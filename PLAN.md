@@ -10,24 +10,29 @@ Build a Telegram job-filter bot from scratch. A Pyrogram user client monitors ~2
 ```
 ahsoka/
 ├── .env / .env.example
+├── .gitignore
 ├── pyproject.toml
+├── uv.lock
+├── .github/
+│   └── workflows/
+│       └── deploy.yml        # CI/CD: test on PR, deploy to Hetzner on main
 ├── ahsoka/
-│   ├── main.py           # entry point: both clients + workers on one event loop
-│   ├── config.py         # pydantic-settings Settings singleton
-│   ├── database.py       # aiosqlite: schema, dedup, user_config CRUD
-│   ├── models.py         # Post, UserConfig, Score dataclasses
+│   ├── main.py               # entry point: both clients + workers on one event loop
+│   ├── config.py             # pydantic-settings Settings singleton
+│   ├── database.py           # aiosqlite: schema, dedup, user_config CRUD
+│   ├── models.py             # Post, UserConfig, Score dataclasses
 │   ├── watcher/
-│   │   ├── client.py     # Pyrogram user client setup
-│   │   └── handler.py    # on_message → puts Post into asyncio.Queue
+│   │   ├── client.py         # Pyrogram user client setup
+│   │   ├── handler.py        # on_raw_update → puts Post into asyncio.Queue
+│   │   └── poller.py         # fallback: polls each channel every 60s
 │   ├── pipeline/
-│   │   ├── dedup.py      # seen_posts check
-│   │   ├── keyword_filter.py  # fast pre-filter (no LLM cost)
-│   │   ├── scraper.py    # httpx + trafilatura; 5s timeout; fallback to raw text
-│   │   └── scorer.py     # Claude API: score 0–10 + reason; rate-limit handling
+│   │   ├── dedup.py          # seen_posts check
+│   │   ├── keyword_filter.py # fast pre-filter (no LLM cost)
+│   │   ├── scraper.py        # httpx + trafilatura; 5s timeout; fallback to raw text
+│   │   └── scorer.py         # Claude API: score 0–10 + reason; rate-limit handling
 │   └── bot/
-│       ├── client.py     # aiogram Bot + Dispatcher setup
-│       ├── commands.py   # /set* /status /pause /resume handlers
-│       └── notifier.py   # formats and sends approved posts to OWNER_CHAT_ID
+│       ├── commands.py       # /set* /status /pause /resume handlers
+│       └── notifier.py       # formats and sends approved posts to OWNER_CHAT_ID
 └── tests/
     ├── test_keyword_filter.py
     ├── test_scraper.py
@@ -39,17 +44,20 @@ ahsoka/
 
 ## Runtime Channel Management
 
-Channels are stored in a **`watched_channels` table** in SQLite and loaded into a `set[int]` at startup (seeded from `CHANNEL_IDS` env var on first run). The Pyrogram handler is registered with `filters.channel` (catch-all) and checks membership in the shared set at message time — no handler re-registration needed.
+Channels are stored in a **`watched_channels` table** in SQLite and loaded into a `set[int]` at startup (seeded from `CHANNEL_IDS` env var on first run). The raw update handler checks membership in the shared set at message time — no handler re-registration needed.
 
 ```python
 # watcher/handler.py
 watched_channels: set[int] = set()  # mutated by bot commands at runtime
 
-@pyro.on_message(filters.channel)
-async def on_message(client, message):
-    if message.chat.id not in watched_channels:
+@pyro.on_raw_update()
+async def on_raw(c, update, users, chats):
+    if not isinstance(update, (UpdateNewChannelMessage, UpdateNewMessage)):
         return
-    await queue.put(Post.from_message(message))
+    # compute chat_id from peer, check watched_channels set
+    if chat_id not in watched_channels:
+        return
+    await queue.put(post)
 ```
 
 Bot commands (`/addchannel`, `/removechannel`) mutate `watched_channels` and persist to DB atomically.
@@ -60,10 +68,11 @@ Bot commands (`/addchannel`, `/removechannel`) mutate `watched_channels` and per
 
 ```
 Pyrogram user client
-  └─ on_message(filters.channel)  — checks watched_channels set at runtime
+  ├─ on_raw_update handler     — immediate, fires on push updates
+  └─ channel_poller            — fallback sweep every 60s, 20 msgs/channel
        │
        ▼
-  handler.py → asyncio.Queue (maxsize=100)
+  handler.py / poller.py → asyncio.Queue (maxsize=100)
        │
        ▼  (3 concurrent worker coroutines)
   dedup.py       — already seen? drop
@@ -73,6 +82,8 @@ Pyrogram user client
   database.mark_seen(channel_id, message_id, score)
   notifier.py    — bot.send_message(OWNER_CHAT_ID, formatted_message)
 ```
+
+**Note on Pyrogram push updates**: Telegram only delivers `UpdateNewChannelMessage` push events for channels the client has recently interacted with. The 60s poller exists as a reliable fallback for channels that go quiet on push.
 
 ---
 
@@ -165,6 +176,8 @@ Return ONLY valid JSON: {"score": <int>, "reason": "<one sentence>", "apply": "<
 
 Post content is truncated to ~4 000 chars before sending to control token cost.
 
+**JSON extraction**: the API call uses assistant-turn prefilling (`{"role": "assistant", "content": "{"}`) to force the model to continue from an open brace, guaranteeing raw JSON output without markdown fences. The `{` is prepended back before `json.loads()`.
+
 ---
 
 ## Concurrency Model (main.py)
@@ -176,26 +189,28 @@ async def main():
     queue = asyncio.Queue(maxsize=100)
 
     pyro = build_pyrogram_client(settings)
-    watched_channels = await load_watched_channels(conn, settings)
+    watched_channels = await load_watched_channels(conn)
     register_watcher_handlers(pyro, queue, watched_channels)
 
     bot = Bot(token=settings.BOT_TOKEN)
     dp = Dispatcher()
     register_bot_commands(dp, conn, settings, watched_channels)
 
-    workers = [asyncio.create_task(pipeline_worker(queue, conn, bot, settings))
+    workers = [asyncio.create_task(pipeline_worker(queue, conn, bot, anthropic))
                for _ in range(3)]
     cleanup = asyncio.create_task(cleanup_worker(conn))
 
     async with pyro:
         polling = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
-        await asyncio.gather(polling, cleanup, *workers)
+        poller  = asyncio.create_task(channel_poller(pyro, queue, watched_channels))
+        await asyncio.gather(polling, poller, cleanup, *workers)
 ```
 
 - `async with pyro:` — Pyrogram's async context manager; handlers fire as tasks on the shared loop
 - `handle_signals=False` — aiogram doesn't fight asyncio.run over SIGINT
 - Single `aiosqlite` connection is safe; all access is from one event loop thread
 - `cleanup_worker` sleeps 24h then deletes `seen_posts` rows older than 30 days (`delete_old_posts(conn, days=30)`)
+- `channel_poller` wakes every 60s and fetches the 20 most recent messages per channel
 
 ---
 
@@ -236,17 +251,75 @@ dependencies = [
 
 ---
 
+## Deployment (Hetzner Cloud + systemd)
+
+**Provider**: Hetzner CX22 (~€4/mo) — persistent local disk, no volume addons needed.
+
+**Persistent files** (never touched by deploys):
+- `ahsoka.db` — SQLite database
+- `ahsoka/ahsoka_user.session` — Pyrogram auth session (single-writer; losing it requires phone re-auth)
+
+**systemd unit** (`/etc/systemd/system/ahsoka.service`):
+```ini
+[Unit]
+Description=Ahsoka Telegram Job-Filter Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ahsoka
+Group=ahsoka
+WorkingDirectory=/home/ahsoka/ahsoka
+ExecStart=/home/ahsoka/ahsoka/.venv/bin/python -m ahsoka.main
+Restart=always
+RestartSec=5s
+EnvironmentFile=/home/ahsoka/ahsoka/.env
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/ahsoka/ahsoka
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ahsoka
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Logs**: `journalctl -u ahsoka -f`
+
+---
+
+## CI/CD (.github/workflows/deploy.yml)
+
+Triggers on every push to `main`:
+1. **Test job**: `uv sync --locked` → `pytest`
+2. **Deploy job** (only on `main` push, after tests pass):
+   - rsync source to server (excludes `.env`, `*.session`, `ahsoka.db`, `.venv`)
+   - `uv sync --locked` on server
+   - `systemctl restart ahsoka`
+
+**Required GitHub secrets**:
+| Secret | Value |
+|--------|-------|
+| `DEPLOY_HOST` | Hetzner server IP |
+| `DEPLOY_SSH_KEY` | Private half of a deploy ed25519 key (public half in root's `authorized_keys`) |
+
+---
+
 ## Key Risks & Mitigations
 
 | Risk | Mitigation |
 |------|-----------|
 | Claude API rate limits | `asyncio.Semaphore(5)` in scorer; exponential backoff on `RateLimitError` |
+| Model returning JSON wrapped in markdown fences | Assistant-turn prefilling forces raw JSON; no fence stripping needed |
+| Pyrogram push updates not delivered for quiet channels | 60s poller fallback via `get_chat_history()`; dedup prevents double-processing |
 | JS-rendered job boards (LinkedIn, etc.) | Fallback to raw post text; no Playwright |
 | Pyrogram session conflicts | Never run two instances; `.session` file is single-writer |
 | `OWNER_CHAT_ID` misconfigured | Startup health check: send test message; exit on failure |
 | `seen_posts` growing unboundedly | Periodic cleanup task deletes rows older than 30 days |
 | Paused state + post flood on resume | Mark seen even when paused (stale jobs are rarely actionable) |
-| Message formatting entities confusing LLM | Use `message.text` (plain), not HTML/Markdown caption |
 
 ---
 
@@ -255,9 +328,9 @@ dependencies = [
 1. **Unit tests**: `pytest tests/` — keyword filter, scraper fallback, scorer JSON parsing, DB dedup
 2. **Integration smoke test**:
    - Set criteria via bot commands, check `/status`
-   - Forward a test message manually to a monitored channel
+   - Wait for a post in a watched channel
    - Confirm it appears in the bot chat with correct score/reason
-3. **Keyword pre-filter validation**: post with no matching keywords should never reach Claude (add a counter/log)
-4. **Scraper test**: post a URL to a plain-HTML job page; confirm scraped content appears in the scorer prompt (visible via debug log)
-5. **Pause/resume**: pause, trigger a post, resume, confirm post does NOT re-appear
-6. **Runtime channel management**: `/addchannel` a new channel, confirm posts from it appear without restart; `/removechannel` it, confirm posts stop; `/channels` reflects current state
+3. **Keyword pre-filter validation**: post with no matching keywords should never reach Claude (visible in logs as `Keyword drop`)
+4. **Pause/resume**: pause, wait for a post, resume, confirm post does NOT re-appear
+5. **Runtime channel management**: `/addchannel` a new channel, confirm posts from it appear without restart; `/removechannel` it, confirm posts stop
+6. **Crash recovery**: `kill -9 <pid>` → systemd restarts within 5s → "ahsoka started ✓" in Telegram
