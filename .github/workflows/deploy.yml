@@ -1,0 +1,53 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --locked
+      - run: uv run pytest
+
+  deploy:
+    name: Deploy
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync code to server
+        run: |
+          rsync -az --delete \
+            --exclude '.env' \
+            --exclude '*.session' \
+            --exclude '*.session-journal' \
+            --exclude 'ahsoka.db' \
+            --exclude '.venv/' \
+            --exclude '__pycache__/' \
+            --exclude '.git/' \
+            ./ root@${{ secrets.DEPLOY_HOST }}:/home/ahsoka/ahsoka/
+
+      - name: Install deps and restart service
+        run: |
+          ssh root@${{ secrets.DEPLOY_HOST }} "
+            cd /home/ahsoka/ahsoka &&
+            uv sync --locked &&
+            systemctl restart ahsoka &&
+            systemctl is-active --quiet ahsoka && echo 'ahsoka is running'
+          "
