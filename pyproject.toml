@@ -1,0 +1,27 @@
+[project]
+name = "ahsoka"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pyrogram",
+    "tgcrypto",
+    "aiogram>=3",
+    "httpx",
+    "trafilatura",
+    "anthropic",
+    "aiosqlite",
+    "pydantic-settings",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
