@@ -17,9 +17,11 @@ def make_config() -> UserConfig:
 
 
 def _mock_client(data: dict) -> AsyncMock:
+    # The scorer prefills the assistant turn with "{", so the API returns
+    # the continuation only — the opening brace is not part of the response.
     client = AsyncMock()
     response = MagicMock()
-    response.content = [MagicMock(text=json.dumps(data))]
+    response.content = [MagicMock(text=json.dumps(data)[1:])]
     client.messages.create = AsyncMock(return_value=response)
     return client
 
