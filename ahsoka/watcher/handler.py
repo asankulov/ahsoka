@@ -46,21 +46,28 @@ def register_watcher_handlers(
             ch = chats[raw_id]
             channel_name = getattr(ch, "username", None) or str(chat_id)
 
-        url: str | None = None
+        seen: set[str] = set()
+        urls: list[str] = []
         for entity in (msg.entities or []):
+            if len(urls) >= 3:
+                break
             if isinstance(entity, raw_types.MessageEntityTextUrl):
-                url = entity.url
-                break
-            if isinstance(entity, raw_types.MessageEntityUrl):
-                url = text[entity.offset : entity.offset + entity.length]
-                break
+                u = entity.url
+            elif isinstance(entity, raw_types.MessageEntityUrl):
+                u = text[entity.offset : entity.offset + entity.length]
+            else:
+                continue
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
 
         post = Post(
             channel_id=chat_id,
             message_id=msg.id,
             channel_name=channel_name,
             text=text,
-            url=url,
+            url=urls[0] if urls else None,
+            urls=urls,
             timestamp=datetime.fromtimestamp(msg.date) if msg.date else datetime.now(),
         )
         logger.info("Queued post %s/%s from @%s", chat_id, msg.id, channel_name)

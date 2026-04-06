@@ -11,6 +11,7 @@ class Post:
     channel_name: str
     text: str
     url: str | None = None
+    urls: list[str] = field(default_factory=list)
     timestamp: datetime = field(default_factory=datetime.now)
 
     @classmethod
@@ -21,26 +22,33 @@ class Post:
             getattr(chat, "username", None) or str(getattr(chat, "id", 0))
         )
 
-        url: str | None = None
+        seen: set[str] = set()
+        urls: list[str] = []
         entities = getattr(message, "entities", None) or []
         for entity in entities:
+            if len(urls) >= 3:
+                break
             etype = getattr(entity, "type", None)
             etype_val = getattr(etype, "value", etype)
             if etype_val == "text_link":
-                url = getattr(entity, "url", None)
-                break
-            if etype_val == "url":
+                u = getattr(entity, "url", None)
+            elif etype_val == "url":
                 offset = getattr(entity, "offset", 0)
                 length = getattr(entity, "length", 0)
-                url = text[offset : offset + length]
-                break
+                u = text[offset : offset + length]
+            else:
+                continue
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
 
         return cls(
             channel_id=getattr(chat, "id", 0),
             message_id=getattr(message, "id", 0),
             channel_name=channel_name,
             text=text,
-            url=url,
+            url=urls[0] if urls else None,
+            urls=urls,
             timestamp=getattr(message, "date", datetime.now()),
         )
 
