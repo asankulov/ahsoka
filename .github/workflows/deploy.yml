@@ -47,7 +47,7 @@ jobs:
         run: |
           ssh root@${{ secrets.DEPLOY_HOST }} "
             cd /home/ahsoka/ahsoka &&
-            uv sync --locked &&
+            /root/.local/bin/uv sync --locked &&
             systemctl restart ahsoka &&
             systemctl is-active --quiet ahsoka && echo 'ahsoka is running'
           "
