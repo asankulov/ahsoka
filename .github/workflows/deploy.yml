@@ -46,6 +46,7 @@ jobs:
       - name: Install deps and restart service
         run: |
           ssh root@${{ secrets.DEPLOY_HOST }} "
+            apt-get install -y --no-install-recommends build-essential python3-dev &&
             cd /home/ahsoka/ahsoka &&
             /root/.local/bin/uv sync --locked &&
             systemctl restart ahsoka &&
