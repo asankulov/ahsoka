@@ -3,12 +3,30 @@ import logging
 import aiosqlite
 from aiogram import Dispatcher, Router
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import BotCommand, Message
 
 from ahsoka import database as db
 from ahsoka.config import Settings
 
 logger = logging.getLogger(__name__)
+
+BOT_COMMANDS: list[BotCommand] = [
+    BotCommand(command="setstack",       description="Set desired tech stack"),
+    BotCommand(command="setseniority",   description="Set seniority level"),
+    BotCommand(command="setremote",      description="Set work mode (remote/hybrid/onsite)"),
+    BotCommand(command="setlocation",    description="Set preferred location"),
+    BotCommand(command="setsalary",      description="Set salary range: /setsalary <min> <max>"),
+    BotCommand(command="setthreshold",   description="Set minimum score (0–10)"),
+    BotCommand(command="setkeywords",    description="Replace the entire keyword list"),
+    BotCommand(command="addkeyword",     description="Append keyword(s) to the list"),
+    BotCommand(command="resetkeywords",  description="Clear all keywords"),
+    BotCommand(command="status",         description="Show current filter criteria"),
+    BotCommand(command="pause",          description="Pause forwarding (still marks seen)"),
+    BotCommand(command="resume",         description="Resume forwarding"),
+    BotCommand(command="addchannel",     description="Add a channel to the watch list"),
+    BotCommand(command="removechannel",  description="Remove a channel from the watch list"),
+    BotCommand(command="channels",       description="List watched channels"),
+]
 
 
 def register_bot_commands(
