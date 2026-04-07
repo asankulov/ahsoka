@@ -47,6 +47,7 @@ jobs:
         run: |
           ssh ahsoka@${{ secrets.DEPLOY_HOST }} "
             sudo apt-get install -y --no-install-recommends build-essential python3-dev &&
+            sudo chown -R ahsoka:ahsoka /home/ahsoka/ahsoka &&
             cd /home/ahsoka/ahsoka &&
             /home/ahsoka/.local/bin/uv sync --locked &&
             sudo systemctl restart ahsoka &&
