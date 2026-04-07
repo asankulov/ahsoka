@@ -46,6 +46,16 @@ jobs:
             --exclude '.git/' \
             ./ ahsoka@${{ secrets.DEPLOY_HOST }}:/home/ahsoka/ahsoka/
 
+      - name: Inject secrets into .env
+        run: |
+          ssh ahsoka@${{ secrets.DEPLOY_HOST }} "
+            cd /home/ahsoka/ahsoka &&
+            touch .env &&
+            grep -q '^LOG_BOT_TOKEN=' .env \
+              && sed -i 's|^LOG_BOT_TOKEN=.*|LOG_BOT_TOKEN=${{ secrets.LOG_BOT_TOKEN }}|' .env \
+              || echo 'LOG_BOT_TOKEN=${{ secrets.LOG_BOT_TOKEN }}' >> .env
+          "
+
       - name: Install deps and restart service
         run: |
           ssh ahsoka@${{ secrets.DEPLOY_HOST }} "
