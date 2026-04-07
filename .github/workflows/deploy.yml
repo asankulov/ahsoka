@@ -11,8 +11,8 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v4.2.2
+      - uses: astral-sh/setup-uv@v6
       - run: uv sync --locked --extra dev
       - run: uv run pytest
 
@@ -22,7 +22,7 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
 
       - name: Set up SSH
         run: |
