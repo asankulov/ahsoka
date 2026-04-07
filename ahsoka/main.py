@@ -24,6 +24,7 @@ from ahsoka.pipeline.scraper import scrape_content
 from ahsoka.pipeline.scorer import score_post
 from ahsoka.bot.commands import register_bot_commands
 from ahsoka.bot.notifier import send_notification
+from ahsoka.pipeline.tg_resolver import is_tg_link, resolve_tg_link
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,6 +38,7 @@ async def pipeline_worker(
     conn: aiosqlite.Connection,
     bot: Bot,
     anthropic: AsyncAnthropic,
+    pyro,
 ) -> None:
     while True:
         post: Post = await queue.get()
@@ -53,6 +55,13 @@ async def pipeline_worker(
                 continue
 
             content = await scrape_content(post, timeout=settings.scrape_timeout_s)
+
+            for url in post.urls:
+                if is_tg_link(url):
+                    resolved = await resolve_tg_link(url, pyro)
+                    if resolved:
+                        content += f"\n\n--- linked from {url} ---\n{resolved}"
+
             score = await score_post(anthropic, post, content, config, settings.claude_model)
             logger.info(
                 "Scored %s/%s: %d/10 — %s",
@@ -106,7 +115,7 @@ async def main() -> None:
         raise SystemExit(1)
 
     workers = [
-        asyncio.create_task(pipeline_worker(queue, conn, bot, anthropic))
+        asyncio.create_task(pipeline_worker(queue, conn, bot, anthropic, pyro))
         for _ in range(3)
     ]
     cleanup = asyncio.create_task(cleanup_worker(conn))

@@ -70,3 +70,22 @@ async def test_partial_scrape_failure():
     assert "original" in result
     assert "scraped ok" in result
     assert "fail.com" not in result
+
+
+async def test_tg_link_is_not_http_fetched():
+    """Telegram deep links must be excluded from the httpx fetch list."""
+    post = make_post("summary text", urls=["https://t.me/revacancy/137378"])
+    with patch("ahsoka.pipeline.scraper.httpx.AsyncClient") as mock_cls:
+        result = await scrape_content(post)
+    # httpx.AsyncClient should never have been entered
+    mock_cls.return_value.__aenter__.assert_not_called()
+    assert result == "summary text"
+
+
+async def test_tg_link_skipped_but_http_url_still_scraped():
+    """A mixed list: t.me link is skipped, regular URL is HTTP-fetched normally."""
+    post = make_post("text", urls=["https://t.me/chan/1", "http://example.com/job"])
+    with patch("ahsoka.pipeline.scraper._fetch_one", new=AsyncMock(return_value="scraped job")):
+        result = await scrape_content(post)
+    assert "scraped job" in result
+    assert "text" in result
