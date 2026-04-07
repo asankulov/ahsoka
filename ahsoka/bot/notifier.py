@@ -25,7 +25,7 @@ def format_notification(post: Post, score: Score, url: str | None = None) -> str
     lines.append("")
     lines.append(post.text[:800])
     if isinstance(post.timestamp, datetime):
-        date_str = post.timestamp.strftime("%b %-d")
+        date_str = post.timestamp.strftime("%b %-d %H:%M")
     else:
         date_str = str(post.timestamp)
     lines.append(f"\n— @{post.channel_name} · {date_str} · {_post_link(post)}")
