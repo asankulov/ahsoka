@@ -41,15 +41,14 @@ jobs:
             --exclude '.venv/' \
             --exclude '__pycache__/' \
             --exclude '.git/' \
-            ./ root@${{ secrets.DEPLOY_HOST }}:/home/ahsoka/ahsoka/
+            ./ ahsoka@${{ secrets.DEPLOY_HOST }}:/home/ahsoka/ahsoka/
 
       - name: Install deps and restart service
         run: |
-          ssh root@${{ secrets.DEPLOY_HOST }} "
-            apt-get install -y --no-install-recommends build-essential python3-dev &&
-            chown -R ahsoka:ahsoka /home/ahsoka/ahsoka &&
+          ssh ahsoka@${{ secrets.DEPLOY_HOST }} "
+            sudo apt-get install -y --no-install-recommends build-essential python3-dev &&
             cd /home/ahsoka/ahsoka &&
-            /root/.local/bin/uv sync --locked &&
-            systemctl restart ahsoka &&
-            systemctl is-active --quiet ahsoka && echo 'ahsoka is running'
+            /home/ahsoka/.local/bin/uv sync --locked &&
+            sudo systemctl restart ahsoka &&
+            sudo systemctl is-active --quiet ahsoka && echo 'ahsoka is running'
           "
