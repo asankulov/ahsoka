@@ -76,7 +76,9 @@ DB_PATH=ahsoka.db
 | `/setlocation` | `/setlocation Amsterdam` | Location |
 | `/setsalary` | `/setsalary 5000 10000` | Monthly salary range |
 | `/setthreshold` | `/setthreshold 8` | Minimum score (0–10) |
-| `/setkeywords` | `/setkeywords python backend` | Required keywords; empty = pass all |
+| `/setkeywords` | `/setkeywords python backend` | Replace the entire keyword list (≥1 keyword required) |
+| `/addkeyword` | `/addkeyword fastapi` | Append keyword(s); duplicates ignored |
+| `/resetkeywords` | `/resetkeywords` | Clear all keywords; all posts will pass the filter |
 | `/addchannel` | `/addchannel -1001234567890` | Add a channel to the watch list |
 | `/removechannel` | `/removechannel -1001234567890` | Remove a channel |
 | `/channels` | `/channels` | List watched channels |

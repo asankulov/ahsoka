@@ -22,7 +22,7 @@ from ahsoka.pipeline.dedup import is_duplicate
 from ahsoka.pipeline.keyword_filter import passes_keyword_filter
 from ahsoka.pipeline.scraper import scrape_content
 from ahsoka.pipeline.scorer import score_post
-from ahsoka.bot.commands import register_bot_commands
+from ahsoka.bot.commands import register_bot_commands, BOT_COMMANDS
 from ahsoka.bot.notifier import send_notification
 from ahsoka.pipeline.tg_resolver import is_tg_link, resolve_tg_link
 
@@ -113,6 +113,13 @@ async def main() -> None:
     except Exception as exc:
         logger.error("Health check failed: %s — verify OWNER_CHAT_ID and BOT_TOKEN", exc)
         raise SystemExit(1)
+
+    # Sync command menu with Telegram so the "/" autocomplete is always current
+    try:
+        await bot.set_my_commands(BOT_COMMANDS)
+        logger.info("Bot command menu updated (%d commands)", len(BOT_COMMANDS))
+    except Exception as exc:
+        logger.warning("Failed to update bot command menu: %s", exc)
 
     workers = [
         asyncio.create_task(pipeline_worker(queue, conn, bot, anthropic, pyro))
