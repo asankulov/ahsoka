@@ -73,8 +73,9 @@ def test_register_adds_expected_number_of_handlers(conn, settings):
     register_bot_commands(dp, conn, settings, set())
     handlers = get_handlers(dp)
     # setstack, setseniority, setremote, setlocation, setsalary, setthreshold,
-    # setkeywords, status, pause, resume, addchannel, removechannel, channels
-    assert len(handlers) == 13
+    # setkeywords, addkeyword, resetkeywords, status, pause, resume,
+    # addchannel, removechannel, channels
+    assert len(handlers) == 15
 
 
 # ---------------------------------------------------------------------------
@@ -210,12 +211,93 @@ async def test_setkeywords_persists(conn, settings):
     assert (await get_config(conn)).keywords == "python django fastapi"
 
 
-async def test_setkeywords_cleared_reply(conn, settings):
+async def test_setkeywords_no_arg_shows_usage(conn, settings):
     _, handlers, _ = setup_dp(conn, settings)
     msg = make_msg("/setkeywords")
     await handlers[6](msg)
     reply_text = msg.reply.call_args[0][0]
+    assert "Usage" in reply_text
+
+
+# ---------------------------------------------------------------------------
+# /addkeyword
+# ---------------------------------------------------------------------------
+
+async def test_addkeyword_appends_to_empty(conn, settings):
+    _, handlers, _ = setup_dp(conn, settings)
+    await handlers[7](make_msg("/addkeyword python django"))
+    assert (await get_config(conn)).keywords == "python django"
+
+
+async def test_addkeyword_appends_to_existing(conn, settings):
+    _, handlers, _ = setup_dp(conn, settings)
+    await handlers[6](make_msg("/setkeywords python"))
+    await handlers[7](make_msg("/addkeyword fastapi"))
+    assert (await get_config(conn)).keywords == "python fastapi"
+
+
+async def test_addkeyword_deduplicates(conn, settings):
+    _, handlers, _ = setup_dp(conn, settings)
+    await handlers[6](make_msg("/setkeywords python django"))
+    await handlers[7](make_msg("/addkeyword django fastapi"))
+    assert (await get_config(conn)).keywords == "python django fastapi"
+
+
+async def test_addkeyword_all_duplicates_reply(conn, settings):
+    _, handlers, _ = setup_dp(conn, settings)
+    await handlers[6](make_msg("/setkeywords python"))
+    msg = make_msg("/addkeyword python")
+    await handlers[7](msg)
+    reply_text = msg.reply.call_args[0][0]
+    assert "duplicate" in reply_text.lower() or "no new" in reply_text.lower()
+
+
+async def test_addkeyword_preserves_order(conn, settings):
+    _, handlers, _ = setup_dp(conn, settings)
+    await handlers[6](make_msg("/setkeywords c b a"))
+    await handlers[7](make_msg("/addkeyword d"))
+    assert (await get_config(conn)).keywords == "c b a d"
+
+
+async def test_addkeyword_no_arg_shows_usage(conn, settings):
+    _, handlers, _ = setup_dp(conn, settings)
+    msg = make_msg("/addkeyword")
+    await handlers[7](msg)
+    reply_text = msg.reply.call_args[0][0]
+    assert "Usage" in reply_text
+
+
+async def test_addkeyword_replies(conn, settings):
+    _, handlers, _ = setup_dp(conn, settings)
+    msg = make_msg("/addkeyword rust")
+    await handlers[7](msg)
+    msg.reply.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# /resetkeywords
+# ---------------------------------------------------------------------------
+
+async def test_resetkeywords_clears_keywords(conn, settings):
+    _, handlers, _ = setup_dp(conn, settings)
+    await handlers[6](make_msg("/setkeywords python django"))
+    await handlers[8](make_msg("/resetkeywords"))
+    assert (await get_config(conn)).keywords == ""
+
+
+async def test_resetkeywords_reply_mentions_cleared(conn, settings):
+    _, handlers, _ = setup_dp(conn, settings)
+    msg = make_msg("/resetkeywords")
+    await handlers[8](msg)
+    reply_text = msg.reply.call_args[0][0]
     assert "cleared" in reply_text.lower() or "pass" in reply_text.lower()
+
+
+async def test_resetkeywords_idempotent(conn, settings):
+    _, handlers, _ = setup_dp(conn, settings)
+    await handlers[8](make_msg("/resetkeywords"))
+    await handlers[8](make_msg("/resetkeywords"))
+    assert (await get_config(conn)).keywords == ""
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +312,7 @@ async def test_status_reflects_current_config(conn, settings):
     await handlers[5](make_msg("/setthreshold 6"))   # setthreshold
 
     msg = make_msg("/status")
-    await handlers[7](msg)
+    await handlers[9](msg)
     reply_text = msg.reply.call_args[0][0]
     assert "python" in reply_text
     assert "6/10" in reply_text
@@ -243,14 +325,14 @@ async def test_status_reflects_current_config(conn, settings):
 
 async def test_pause_sets_paused_flag(conn, settings):
     _, handlers, _ = setup_dp(conn, settings)
-    await handlers[8](make_msg("/pause"))
+    await handlers[10](make_msg("/pause"))
     assert (await get_config(conn)).paused is True
 
 
 async def test_resume_clears_paused_flag(conn, settings):
     _, handlers, _ = setup_dp(conn, settings)
-    await handlers[8](make_msg("/pause"))
-    await handlers[9](make_msg("/resume"))
+    await handlers[10](make_msg("/pause"))
+    await handlers[11](make_msg("/resume"))
     assert (await get_config(conn)).paused is False
 
 
@@ -261,7 +343,7 @@ async def test_resume_clears_paused_flag(conn, settings):
 async def test_addchannel_valid(conn, settings):
     _, handlers, watched = setup_dp(conn, settings)
     msg = make_msg("/addchannel -100999")
-    await handlers[10](msg)
+    await handlers[12](msg)
     assert -100999 in watched
     channels = await load_watched_channels(conn)
     assert -100999 in channels
@@ -270,7 +352,7 @@ async def test_addchannel_valid(conn, settings):
 async def test_addchannel_invalid_id_replies_error(conn, settings):
     _, handlers, watched = setup_dp(conn, settings)
     msg = make_msg("/addchannel notanid")
-    await handlers[10](msg)
+    await handlers[12](msg)
     reply_text = msg.reply.call_args[0][0]
     assert "integer" in reply_text.lower()
     assert len(watched) == 0
@@ -279,7 +361,7 @@ async def test_addchannel_invalid_id_replies_error(conn, settings):
 async def test_addchannel_missing_arg_replies_usage(conn, settings):
     _, handlers, watched = setup_dp(conn, settings)
     msg = make_msg("/addchannel")
-    await handlers[10](msg)
+    await handlers[12](msg)
     reply_text = msg.reply.call_args[0][0]
     assert "Usage" in reply_text
 
@@ -287,11 +369,11 @@ async def test_addchannel_missing_arg_replies_usage(conn, settings):
 async def test_removechannel_valid(conn, settings):
     _, handlers, watched = setup_dp(conn, settings)
     # Add first
-    await handlers[10](make_msg("/addchannel -100999"))
+    await handlers[12](make_msg("/addchannel -100999"))
     assert -100999 in watched
     # Now remove
     msg = make_msg("/removechannel -100999")
-    await handlers[11](msg)
+    await handlers[13](msg)
     assert -100999 not in watched
     channels = await load_watched_channels(conn)
     assert -100999 not in channels
@@ -300,7 +382,7 @@ async def test_removechannel_valid(conn, settings):
 async def test_removechannel_invalid_id_replies_error(conn, settings):
     _, handlers, _ = setup_dp(conn, settings)
     msg = make_msg("/removechannel notanid")
-    await handlers[11](msg)
+    await handlers[13](msg)
     reply_text = msg.reply.call_args[0][0]
     assert "integer" in reply_text.lower()
 
@@ -308,7 +390,7 @@ async def test_removechannel_invalid_id_replies_error(conn, settings):
 async def test_removechannel_missing_arg_replies_usage(conn, settings):
     _, handlers, _ = setup_dp(conn, settings)
     msg = make_msg("/removechannel")
-    await handlers[11](msg)
+    await handlers[13](msg)
     reply_text = msg.reply.call_args[0][0]
     assert "Usage" in reply_text
 
@@ -321,7 +403,7 @@ async def test_channels_lists_watched(conn, settings):
     _, handlers, watched = setup_dp(conn, settings)
     watched.update([-100111, -100222])
     msg = make_msg("/channels")
-    await handlers[12](msg)
+    await handlers[14](msg)
     reply_text = msg.reply.call_args[0][0]
     assert "-100111" in reply_text
     assert "-100222" in reply_text
@@ -330,7 +412,7 @@ async def test_channels_lists_watched(conn, settings):
 async def test_channels_empty_set(conn, settings):
     _, handlers, _ = setup_dp(conn, settings)
     msg = make_msg("/channels")
-    await handlers[12](msg)
+    await handlers[14](msg)
     reply_text = msg.reply.call_args[0][0]
     assert "No channels" in reply_text
 
