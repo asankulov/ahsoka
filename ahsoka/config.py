@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     telegram_api_hash: str
     session_name: str = "ahsoka_user"
     bot_token: str
+    log_bot_token: str | None = None  # dedicated bot for forwarding log records
     owner_chat_id: int
     channel_ids: list[int] = []
     anthropic_api_key: str
