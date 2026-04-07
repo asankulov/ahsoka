@@ -148,6 +148,17 @@ async def main() -> None:
         logger.error("Health check failed: %s — verify OWNER_CHAT_ID and BOT_TOKEN", exc)
         raise SystemExit(1)
 
+    # Dedicated log-forwarding bot (optional — only if LOG_BOT_TOKEN is set)
+    log_bot: Bot | None = None
+    if settings.log_bot_token:
+        from ahsoka.bot.log_handler import TelegramLogHandler
+        log_bot = Bot(token=settings.log_bot_token)
+        _tg_handler = TelegramLogHandler(log_bot, settings.owner_chat_id)
+        _tg_handler.setLevel(logging.WARNING)
+        _tg_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s\n%(message)s"))
+        logging.getLogger().addHandler(_tg_handler)
+        logger.info("Telegram log handler registered (WARNING+) via dedicated log bot")
+
     # Sync command menu with Telegram so the "/" autocomplete is always current
     try:
         await bot.set_my_commands(BOT_COMMANDS)
@@ -186,6 +197,8 @@ async def main() -> None:
             await asyncio.gather(*all_tasks, return_exceptions=True)
             await dp.storage.close()
             await bot.session.close()
+            if log_bot is not None:
+                await log_bot.session.close()
             await conn.close()
             logger.info("Shut down cleanly.")
 
