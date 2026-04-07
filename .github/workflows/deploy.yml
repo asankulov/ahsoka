@@ -52,8 +52,8 @@ jobs:
             cd /home/ahsoka/ahsoka &&
             touch .env &&
             grep -q '^LOG_BOT_TOKEN=' .env \
-              && sed -i 's|^LOG_BOT_TOKEN=.*|LOG_BOT_TOKEN=${{ secrets.LOG_BOT_TOKEN }}|' .env \
-              || echo 'LOG_BOT_TOKEN=${{ secrets.LOG_BOT_TOKEN }}' >> .env
+              && sed -i 's|^LOG_BOT_TOKEN=.*|LOG_BOT_TOKEN=8501917593:AAFtZUQas6CZijwh9tqV3Rj092_AE20H9zw|' .env \
+              || echo 'LOG_BOT_TOKEN=8501917593:AAFtZUQas6CZijwh9tqV3Rj092_AE20H9zw' >> .env
           "
 
       - name: Install deps and restart service
