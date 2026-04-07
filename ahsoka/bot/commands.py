@@ -76,11 +76,36 @@ def register_bot_commands(
     @router.message(Command("setkeywords"))
     async def cmd_setkeywords(message: Message) -> None:
         value = _arg(message.text)
+        if not value:
+            await message.reply("Usage: /setkeywords <kw1> [kw2 ...]\nTo clear all keywords use /resetkeywords.")
+            return
         await db.set_config(conn, "keywords", value)
-        if value:
-            await message.reply(f"Keywords set: {', '.join(value.split())}")
+        await message.reply(f"Keywords set: {', '.join(value.split())}")
+
+    @router.message(Command("addkeyword"))
+    async def cmd_addkeyword(message: Message) -> None:
+        value = _arg(message.text)
+        if not value:
+            await message.reply("Usage: /addkeyword <kw1> [kw2 ...]")
+            return
+        new_keywords = value.split()
+        config = await db.get_config(conn)
+        existing = config.keywords.split() if config.keywords else []
+        existing_set = set(existing)
+        added = [kw for kw in new_keywords if kw not in existing_set]
+        for kw in added:
+            existing.append(kw)
+            existing_set.add(kw)
+        await db.set_config(conn, "keywords", " ".join(existing))
+        if added:
+            await message.reply(f"Added: {', '.join(added)}\nAll keywords: {', '.join(existing)}")
         else:
-            await message.reply("Keywords cleared — all posts will pass the filter.")
+            await message.reply(f"No new keywords added (all duplicates).\nCurrent keywords: {', '.join(existing)}")
+
+    @router.message(Command("resetkeywords"))
+    async def cmd_resetkeywords(message: Message) -> None:
+        await db.set_config(conn, "keywords", "")
+        await message.reply("Keywords cleared — all posts will pass the filter.")
 
     @router.message(Command("status"))
     async def cmd_status(message: Message) -> None:
