@@ -20,7 +20,7 @@ from ahsoka.watcher.handler import register_watcher_handlers
 from ahsoka.watcher.poller import channel_poller
 from ahsoka.pipeline.dedup import is_duplicate
 from ahsoka.pipeline.keyword_filter import passes_keyword_filter
-from ahsoka.pipeline.scraper import scrape_content
+from ahsoka.pipeline.scraper import scrape_content, scrape_url
 from ahsoka.pipeline.scorer import score_post
 from ahsoka.bot.commands import register_bot_commands, BOT_COMMANDS
 from ahsoka.bot.notifier import send_notification
@@ -31,6 +31,57 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+async def _process_single(
+    conn: aiosqlite.Connection,
+    bot: Bot,
+    anthropic: AsyncAnthropic,
+    post: Post,
+    config: UserConfig,
+    pyro,
+) -> None:
+    if await is_duplicate(conn, post):
+        logger.debug("Duplicate: %s/%s", post.channel_id, post.message_id)
+        return
+    content = await scrape_content(post, timeout=settings.scrape_timeout_s)
+    for url in post.urls:
+        if is_tg_link(url):
+            resolved = await resolve_tg_link(url, pyro)
+            if resolved:
+                content += f"\n\n--- linked from {url} ---\n{resolved}"
+    score = await score_post(anthropic, post, content, config, settings.claude_model)
+    logger.info("Scored %s/%s: %d/10 — %s", post.channel_id, post.message_id, score.score, score.reason)
+    await db.mark_seen(conn, post.channel_id, post.message_id, score.score)
+    if not config.paused and score.score >= config.threshold:
+        await send_notification(bot, settings.owner_chat_id, post, score)
+
+
+async def _process_fanout(
+    conn: aiosqlite.Connection,
+    bot: Bot,
+    anthropic: AsyncAnthropic,
+    post: Post,
+    config: UserConfig,
+    pyro,
+) -> None:
+    for url in post.urls:
+        if await is_duplicate(conn, post, url=url):
+            logger.debug("Duplicate URL: %s/%s %s", post.channel_id, post.message_id, url)
+            continue
+        if is_tg_link(url):
+            resolved = await resolve_tg_link(url, pyro)
+            content = "\n\n".join(filter(None, [post.text, resolved and f"--- linked from {url} ---\n{resolved}"]))
+        else:
+            content = await scrape_url(url, post.text, timeout=settings.scrape_timeout_s)
+        score = await score_post(anthropic, post, content, config, settings.claude_model)
+        logger.info(
+            "Scored %s/%s [%s]: %d/10 — %s",
+            post.channel_id, post.message_id, url, score.score, score.reason,
+        )
+        await db.mark_seen(conn, post.channel_id, post.message_id, score.score, url=url)
+        if not config.paused and score.score >= config.threshold:
+            await send_notification(bot, settings.owner_chat_id, post, score, url=url)
 
 
 async def pipeline_worker(
@@ -54,27 +105,10 @@ async def pipeline_worker(
                 await db.mark_seen(conn, post.channel_id, post.message_id)
                 continue
 
-            content = await scrape_content(post, timeout=settings.scrape_timeout_s)
-
-            for url in post.urls:
-                if is_tg_link(url):
-                    resolved = await resolve_tg_link(url, pyro)
-                    if resolved:
-                        content += f"\n\n--- linked from {url} ---\n{resolved}"
-
-            score = await score_post(anthropic, post, content, config, settings.claude_model)
-            logger.info(
-                "Scored %s/%s: %d/10 — %s",
-                post.channel_id,
-                post.message_id,
-                score.score,
-                score.reason,
-            )
-
-            await db.mark_seen(conn, post.channel_id, post.message_id, score.score)
-
-            if not config.paused and score.score >= config.threshold:
-                await send_notification(bot, settings.owner_chat_id, post, score)
+            if len(post.urls) >= 2:
+                await _process_fanout(conn, bot, anthropic, post, config, pyro)
+            else:
+                await _process_single(conn, bot, anthropic, post, config, pyro)
         except Exception:
             logger.exception("Pipeline error for %s/%s", post.channel_id, post.message_id)
         finally:

@@ -23,6 +23,16 @@ async def _fetch_one(client: httpx.AsyncClient, url: str) -> str | None:
     return None
 
 
+async def scrape_url(url: str, context_text: str, timeout: float = 5.0) -> str:
+    """Fetch a single URL and combine with the message text as context."""
+    parts: list[str] = [context_text]
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        result = await _fetch_one(client, url)
+    if result:
+        parts.append(f"--- scraped from {url} ---\n{result}")
+    return "\n\n".join(parts)
+
+
 async def scrape_content(post: Post, timeout: float = 5.0) -> str:
     """Fetch all linked URLs concurrently and combine with original post text.
 

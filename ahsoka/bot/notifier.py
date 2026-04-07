@@ -8,10 +8,12 @@ from ahsoka.models import Post, Score
 logger = logging.getLogger(__name__)
 
 
-def format_notification(post: Post, score: Score) -> str:
+def format_notification(post: Post, score: Score, url: str | None = None) -> str:
     lines = [f"⭐ {score.score}/10 — {score.reason}"]
     if score.apply:
         lines.append(f"📬 {score.apply}")
+    if url:
+        lines.append(f"🔗 {url}")
     lines.append("")
     lines.append(post.text[:800])
     if isinstance(post.timestamp, datetime):
@@ -22,8 +24,10 @@ def format_notification(post: Post, score: Score) -> str:
     return "\n".join(lines)
 
 
-async def send_notification(bot: Bot, chat_id: int, post: Post, score: Score) -> None:
-    text = format_notification(post, score)
+async def send_notification(
+    bot: Bot, chat_id: int, post: Post, score: Score, url: str | None = None
+) -> None:
+    text = format_notification(post, score, url)
     try:
         await bot.send_message(chat_id, text)
     except Exception:

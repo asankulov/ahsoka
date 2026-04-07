@@ -7,9 +7,10 @@ CREATE TABLE IF NOT EXISTS seen_posts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_id  INTEGER NOT NULL,
     message_id  INTEGER NOT NULL,
+    url         TEXT    NOT NULL DEFAULT '',
     score       INTEGER,
     scored_at   TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(channel_id, message_id)
+    UNIQUE(channel_id, message_id, url)
 );
 
 CREATE TABLE IF NOT EXISTS user_config (
@@ -39,6 +40,11 @@ _DEFAULT_CONFIG: dict[str, str] = {
 
 async def init_db(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_SCHEMA)
+    try:
+        await conn.execute("ALTER TABLE seen_posts ADD COLUMN url TEXT NOT NULL DEFAULT ''")
+        await conn.commit()
+    except aiosqlite.OperationalError:
+        pass  # column already exists
     await conn.executemany(
         "INSERT OR IGNORE INTO user_config (key, value) VALUES (?, ?)",
         list(_DEFAULT_CONFIG.items()),
@@ -80,10 +86,15 @@ async def remove_channel(conn: aiosqlite.Connection, channel_id: int) -> None:
     await conn.commit()
 
 
-async def is_seen(conn: aiosqlite.Connection, channel_id: int, message_id: int) -> bool:
+async def is_seen(
+    conn: aiosqlite.Connection,
+    channel_id: int,
+    message_id: int,
+    url: str = "",
+) -> bool:
     async with conn.execute(
-        "SELECT 1 FROM seen_posts WHERE channel_id = ? AND message_id = ?",
-        (channel_id, message_id),
+        "SELECT 1 FROM seen_posts WHERE channel_id = ? AND message_id = ? AND url = ?",
+        (channel_id, message_id, url),
     ) as cur:
         return await cur.fetchone() is not None
 
@@ -93,10 +104,11 @@ async def mark_seen(
     channel_id: int,
     message_id: int,
     score: int | None = None,
+    url: str = "",
 ) -> None:
     await conn.execute(
-        "INSERT OR IGNORE INTO seen_posts (channel_id, message_id, score) VALUES (?, ?, ?)",
-        (channel_id, message_id, score),
+        "INSERT OR IGNORE INTO seen_posts (channel_id, message_id, url, score) VALUES (?, ?, ?, ?)",
+        (channel_id, message_id, url, score),
     )
     await conn.commit()
 
