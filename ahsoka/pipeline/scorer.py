@@ -48,6 +48,10 @@ async def score_post(
 
     raw = ""
     async with _semaphore:
+        logger.debug(
+            "Scoring %s/%s — content (%d chars):\n%s",
+            post.channel_id, post.message_id, len(content), content[:4000],
+        )
         for attempt in range(4):
             try:
                 response = await client.messages.create(

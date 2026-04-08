@@ -52,6 +52,13 @@ class Post:
             timestamp=getattr(message, "date", datetime.now()),
         )
 
+    @property
+    def link(self) -> str:
+        if not self.channel_name.lstrip("-").isdigit():
+            return f"https://t.me/{self.channel_name}/{self.message_id}"
+        cid = str(abs(self.channel_id))[3:]  # strip leading "100" from e.g. 1001234567890
+        return f"https://t.me/c/{cid}/{self.message_id}"
+
 
 @dataclass
 class Score:
