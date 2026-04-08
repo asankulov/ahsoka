@@ -153,6 +153,10 @@ async def main() -> None:
     if settings.log_bot_token:
         from ahsoka.bot.log_handler import TelegramLogHandler
         log_bot = Bot(token=settings.log_bot_token)
+        try:
+            await log_bot.send_message(settings.owner_chat_id, "ahsoka log bot ready ✓")
+        except Exception as exc:
+            logger.error("Log bot health check failed: %s — verify LOG_BOT_TOKEN", exc)
         _tg_handler = TelegramLogHandler(log_bot, settings.owner_chat_id)
         _tg_handler.setLevel(logging.WARNING)
         _tg_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s\n%(message)s"))
