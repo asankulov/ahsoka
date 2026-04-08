@@ -26,7 +26,7 @@ jobs:
 
             echo ''
             echo '=== .env key presence ==='
-            for key in BOT_TOKEN LOG_BOT_TOKEN OWNER_CHAT_ID ANTHROPIC_API_KEY TELEGRAM_API_ID; do
+            for key in BOT_TOKEN LOG_BOT_TOKEN OWNER_CHAT_ID ANTHROPIC_API_KEY TELEGRAM_API_ID TELEGRAM_API_HASH; do
               grep -q \"^\${key}=\" /home/ahsoka/ahsoka/.env \
                 && echo \"\${key}: SET\" \
                 || echo \"\${key}: MISSING\"
