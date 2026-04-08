@@ -57,6 +57,7 @@ TELEGRAM_API_ID=          # from https://my.telegram.org
 TELEGRAM_API_HASH=        # from https://my.telegram.org
 SESSION_NAME=ahsoka_user
 BOT_TOKEN=                # from @BotFather
+LOG_BOT_TOKEN=            # optional — separate bot for log forwarding (from @BotFather)
 OWNER_CHAT_ID=            # your numeric user ID — get from @userinfobot
 CHANNEL_IDS=              # comma-separated channel IDs, e.g. -1001234567890,-1009876543210
 ANTHROPIC_API_KEY=
@@ -97,7 +98,7 @@ SQLite (`ahsoka.db`). Three tables:
 ## Running tests
 
 ```bash
-uv run pytest
+uv run --extra dev pytest
 ```
 
 ## Deployment
