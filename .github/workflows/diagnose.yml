@@ -1,0 +1,38 @@
+name: Diagnose
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  diagnose:
+    name: Server Diagnostics
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Run diagnostics
+        run: |
+          ssh ahsoka@${{ secrets.DEPLOY_HOST }} "
+            echo '=== service status ==='
+            sudo systemctl status ahsoka --no-pager
+
+            echo ''
+            echo '=== .env key presence ==='
+            for key in BOT_TOKEN LOG_BOT_TOKEN OWNER_CHAT_ID ANTHROPIC_API_KEY TELEGRAM_API_ID; do
+              grep -q \"^\${key}=\" /home/ahsoka/ahsoka/.env \
+                && echo \"\${key}: SET\" \
+                || echo \"\${key}: MISSING\"
+            done
+
+            echo ''
+            echo '=== last 80 log lines ==='
+            sudo journalctl -u ahsoka -n 80 --no-pager
+          "
