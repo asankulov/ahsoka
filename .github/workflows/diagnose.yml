@@ -35,4 +35,12 @@ jobs:
             echo ''
             echo '=== last 80 log lines ==='
             sudo journalctl -u ahsoka -n 80 --no-pager
-          "
+          " | tee diagnostics.txt
+
+      - name: Upload diagnostics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ github.run_id }}
+          path: diagnostics.txt
+          retention-days: 7
