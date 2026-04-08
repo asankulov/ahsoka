@@ -15,23 +15,34 @@ A personal Telegram job-filter bot written in Python 3.12+. It monitors job chan
 ```
 ahsoka/
   bot/
-    commands.py     # All 25 aiogram command handlers + FSM states
+    commands.py     # All aiogram command handlers + FSM states
+    log_handler.py  # TelegramLogHandler — forwards INFO+ logs to a dedicated Telegram bot
+    notifier.py     # format_notification() + send_notification()
   pipeline/
     scraper.py      # HTTP scraping; skips t.me links (handled by tg_resolver)
     tg_resolver.py  # Resolves t.me deep links via Pyrogram client
-    models.py       # Post dataclass + Post.from_message()
-    notifier.py     # format_notification()
+    scorer.py       # Claude API: score 0–10 + reason; rate-limit handling
     dedup.py        # is_duplicate()
-  main.py           # Entry point; pipeline_worker; calls set_my_commands() on startup
+    keyword_filter.py # Fast keyword pre-filter (no LLM cost)
+  models.py         # Post (with .link property), Score, UserConfig dataclasses
+  main.py           # Entry point; pipeline_worker; log bot setup; calls set_my_commands()
   config.py         # Settings (pydantic); instantiated at module level — needs env vars at import time
+  database.py       # aiosqlite: schema, dedup, user_config CRUD
+  watcher/
+    client.py       # Pyrogram user client setup
+    handler.py      # on_raw_update → puts Post into asyncio.Queue
+    poller.py       # Fallback: polls each channel every 60s
 tests/
-  conftest.py       # Injects dummy env vars before collection (needed by config.py)
-  test_commands.py  # 31+ tests for all command handlers + FSM states
-  test_models.py    # 15 tests for Post.from_message()
-  test_notifier.py  # 12 tests for format_notification()
-  test_dedup.py     # 4 tests for is_duplicate()
-  test_tg_resolver.py # 15 tests for is_tg_link / resolve_tg_link
-  test_scraper.py   # scraper tests incl. t.me-skip behavior
+  test_commands.py      # 65 tests for command handlers + FSM states
+  test_log_handler.py   # 21 tests for TelegramLogHandler
+  test_models.py        # 15 tests for Post.from_message()
+  test_database.py      # 13 tests for database CRUD
+  test_notifier.py      # 12 tests for format_notification()
+  test_scraper.py       # 11 tests for scraper incl. t.me-skip behavior
+  test_keyword_filter.py # 7 tests for keyword filtering
+  test_tg_resolver.py   # 15 tests for is_tg_link / resolve_tg_link
+  test_scorer.py        # 4 tests for Claude scorer
+  test_dedup.py         # 4 tests for is_duplicate()
 ```
 
 ## Key Design Decisions
@@ -57,14 +68,11 @@ Job channels use a two-post pattern: summary post with a `text_link` entity poin
 - `resolve_tg_link(url, client)` — returns `msg.text or msg.caption or None`
 - `scraper.py` filters out t.me URLs before HTTP fetching; `main.py` resolves them post-scrape and appends content
 
-### config.py Import Side Effect
-`config.py` calls `Settings()` at module level. Any test file that imports from `ahsoka.*` will fail unless the required env vars are set first. `tests/conftest.py` handles this with `os.environ.setdefault(...)` for all 5 required vars.
+### Log Forwarding (log_handler.py)
+A dedicated Telegram bot (optional, via `LOG_BOT_TOKEN`) forwards INFO+ log records to the owner in real time. Noisy loggers (`aiogram`, `pyrogram`, `httpx`, `httpcore`) are filtered out. Messages are truncated to Telegram's 4096-char limit (tail preserved). The handler is fire-and-forget via `loop.create_task()`.
 
-## Git Branches (PRs)
-- PR #2: Test coverage expansion + keyword command split
-- PR #3: Bot command menu sync on startup (`set_my_commands`)
-- PR #4: FSM wait-for-input behavior
-- PR #5: Telegram deep link resolution via Pyrogram (`claude/resolve-tg-deep-links`)
+### config.py Import Side Effect
+`config.py` calls `Settings()` at module level. Any test file that imports from `ahsoka.*` will fail unless the required env vars are set first. Tests that need `Settings` use `MagicMock(spec=Settings)` to avoid the import side effect.
 
 ## Running Tests
 ```bash
