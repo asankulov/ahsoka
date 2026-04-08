@@ -33,8 +33,12 @@ jobs:
             done
 
             echo ''
-            echo '=== last 80 log lines ==='
-            sudo journalctl -u ahsoka -n 80 --no-pager
+            echo '=== restart count ==='
+            sudo systemctl show ahsoka --property=NRestarts,ExecMainStartTimestamp
+
+            echo ''
+            echo '=== last 200 log lines ==='
+            sudo journalctl -u ahsoka -n 200 --no-pager
           " | tee diagnostics.txt
 
       - name: Upload diagnostics artifact
