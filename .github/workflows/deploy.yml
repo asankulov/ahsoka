@@ -47,14 +47,19 @@ jobs:
             ./ ahsoka@${{ secrets.DEPLOY_HOST }}:/home/ahsoka/ahsoka/
 
       - name: Inject secrets into .env
+        env:
+          DOTENV: |
+            BOT_TOKEN=${{ secrets.BOT_TOKEN }}
+            LOG_BOT_TOKEN=${{ secrets.LOG_BOT_TOKEN }}
+            OWNER_CHAT_ID=${{ secrets.OWNER_CHAT_ID }}
+            ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+            TELEGRAM_API_ID=${{ secrets.TELEGRAM_API_ID }}
+            TELEGRAM_API_HASH=${{ secrets.TELEGRAM_API_HASH }}
+            CLAUDE_MODEL=${{ vars.CLAUDE_MODEL }}
+            DEFAULT_SCORE_THRESHOLD=${{ vars.DEFAULT_SCORE_THRESHOLD }}
         run: |
-          ssh ahsoka@${{ secrets.DEPLOY_HOST }} "
-            cd /home/ahsoka/ahsoka &&
-            touch .env &&
-            grep -q '^LOG_BOT_TOKEN=' .env \
-              && sed -i 's|^LOG_BOT_TOKEN=.*|LOG_BOT_TOKEN=8501917593:AAFtZUQas6CZijwh9tqV3Rj092_AE20H9zw|' .env \
-              || echo 'LOG_BOT_TOKEN=8501917593:AAFtZUQas6CZijwh9tqV3Rj092_AE20H9zw' >> .env
-          "
+          printf '%s\n' "$DOTENV" | grep -v '=$' \
+            | ssh ahsoka@${{ secrets.DEPLOY_HOST }} "cat > /home/ahsoka/ahsoka/.env"
 
       - name: Install deps and restart service
         run: |
