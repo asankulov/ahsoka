@@ -51,7 +51,7 @@ async def _process_single(
             if resolved:
                 content += f"\n\n--- linked from {url} ---\n{resolved}"
     score = await score_post(anthropic, post, content, config, settings.claude_model)
-    logger.info("Scored %s/%s: %d/10 — %s", post.channel_id, post.message_id, score.score, score.reason)
+    logger.info("Scored %s — %d/10 — %s", post.link, score.score, score.reason)
     await db.mark_seen(conn, post.channel_id, post.message_id, score.score)
     if not config.paused and score.score >= config.threshold:
         await send_notification(bot, settings.owner_chat_id, post, score)
@@ -75,10 +75,7 @@ async def _process_fanout(
         else:
             content = await scrape_url(url, post.text, timeout=settings.scrape_timeout_s)
         score = await score_post(anthropic, post, content, config, settings.claude_model)
-        logger.info(
-            "Scored %s/%s [%s]: %d/10 — %s",
-            post.channel_id, post.message_id, url, score.score, score.reason,
-        )
+        logger.info("Scored %s [%s] — %d/10 — %s", post.link, url, score.score, score.reason)
         await db.mark_seen(conn, post.channel_id, post.message_id, score.score, url=url)
         if not config.paused and score.score >= config.threshold:
             await send_notification(bot, settings.owner_chat_id, post, score, url=url)
