@@ -84,7 +84,7 @@ Post link is placed first in the message to trigger Telegram's rich link preview
 Job channels use a two-post pattern: summary post with a `text_link` entity pointing to a full description post. HTTP fetching of `t.me` URLs fails; the Pyrogram client fetches the linked message directly.
 
 ### Log Forwarding (log_handler.py)
-A dedicated Telegram bot (optional, via `LOG_BOT_TOKEN`) forwards INFO+ log records to the owner. Noisy loggers are filtered out. Messages truncated to 4096 chars.
+A dedicated Telegram bot (optional, via `LOG_BOT_TOKEN`) forwards DEBUG+ log records to the owner. Noisy loggers are filtered out. Messages truncated to 4096 chars.
 
 ### config.py Import Side Effect
 `config.py` calls `Settings()` at module level. Tests that need `Settings` use `MagicMock(spec=Settings)` to avoid the import side effect.
