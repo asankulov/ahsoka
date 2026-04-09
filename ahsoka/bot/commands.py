@@ -439,6 +439,21 @@ def register_bot_commands(
     # Admin commands (hidden from bot menu)
     # -------------------------------------------------------------------------
 
+    @admin_router.message(Command("admin"))
+    async def cmd_admin(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        lines = [
+            "Admin commands:",
+            "",
+            "  /removechannel -100123 - Remove a channel from watchlist",
+            "  /users - List all registered users",
+            "  /ban 123456 - Ban a user (stops notifications)",
+            "  /unban 123456 - Unban a user",
+            "  /stats - Show usage statistics (users, posts, notifications)",
+            "  /admin - Show this help",
+        ]
+        await message.reply("\n".join(lines))
+
     @admin_router.message(Command("removechannel"))
     async def cmd_removechannel(message: Message, state: FSMContext) -> None:
         await state.clear()
