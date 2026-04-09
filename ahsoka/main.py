@@ -184,14 +184,21 @@ async def main() -> None:
         except Exception as exc:
             logger.error("Log bot health check failed: %s — verify LOG_BOT_TOKEN", exc)
         _tg_handler = TelegramLogHandler(log_bot, settings.owner_chat_id)
-        _tg_handler.setLevel(logging.INFO)
+        _tg_handler.setLevel(logging.DEBUG)
         _tg_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s\n%(message)s"))
         logging.getLogger().addHandler(_tg_handler)
         logger.info("Telegram log handler registered (INFO+) via dedicated log bot")
 
-    # Sync command menu with Telegram so the "/" autocomplete is always current
+    # Sync command menu and bot description with Telegram
     try:
         await bot.set_my_commands(BOT_COMMANDS)
+        await bot.set_my_description(
+            "Ahsoka monitors Telegram job channels, scores posts with AI, "
+            "and sends you only the ones that match your filters."
+        )
+        await bot.set_my_short_description(
+            "AI-powered job filter bot for Telegram channels"
+        )
         logger.info("Bot command menu updated (%d commands)", len(BOT_COMMANDS))
     except Exception as exc:
         logger.warning("Failed to update bot command menu: %s", exc)
