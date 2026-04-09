@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 
 # Pyrogram's sync.py calls asyncio.get_event_loop() at import time.
@@ -79,6 +80,10 @@ async def _process_single(
     await db.mark_seen(
         conn, post.channel_id, post.message_id, score.score,
         score_reason=score.reason, apply_info=score.apply,
+        stack_tags=json.dumps(score.stack),
+        seniority=score.seniority,
+        remote=score.remote,
+        red_flags=json.dumps(score.red_flags),
     )
     await _fan_out_to_users(conn, bot, post, score)
 
@@ -104,6 +109,10 @@ async def _process_fanout(
         await db.mark_seen(
             conn, post.channel_id, post.message_id, score.score, url=url,
             score_reason=score.reason, apply_info=score.apply,
+            stack_tags=json.dumps(score.stack),
+            seniority=score.seniority,
+            remote=score.remote,
+            red_flags=json.dumps(score.red_flags),
         )
         await _fan_out_to_users(conn, bot, post, score, url=url)
 

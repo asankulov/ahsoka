@@ -23,11 +23,19 @@ def _mock_client(data: dict) -> AsyncMock:
 
 
 async def test_score_parsed_correctly():
-    client = _mock_client({"score": 8, "reason": "Good match", "apply": "hr@co.com"})
+    client = _mock_client({
+        "score": 8, "reason": "Good match", "apply": "hr@co.com",
+        "stack": ["python", "django"], "seniority": "senior",
+        "remote": "remote", "red_flags": ["no salary info"],
+    })
     score = await score_post(client, make_post(), "content", "model")
     assert score.score == 8
     assert score.reason == "Good match"
     assert score.apply == "hr@co.com"
+    assert score.stack == ["python", "django"]
+    assert score.seniority == "senior"
+    assert score.remote == "remote"
+    assert score.red_flags == ["no salary info"]
 
 
 async def test_apply_defaults_to_empty_string():
@@ -44,6 +52,10 @@ async def test_malformed_json_returns_zero():
     score = await score_post(client, make_post(), "content", "model")
     assert score.score == 0
     assert score.reason == "parse error"
+    assert score.stack == []
+    assert score.seniority == "any"
+    assert score.remote == "unknown"
+    assert score.red_flags == []
 
 
 async def test_content_truncated_to_4000_chars():
@@ -54,3 +66,36 @@ async def test_content_truncated_to_4000_chars():
     prompt = call_kwargs.kwargs["messages"][0]["content"]
     assert long_content[:4000] in prompt
     assert long_content[4001:] not in prompt
+
+
+async def test_invalid_seniority_falls_back_to_any():
+    client = _mock_client({
+        "score": 6, "reason": "ok", "seniority": "expert",
+    })
+    score = await score_post(client, make_post(), "content", "model")
+    assert score.seniority == "any"
+
+
+async def test_invalid_remote_falls_back_to_unknown():
+    client = _mock_client({
+        "score": 6, "reason": "ok", "remote": "flexible",
+    })
+    score = await score_post(client, make_post(), "content", "model")
+    assert score.remote == "unknown"
+
+
+async def test_stack_string_wrapped_in_list():
+    client = _mock_client({
+        "score": 7, "reason": "ok", "stack": "python",
+    })
+    score = await score_post(client, make_post(), "content", "model")
+    assert score.stack == ["python"]
+
+
+async def test_missing_new_fields_get_defaults():
+    client = _mock_client({"score": 5, "reason": "ok"})
+    score = await score_post(client, make_post(), "content", "model")
+    assert score.stack == []
+    assert score.seniority == "any"
+    assert score.remote == "unknown"
+    assert score.red_flags == []

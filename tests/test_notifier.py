@@ -20,8 +20,8 @@ def make_post(
     )
 
 
-def make_score(score: int = 8, reason: str = "Good match", apply: str = "") -> Score:
-    return Score(score=score, reason=reason, apply=apply)
+def make_score(score: int = 8, reason: str = "Good match", apply: str = "", **kwargs) -> Score:
+    return Score(score=score, reason=reason, apply=apply, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -117,17 +117,63 @@ def test_full_notification_order():
     """Link comes first, then score, then apply, then body, then footer."""
     result = format_notification(
         make_post(text="Job body", channel_name="chan"),
-        make_score(score=7, reason="OK match", apply="https://apply.io"),
+        make_score(score=7, reason="OK match", apply="https://apply.io",
+                   red_flags=["vague comp"], stack=["python"], seniority="senior", remote="remote"),
     )
     link_pos = result.index("t.me/")
-    score_pos = result.index("\u2b50")
-    apply_pos = result.index("\U0001f4ec")
+    score_pos = result.index("⭐")
+    apply_pos = result.index("📬")
+    flags_pos = result.index("⚠️")
+    tags_pos = result.index("🏷")
     body_pos = result.index("Job body")
     footer_pos = result.index("@chan")
-    assert link_pos < score_pos < apply_pos < body_pos < footer_pos
+    assert link_pos < score_pos < apply_pos < flags_pos < tags_pos < body_pos < footer_pos
 
 
 def test_footer_does_not_duplicate_link():
     """Post link should only appear once (at top for preview), not in footer."""
     result = format_notification(make_post(channel_name="jobschannel"), make_score())
     assert result.count("t.me/jobschannel/1") == 1
+
+
+# ---------------------------------------------------------------------------
+# Red flags and tags
+# ---------------------------------------------------------------------------
+
+def test_red_flags_displayed():
+    result = format_notification(make_post(), make_score(red_flags=["vague compensation", "no company name"]))
+    assert "⚠️ vague compensation, no company name" in result
+
+
+def test_no_red_flags_line_when_empty():
+    result = format_notification(make_post(), make_score(red_flags=[]))
+    assert "⚠️" not in result
+
+
+def test_tags_line_with_stack_seniority_remote():
+    result = format_notification(
+        make_post(),
+        make_score(stack=["python", "django"], seniority="senior", remote="remote"),
+    )
+    assert "🏷 python django · senior · remote" in result
+
+
+def test_tags_line_omits_any_and_unknown():
+    result = format_notification(make_post(), make_score(stack=["python"], seniority="any", remote="unknown"))
+    assert "🏷 python" in result
+    assert "any" not in result.split("🏷")[1]
+    assert "unknown" not in result.split("🏷")[1]
+
+
+def test_no_tags_line_when_all_defaults():
+    result = format_notification(make_post(), make_score(stack=[], seniority="any", remote="unknown"))
+    assert "🏷" not in result
+
+
+def test_tags_stack_capped_at_five():
+    result = format_notification(
+        make_post(),
+        make_score(stack=["a", "b", "c", "d", "e", "f", "g"]),
+    )
+    tags_part = result.split("🏷 ")[1].split("\n")[0]
+    assert "f" not in tags_part

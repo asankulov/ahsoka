@@ -15,6 +15,10 @@ CREATE TABLE IF NOT EXISTS seen_posts (
     score        INTEGER,
     score_reason TEXT    NOT NULL DEFAULT '',
     apply_info   TEXT    NOT NULL DEFAULT '',
+    stack_tags   TEXT    NOT NULL DEFAULT '',
+    seniority    TEXT    NOT NULL DEFAULT '',
+    remote       TEXT    NOT NULL DEFAULT '',
+    red_flags    TEXT    NOT NULL DEFAULT '',
     scored_at    TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(channel_id, message_id, url)
 );
@@ -152,6 +156,10 @@ async def init_db(conn: aiosqlite.Connection, owner_chat_id: int = 0) -> None:
         ("url", "TEXT NOT NULL DEFAULT ''"),
         ("score_reason", "TEXT NOT NULL DEFAULT ''"),
         ("apply_info", "TEXT NOT NULL DEFAULT ''"),
+        ("stack_tags", "TEXT NOT NULL DEFAULT ''"),
+        ("seniority", "TEXT NOT NULL DEFAULT ''"),
+        ("remote", "TEXT NOT NULL DEFAULT ''"),
+        ("red_flags", "TEXT NOT NULL DEFAULT ''"),
     ]:
         try:
             await conn.execute(f"ALTER TABLE seen_posts ADD COLUMN {col} {default}")
@@ -241,12 +249,18 @@ async def mark_seen(
     url: str = "",
     score_reason: str = "",
     apply_info: str = "",
+    stack_tags: str = "",
+    seniority: str = "",
+    remote: str = "",
+    red_flags: str = "",
 ) -> None:
     await conn.execute(
         """INSERT OR IGNORE INTO seen_posts
-           (channel_id, message_id, url, score, score_reason, apply_info)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (channel_id, message_id, url, score, score_reason, apply_info),
+           (channel_id, message_id, url, score, score_reason, apply_info,
+            stack_tags, seniority, remote, red_flags)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (channel_id, message_id, url, score, score_reason, apply_info,
+         stack_tags, seniority, remote, red_flags),
     )
     await conn.commit()
 
