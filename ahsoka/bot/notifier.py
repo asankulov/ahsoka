@@ -9,7 +9,9 @@ logger = logging.getLogger(__name__)
 
 
 def format_notification(post: Post, score: Score, url: str | None = None) -> str:
-    lines = [f"⭐ {score.score}/10 — {score.reason}"]
+    lines = [post.link]
+    lines.append("")
+    lines.append(f"⭐ {score.score}/10 — {score.reason}")
     if score.apply:
         lines.append(f"📬 {score.apply}")
     if url:
@@ -20,7 +22,7 @@ def format_notification(post: Post, score: Score, url: str | None = None) -> str
         date_str = post.timestamp.strftime("%b %-d %H:%M")
     else:
         date_str = str(post.timestamp)
-    lines.append(f"\n— @{post.channel_name} · {date_str} · {post.link}")
+    lines.append(f"\n— @{post.channel_name} · {date_str}")
     return "\n".join(lines)
 
 

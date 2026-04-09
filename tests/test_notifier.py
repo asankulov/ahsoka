@@ -25,17 +25,27 @@ def make_score(score: int = 8, reason: str = "Good match", apply: str = "") -> S
 
 
 # ---------------------------------------------------------------------------
+# Link preview (post link first)
+# ---------------------------------------------------------------------------
+
+def test_post_link_is_first_line():
+    result = format_notification(make_post(), make_score())
+    first_line = result.split("\n")[0]
+    assert "t.me/" in first_line
+
+
+# ---------------------------------------------------------------------------
 # Score line
 # ---------------------------------------------------------------------------
 
 def test_score_line_present():
     result = format_notification(make_post(), make_score(score=9, reason="Strong fit"))
-    assert "⭐ 9/10 — Strong fit" in result
+    assert "\u2b50 9/10 \u2014 Strong fit" in result
 
 
 def test_score_boundaries_zero_and_ten():
-    assert "⭐ 0/10" in format_notification(make_post(), make_score(score=0))
-    assert "⭐ 10/10" in format_notification(make_post(), make_score(score=10))
+    assert "\u2b50 0/10" in format_notification(make_post(), make_score(score=0))
+    assert "\u2b50 10/10" in format_notification(make_post(), make_score(score=10))
 
 
 # ---------------------------------------------------------------------------
@@ -44,12 +54,12 @@ def test_score_boundaries_zero_and_ten():
 
 def test_apply_line_included_when_present():
     result = format_notification(make_post(), make_score(apply="https://apply.example.com"))
-    assert "📬 https://apply.example.com" in result
+    assert "\U0001f4ec https://apply.example.com" in result
 
 
 def test_apply_line_absent_when_empty():
     result = format_notification(make_post(), make_score(apply=""))
-    assert "📬" not in result
+    assert "\U0001f4ec" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +94,6 @@ def test_footer_contains_channel_name():
 
 
 def test_footer_contains_formatted_date():
-    # datetime(2024, 3, 5) → "Mar 5"
     result = format_notification(make_post(timestamp=datetime(2024, 3, 5)), make_score())
     assert "Mar 5" in result
 
@@ -105,13 +114,20 @@ def test_result_is_string():
 
 
 def test_full_notification_order():
-    """Score line appears before post text, footer comes last."""
+    """Link comes first, then score, then apply, then body, then footer."""
     result = format_notification(
         make_post(text="Job body", channel_name="chan"),
         make_score(score=7, reason="OK match", apply="https://apply.io"),
     )
-    score_pos = result.index("⭐")
-    apply_pos = result.index("📬")
+    link_pos = result.index("t.me/")
+    score_pos = result.index("\u2b50")
+    apply_pos = result.index("\U0001f4ec")
     body_pos = result.index("Job body")
     footer_pos = result.index("@chan")
-    assert score_pos < apply_pos < body_pos < footer_pos
+    assert link_pos < score_pos < apply_pos < body_pos < footer_pos
+
+
+def test_footer_does_not_duplicate_link():
+    """Post link should only appear once (at top for preview), not in footer."""
+    result = format_notification(make_post(channel_name="jobschannel"), make_score())
+    assert result.count("t.me/jobschannel/1") == 1
