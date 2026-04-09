@@ -68,7 +68,17 @@ class Score:
 
 
 @dataclass
+class User:
+    user_id: int
+    notify_chat_id: int
+    is_admin: bool = False
+    is_banned: bool = False
+
+
+@dataclass
 class UserConfig:
+    user_id: int = 0
+    notify_chat_id: int = 0
     stack: str = ""
     seniority: str = ""
     remote: str = ""
