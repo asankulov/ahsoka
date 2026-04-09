@@ -14,6 +14,17 @@ def format_notification(post: Post, score: Score, url: str | None = None) -> str
     lines.append(f"⭐ {score.score}/10 — {score.reason}")
     if score.apply:
         lines.append(f"📬 {score.apply}")
+    if score.red_flags:
+        lines.append(f"⚠️ {', '.join(score.red_flags)}")
+    tags = []
+    if score.stack:
+        tags.append(" ".join(score.stack[:5]))
+    if score.seniority != "any":
+        tags.append(score.seniority)
+    if score.remote != "unknown":
+        tags.append(score.remote)
+    if tags:
+        lines.append(f"🏷 {' · '.join(tags)}")
     if url:
         lines.append(f"🔗 {url}")
     lines.append("")

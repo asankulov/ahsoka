@@ -66,6 +66,21 @@ async def test_mark_seen_stores_score_reason_and_apply(conn):
     assert row == (8, "Good match", "hr@co.com")
 
 
+async def test_mark_seen_stores_extracted_fields(conn):
+    await mark_seen(
+        conn, 1, 2, score=8,
+        stack_tags='["python", "django"]',
+        seniority="senior",
+        remote="remote",
+        red_flags='["no salary info"]',
+    )
+    async with conn.execute(
+        "SELECT stack_tags, seniority, remote, red_flags FROM seen_posts WHERE channel_id = 1 AND message_id = 2"
+    ) as cur:
+        row = await cur.fetchone()
+    assert row == ('["python", "django"]', "senior", "remote", '["no salary info"]')
+
+
 # --- User management ---
 
 

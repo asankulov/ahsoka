@@ -65,6 +65,10 @@ class Score:
     score: int
     reason: str
     apply: str = ""
+    stack: list[str] = field(default_factory=list)
+    seniority: str = "any"
+    remote: str = "unknown"
+    red_flags: list[str] = field(default_factory=list)
 
 
 @dataclass
