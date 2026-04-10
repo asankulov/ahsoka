@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -c 'if .tool_input.subagent_type == \"cara-dune\" then {hookSpecificOutput: {hookEventName: \"PreToolUse\", additionalContext: \"WATCH LIST when reviewing cara-dune output: (1) Did it write anything under .claude/agent-memory/cara-dune/? If not, `memory: project` is not auto-injecting — add a short memory pointer back to the agent body (not the full preamble). (2) Did it run `uv run --extra dev pytest`? If it fell back to bare `pytest`, tighten rule 5 in .claude/agents/cara-dune.md to make CLAUDE.md read mandatory. (3) Did its output include the `OVERALL COVERAGE: <int>%` line on its own line? ig-11 parses this exactly.\"}} else empty end'"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,5 +1,7 @@
 # Ahsoka — Project Context
 
+**Workflow:** When working in this directory, follow the principal engineer workflow in [.claude/PRINCIPAL.md](.claude/PRINCIPAL.md).
+
 ## What This Is
 A multi-user Telegram job-filter bot written in Python 3.12+. It monitors public job channels via Pyrogram, scrapes linked pages, scores posts with Claude AI **once per post**, and fans out matching notifications to each user based on their personal filters.
 
