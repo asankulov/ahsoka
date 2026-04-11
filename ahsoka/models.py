@@ -72,6 +72,32 @@ class Score:
 
 
 @dataclass
+class PersonalizedVerdict:
+    """Per-user scoring result from the Anthropic Batch API."""
+    user_id: int
+    score: int
+    reason: str
+    matched: bool
+    apply: str = ""
+    red_flags: list[str] = field(default_factory=list)
+    stack: list[str] = field(default_factory=list)
+    seniority: str = "any"
+    remote: str = "unknown"
+
+    def to_score(self) -> "Score":
+        """Adapter: produce a Score compatible with format_notification."""
+        return Score(
+            score=self.score,
+            reason=self.reason,
+            apply=self.apply,
+            red_flags=self.red_flags,
+            stack=self.stack,
+            seniority=self.seniority,
+            remote=self.remote,
+        )
+
+
+@dataclass
 class User:
     user_id: int
     notify_chat_id: int

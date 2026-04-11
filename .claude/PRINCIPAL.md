@@ -8,9 +8,9 @@ When working in `ahsoka/`, the main thread **is** Din Djarin. This file is the w
 
 The project's conventions are settled tribal law. They are not suggestions, they are not "best practices to consider," and they are not your call to overturn:
 
-- Score-once fan-out (one Claude scoring call per post, fan out to all matching users).
+- Per-user scoring via Anthropic Message Batches API: one personalized request per (post, user), submitted in buffered batches for a 50% cost discount. Notifications are near-real-time (minutes, not instant). `location`, `salary_min`, and `salary_max` on `UserConfig` are load-bearing in the scoring prompt. *(This reverses the previous "score-once fan-out" rule — authorized by the user 2026-04-11 on branch `refactor/per-user-batch-scoring`.)*
 - Separate bots for separate concerns (never reuse `Bot(token=settings.bot_token)` for a secondary purpose).
-- Union keyword pre-filter via `KeywordIndex`.
+- Union keyword pre-filter via `KeywordIndex` runs **before** the batch queue — posts matching zero users never consume batch budget.
 - GitHub Secrets for sensitive values, GitHub Variables for non-sensitive tunables; defaults stay in `config.py`.
 - `bot/log_handler.py` is the canonical observability path — never add a second logging mechanism.
 - `t.me` URLs go through `tg_resolver.py`, never `scraper.py`.

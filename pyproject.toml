@@ -8,7 +8,7 @@ dependencies = [
     "aiogram>=3",
     "httpx",
     "trafilatura",
-    "anthropic",
+    "anthropic>=0.40.0",
     "aiosqlite",
     "pydantic-settings",
 ]
@@ -17,6 +17,7 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-asyncio",
+    "pytest-cov",
 ]
 
 [tool.pytest.ini_options]
