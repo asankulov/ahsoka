@@ -1,8 +1,10 @@
+import json
 import logging
+from datetime import datetime, timezone
 
 import aiosqlite
 
-from ahsoka.models import User, UserConfig
+from ahsoka.models import PersonalizedVerdict, User, UserConfig
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,27 @@ CREATE TABLE IF NOT EXISTS user_notified (
     url        TEXT    NOT NULL DEFAULT '',
     sent_at    TEXT    NOT NULL DEFAULT (datetime('now')),
     UNIQUE(user_id, channel_id, message_id, url)
+);
+
+CREATE TABLE IF NOT EXISTS post_verdicts (
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    score      INTEGER NOT NULL,
+    reason     TEXT    NOT NULL,
+    matched    INTEGER NOT NULL,
+    apply      TEXT,
+    red_flags  TEXT,
+    scored_at  TEXT    NOT NULL,
+    PRIMARY KEY (channel_id, message_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_post_verdicts_user ON post_verdicts(user_id, scored_at);
+
+CREATE TABLE IF NOT EXISTS pending_batches (
+    batch_id     TEXT PRIMARY KEY,
+    submitted_at TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    request_map  TEXT NOT NULL
 );
 """
 
@@ -445,3 +468,110 @@ async def delete_old_posts(conn: aiosqlite.Connection, days: int = 30) -> int:
     )
     await conn.commit()
     return cursor.rowcount  # type: ignore[return-value]
+
+
+# --- Personalized verdicts ---
+
+
+async def store_verdict(
+    conn: aiosqlite.Connection,
+    verdict: PersonalizedVerdict,
+    channel_id: int,
+    message_id: int,
+) -> None:
+    """Upsert a per-user verdict for a (channel_id, message_id) pair."""
+    scored_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    await conn.execute(
+        """INSERT OR REPLACE INTO post_verdicts
+           (channel_id, message_id, user_id, score, reason, matched, apply, red_flags, scored_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            channel_id,
+            message_id,
+            verdict.user_id,
+            verdict.score,
+            verdict.reason,
+            int(verdict.matched),
+            verdict.apply,
+            json.dumps(verdict.red_flags),
+            scored_at,
+        ),
+    )
+    await conn.commit()
+
+
+async def get_verdicts_for_post(
+    conn: aiosqlite.Connection,
+    channel_id: int,
+    message_id: int,
+) -> list[PersonalizedVerdict]:
+    """Return all stored verdicts for a given post."""
+    async with conn.execute(
+        """SELECT user_id, score, reason, matched, apply, red_flags
+           FROM post_verdicts
+           WHERE channel_id = ? AND message_id = ?""",
+        (channel_id, message_id),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [
+        PersonalizedVerdict(
+            user_id=row[0],
+            score=row[1],
+            reason=row[2],
+            matched=bool(row[3]),
+            apply=row[4] or "",
+            red_flags=json.loads(row[5]) if row[5] else [],
+        )
+        for row in rows
+    ]
+
+
+# --- Batch lifecycle ---
+
+
+async def save_pending_batch(
+    conn: aiosqlite.Connection,
+    batch_id: str,
+    request_map: dict[str, tuple[int, int, int]],
+) -> None:
+    """Persist a newly submitted batch so it can be recovered on restart."""
+    submitted_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # request_map: custom_id → (channel_id, message_id, user_id) as a JSON list
+    serialized = json.dumps({k: list(v) for k, v in request_map.items()})
+    await conn.execute(
+        """INSERT OR IGNORE INTO pending_batches (batch_id, submitted_at, status, request_map)
+           VALUES (?, ?, 'submitted', ?)""",
+        (batch_id, submitted_at, serialized),
+    )
+    await conn.commit()
+
+
+async def get_pending_batches(
+    conn: aiosqlite.Connection,
+) -> list[dict]:
+    """Return all batches with status='submitted' for restart recovery."""
+    async with conn.execute(
+        "SELECT batch_id, submitted_at, request_map FROM pending_batches WHERE status = 'submitted'"
+    ) as cur:
+        rows = await cur.fetchall()
+    return [
+        {
+            "batch_id": row[0],
+            "submitted_at": row[1],
+            "request_map": json.loads(row[2]),
+        }
+        for row in rows
+    ]
+
+
+async def mark_batch_complete(
+    conn: aiosqlite.Connection,
+    batch_id: str,
+    status: str = "complete",
+) -> None:
+    """Update batch status to 'complete' or 'failed'."""
+    await conn.execute(
+        "UPDATE pending_batches SET status = ? WHERE batch_id = ?",
+        (status, batch_id),
+    )
+    await conn.commit()

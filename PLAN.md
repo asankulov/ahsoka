@@ -291,6 +291,47 @@ WantedBy=multi-user.target
 
 ---
 
+## Batch Scoring — Operator Runbook
+
+Scoring goes through Anthropic's **Message Batches API** (per-user personalized prompts, 50% flat cost discount). Notifications are **near-real-time, not instant**.
+
+**Typical notification latency**
+
+`BATCH_FLUSH_SECONDS` (default 10 min) + Anthropic batch processing time (typically 1–15 min) = **10–25 min end-to-end**. This is expected behaviour — not a bug. Do not page anyone for the first 30 minutes after a post lands in a watched channel.
+
+**Serialization and worst-case starvation**
+
+`batch_worker` processes one batch at a time. While a batch is in-flight, every subsequent post waits to be scored — a slow-responding batch blocks the entire scoring pipeline for its full duration. This is **by design**: the architecture deliberately accepts near-real-time (minutes) latency in exchange for the 50% batch discount and per-user personalized scoring.
+
+The starvation window is bounded by `BATCH_MAX_WAIT_SECONDS` (default 30 min). When that ceiling is reached:
+- The in-flight batch is marked failed in `pending_batches`.
+- `batch_worker` moves on immediately; the next flush proceeds.
+- Posts already submitted in the failed batch are **lost** — no retry, no notification. This is consistent with the plan's "if batch fails, requests drop" rollback contract.
+
+**Tunables** (non-sensitive — set as GitHub Variables or omit to use config.py defaults):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `BATCH_FLUSH_SIZE` | `50` | Flush immediately when this many per-user scoring requests are queued |
+| `BATCH_FLUSH_SECONDS` | `600` | Flush after this many seconds even if size threshold not reached |
+| `BATCH_POLL_INTERVAL_SECONDS` | `60` | How often the poller checks Anthropic for batch completion |
+| `BATCH_MAX_WAIT_SECONDS` | `1800` | Max seconds to wait for a single batch before marking it failed and moving on |
+
+**Observability** — watch the admin log bot for these lifecycle lines:
+- `batch submitted batch_id=... size=...` — batch sent to Anthropic
+- `batch complete batch_id=... duration_s=...` — Anthropic finished processing
+- `batch verdicts stored n=...` — results written to DB, fan-out begins
+- `batch exceeded max_wait_seconds batch_id=...` — batch timed out; affected posts are dropped
+
+If you see `batch exceeded max_wait_seconds` warnings, the Anthropic batch queue is backed up. Mitigations in order:
+1. Reduce `BATCH_FLUSH_SIZE` — fewer requests per batch means faster Anthropic processing.
+2. Increase `BATCH_FLUSH_SECONDS` — less frequent flushes while the queue is slow.
+3. Raise `BATCH_MAX_WAIT_SECONDS` temporarily if the backlog is known-transient.
+
+**Rollback** — revert the batch-scoring commit; generic synchronous scoring resumes immediately on the next deploy. Orphan rows in `post_verdicts` left by the batch pipeline are harmless and do not affect bot operation.
+
+---
+
 ## CI/CD (.github/workflows/deploy.yml)
 
 Triggers on every push to `main`:

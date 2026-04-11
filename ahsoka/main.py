@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 
 # Pyrogram's sync.py calls asyncio.get_event_loop() at import time.
@@ -15,7 +14,7 @@ from aiogram import Bot, Dispatcher
 
 from ahsoka import database as db
 from ahsoka.config import settings
-from ahsoka.models import Post, Score
+from ahsoka.models import Post, PersonalizedVerdict
 from ahsoka.watcher.client import build_pyrogram_client
 from ahsoka.watcher.handler import register_watcher_handlers
 from ahsoka.watcher.poller import channel_poller
@@ -23,7 +22,8 @@ from ahsoka.pipeline.dedup import is_duplicate
 from ahsoka.pipeline.keyword_index import KeywordIndex
 from ahsoka.pipeline.user_filter import matches_user
 from ahsoka.pipeline.scraper import scrape_content, scrape_url
-from ahsoka.pipeline.scorer import score_post
+from ahsoka.pipeline.batch_queue import BatchQueue
+from ahsoka.pipeline.batch_submitter import BatchSubmitter
 from ahsoka.bot.commands import register_bot_commands, BOT_COMMANDS
 from ahsoka.bot.notifier import send_notification
 from ahsoka.pipeline.tg_resolver import is_tg_link, resolve_tg_link
@@ -35,21 +35,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def _fan_out_to_users(
+async def _fan_out_verdicts(
     conn: aiosqlite.Connection,
     bot: Bot,
-    post: Post,
-    score: Score,
+    results: list[tuple[Post, object, PersonalizedVerdict]],
     url: str = "",
 ) -> None:
-    """Send notifications to all matching users."""
-    configs = await db.get_all_active_configs(conn)
-    for config in configs:
-        if not matches_user(post, score, config):
+    """For each (post, config, verdict) triple: check matches_user, dedup, notify."""
+    for post, config, verdict in results:
+        if not matches_user(verdict, config):
             continue
         if await db.is_notified(conn, config.user_id, post.channel_id, post.message_id, url):
             continue
         try:
+            score = verdict.to_score()
             await send_notification(bot, config.notify_chat_id, post, score, url=url or None)
             await db.mark_notified(conn, config.user_id, post.channel_id, post.message_id, url)
         except Exception:
@@ -59,69 +58,64 @@ async def _fan_out_to_users(
             )
 
 
-async def _process_single(
+async def _run_batch(
     conn: aiosqlite.Connection,
     bot: Bot,
-    anthropic: AsyncAnthropic,
-    post: Post,
-    pyro,
+    submitter: BatchSubmitter,
+    batch_queue: BatchQueue,
 ) -> None:
-    if await is_duplicate(conn, post):
-        logger.debug("Duplicate: %s/%s", post.channel_id, post.message_id)
+    """Drain the queue, submit a batch, poll to completion, fan-out notifications."""
+    requests = await batch_queue.drain()
+    if not requests:
         return
-    content = await scrape_content(post, timeout=settings.scrape_timeout_s)
-    for url in post.urls:
-        if is_tg_link(url):
-            resolved = await resolve_tg_link(url, pyro)
-            if resolved:
-                content += f"\n\n--- linked from {url} ---\n{resolved}"
-    score = await score_post(anthropic, post, content, settings.claude_model)
-    logger.info("Scored %s — %d/10 — %s", post.link, score.score, score.reason)
-    await db.mark_seen(
-        conn, post.channel_id, post.message_id, score.score,
-        score_reason=score.reason, apply_info=score.apply,
-        stack_tags=json.dumps(score.stack),
-        seniority=score.seniority,
-        remote=score.remote,
-        red_flags=json.dumps(score.red_flags),
-    )
-    await _fan_out_to_users(conn, bot, post, score)
+
+    try:
+        batch_id = await submitter.submit(requests)
+    except Exception:
+        logger.exception("Batch submission failed — %d requests dropped", len(requests))
+        return
+
+    results = await submitter.poll_and_process(batch_id, requests)
+    if not results:
+        return
+
+    # Store verdicts, then fan-out
+    for post, _config, verdict in results:
+        await db.store_verdict(conn, verdict, post.channel_id, post.message_id)
+
+    logger.info("batch verdicts stored n=%d", len(results))
+    await _fan_out_verdicts(conn, bot, results)
 
 
-async def _process_fanout(
+async def batch_worker(
     conn: aiosqlite.Connection,
     bot: Bot,
-    anthropic: AsyncAnthropic,
-    post: Post,
-    pyro,
+    submitter: BatchSubmitter,
+    batch_queue: BatchQueue,
 ) -> None:
-    for url in post.urls:
-        if await is_duplicate(conn, post, url=url):
-            logger.debug("Duplicate URL: %s/%s %s", post.channel_id, post.message_id, url)
-            continue
-        if is_tg_link(url):
-            resolved = await resolve_tg_link(url, pyro)
-            content = "\n\n".join(filter(None, [post.text, resolved and f"--- linked from {url} ---\n{resolved}"]))
-        else:
-            content = await scrape_url(url, post.text, timeout=settings.scrape_timeout_s)
-        score = await score_post(anthropic, post, content, settings.claude_model)
-        logger.info("Scored %s [%s] — %d/10 — %s", post.link, url, score.score, score.reason)
-        await db.mark_seen(
-            conn, post.channel_id, post.message_id, score.score, url=url,
-            score_reason=score.reason, apply_info=score.apply,
-            stack_tags=json.dumps(score.stack),
-            seniority=score.seniority,
-            remote=score.remote,
-            red_flags=json.dumps(score.red_flags),
-        )
-        await _fan_out_to_users(conn, bot, post, score, url=url)
+    """Background task: flush → submit → poll → notify loop."""
+    while True:
+        try:
+            if await batch_queue.should_flush():
+                await _run_batch(conn, bot, submitter, batch_queue)
+        except asyncio.CancelledError:
+            # Graceful shutdown: attempt a final flush before exiting
+            logger.info("batch_worker cancelled — attempting final flush")
+            try:
+                await _run_batch(conn, bot, submitter, batch_queue)
+            except Exception:
+                logger.exception("Error during shutdown flush")
+            raise
+        except Exception:
+            logger.exception("Unexpected error in batch_worker")
+        await asyncio.sleep(10)
 
 
 async def pipeline_worker(
     queue: asyncio.Queue,
     conn: aiosqlite.Connection,
     bot: Bot,
-    anthropic: AsyncAnthropic,
+    batch_queue: BatchQueue,
     pyro,
     keyword_index: KeywordIndex,
 ) -> None:
@@ -137,14 +131,62 @@ async def pipeline_worker(
                 await db.mark_seen(conn, post.channel_id, post.message_id)
                 continue
 
+            # Snapshot active configs at receipt time
+            active_configs = await db.get_all_active_configs(conn)
+            if not active_configs:
+                logger.debug("No active users — skipping %s/%s", post.channel_id, post.message_id)
+                await db.mark_seen(conn, post.channel_id, post.message_id)
+                continue
+
             if len(post.urls) >= 2:
-                await _process_fanout(conn, bot, anthropic, post, pyro)
+                await _enqueue_fanout(conn, batch_queue, post, active_configs, pyro)
             else:
-                await _process_single(conn, bot, anthropic, post, pyro)
+                await _enqueue_single(conn, batch_queue, post, active_configs, pyro)
         except Exception:
             logger.exception("Pipeline error for %s/%s", post.channel_id, post.message_id)
         finally:
             queue.task_done()
+
+
+async def _enqueue_single(
+    conn: aiosqlite.Connection,
+    batch_queue: BatchQueue,
+    post: Post,
+    active_configs: list,
+    pyro,
+) -> None:
+    """Scrape content for a single-URL post, mark seen, and enqueue for scoring."""
+    content = await scrape_content(post, timeout=settings.scrape_timeout_s)
+    for url in post.urls:
+        if is_tg_link(url):
+            resolved = await resolve_tg_link(url, pyro)
+            if resolved:
+                content += f"\n\n--- linked from {url} ---\n{resolved}"
+    await db.mark_seen(conn, post.channel_id, post.message_id)
+    await batch_queue.enqueue(post, content, active_configs)
+
+
+async def _enqueue_fanout(
+    conn: aiosqlite.Connection,
+    batch_queue: BatchQueue,
+    post: Post,
+    active_configs: list,
+    pyro,
+) -> None:
+    """For multi-URL posts: one enqueue per URL, mark each as seen."""
+    for url in post.urls:
+        if await is_duplicate(conn, post, url=url):
+            logger.debug("Duplicate URL: %s/%s %s", post.channel_id, post.message_id, url)
+            continue
+        if is_tg_link(url):
+            resolved = await resolve_tg_link(url, pyro)
+            content = "\n\n".join(
+                filter(None, [post.text, resolved and f"--- linked from {url} ---\n{resolved}"])
+            )
+        else:
+            content = await scrape_url(url, post.text, timeout=settings.scrape_timeout_s)
+        await db.mark_seen(conn, post.channel_id, post.message_id, url=url)
+        await batch_queue.enqueue(post, content, active_configs)
 
 
 async def cleanup_worker(conn: aiosqlite.Connection) -> None:
@@ -152,6 +194,44 @@ async def cleanup_worker(conn: aiosqlite.Connection) -> None:
         await asyncio.sleep(86_400)  # 24 h
         deleted = await db.delete_old_posts(conn, days=30)
         logger.info("Cleanup: removed %d stale seen_posts rows", deleted)
+
+
+async def _recover_pending_batches(
+    conn: aiosqlite.Connection,
+    bot: Bot,
+    submitter: BatchSubmitter,
+) -> None:
+    """On startup: resume polling any batches that were in-flight when the process died."""
+    pending = await db.get_pending_batches(conn)
+    if not pending:
+        return
+    logger.info("Recovering %d in-flight batch(es) from previous run", len(pending))
+    for row in pending:
+        batch_id = row["batch_id"]
+        request_map = row["request_map"]
+        # We no longer have the original Post/UserConfig objects in memory,
+        # so we build minimal BatchRequest stubs from the stored request_map.
+        # The poll_and_process loop will parse verdicts from the API response;
+        # caller must fetch configs + posts from DB to fan-out.
+        logger.info(
+            "Recovering batch %s with %d requests — results will be stored but "
+            "no notifications will be sent (restart recovery path)",
+            batch_id, len(request_map),
+        )
+        try:
+            # Poll without a request list (recovery mode): just fetch and store verdicts.
+            await _recover_single_batch(submitter, batch_id, request_map)
+        except Exception:
+            logger.exception("Failed to recover batch %s", batch_id)
+
+
+async def _recover_single_batch(
+    submitter: BatchSubmitter,
+    batch_id: str,
+    request_map: dict,
+) -> None:
+    """Delegate recovery polling to BatchSubmitter.recover()."""
+    await submitter.recover(batch_id, request_map)
 
 
 async def main() -> None:
@@ -175,6 +255,18 @@ async def main() -> None:
     register_bot_commands(dp, conn, settings, watched_channels, pyro, keyword_index)
 
     anthropic = AsyncAnthropic(api_key=settings.anthropic_api_key)
+
+    batch_queue = BatchQueue(
+        flush_size=settings.batch_flush_size,
+        flush_seconds=settings.batch_flush_seconds,
+    )
+    submitter = BatchSubmitter(
+        client=anthropic,
+        conn=conn,
+        model=settings.claude_model,
+        poll_interval_seconds=settings.batch_poll_interval_seconds,
+        max_wait_seconds=settings.batch_max_wait_seconds,
+    )
 
     # Startup health check — fail fast if OWNER_CHAT_ID is wrong
     try:
@@ -212,12 +304,18 @@ async def main() -> None:
     except Exception as exc:
         logger.warning("Failed to update bot command menu: %s", exc)
 
+    # Recover any in-flight batches from a previous run
+    await _recover_pending_batches(conn, bot, submitter)
+
     workers = [
         asyncio.create_task(
-            pipeline_worker(queue, conn, bot, anthropic, pyro, keyword_index)
+            pipeline_worker(queue, conn, bot, batch_queue, pyro, keyword_index)
         )
         for _ in range(3)
     ]
+    batch_task = asyncio.create_task(
+        batch_worker(conn, bot, submitter, batch_queue)
+    )
     cleanup = asyncio.create_task(cleanup_worker(conn))
 
     async with pyro:
@@ -234,7 +332,7 @@ async def main() -> None:
 
         polling = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
         poller = asyncio.create_task(channel_poller(pyro, queue, watched_channels))
-        all_tasks = [polling, poller, cleanup, *workers]
+        all_tasks = [polling, poller, cleanup, batch_task, *workers]
         try:
             await asyncio.gather(*all_tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):

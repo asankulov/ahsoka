@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     default_score_threshold: int = 7
     scrape_timeout_s: float = 5.0
     db_path: str = "ahsoka.db"
+    batch_flush_size: int = 50
+    batch_flush_seconds: int = 600
+    batch_poll_interval_seconds: int = 60
+    batch_max_wait_seconds: int = 1800
 
     @classmethod
     def settings_customise_sources(cls, settings_cls, **kwargs):  # type: ignore[override]

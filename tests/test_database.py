@@ -7,21 +7,27 @@ from ahsoka.database import (
     delete_old_posts,
     get_all_active_configs,
     get_or_create_user,
+    get_pending_batches,
     get_user,
     get_user_config,
+    get_verdicts_for_post,
     init_db,
     is_notified,
     is_seen,
     list_users,
     load_watched_channels,
+    mark_batch_complete,
     mark_notified,
     mark_seen,
     remove_channel,
+    save_pending_batch,
     seed_channels,
     set_notify_target,
     set_user_config,
+    store_verdict,
     unban_user,
 )
+from ahsoka.models import PersonalizedVerdict
 
 OWNER_ID = 12345
 
@@ -236,3 +242,134 @@ async def test_delete_old_posts_keeps_recent(conn):
     deleted = await delete_old_posts(conn, days=30)
     assert deleted == 0
     assert await is_seen(conn, 1, 1) is True
+
+
+# --- Personalized verdicts ---
+
+
+def make_verdict(
+    user_id: int = 1,
+    score: int = 8,
+    matched: bool = True,
+    reason: str = "Great match",
+    apply: str = "hr@co.com",
+    red_flags: list | None = None,
+) -> PersonalizedVerdict:
+    return PersonalizedVerdict(
+        user_id=user_id,
+        score=score,
+        reason=reason,
+        matched=matched,
+        apply=apply,
+        red_flags=red_flags or ["vague comp"],
+    )
+
+
+async def test_store_verdict_inserts_row(conn):
+    verdict = make_verdict(user_id=1, score=8)
+    await store_verdict(conn, verdict, channel_id=10, message_id=20)
+    verdicts = await get_verdicts_for_post(conn, channel_id=10, message_id=20)
+    assert len(verdicts) == 1
+    v = verdicts[0]
+    assert v.user_id == 1
+    assert v.score == 8
+    assert v.matched is True
+    assert v.apply == "hr@co.com"
+    assert v.red_flags == ["vague comp"]
+
+
+async def test_store_verdict_upserts_on_same_primary_key(conn):
+    """Calling store_verdict twice for same (channel_id, message_id, user_id) updates, not duplicates."""
+    verdict_v1 = make_verdict(user_id=1, score=5, reason="first")
+    await store_verdict(conn, verdict_v1, channel_id=10, message_id=20)
+
+    verdict_v2 = make_verdict(user_id=1, score=9, reason="updated")
+    await store_verdict(conn, verdict_v2, channel_id=10, message_id=20)
+
+    verdicts = await get_verdicts_for_post(conn, channel_id=10, message_id=20)
+    assert len(verdicts) == 1
+    assert verdicts[0].score == 9
+    assert verdicts[0].reason == "updated"
+
+
+async def test_get_verdicts_for_post_returns_all_users(conn):
+    await store_verdict(conn, make_verdict(user_id=1, score=7), channel_id=10, message_id=20)
+    await store_verdict(conn, make_verdict(user_id=2, score=9), channel_id=10, message_id=20)
+    verdicts = await get_verdicts_for_post(conn, channel_id=10, message_id=20)
+    assert len(verdicts) == 2
+    user_ids = {v.user_id for v in verdicts}
+    assert user_ids == {1, 2}
+
+
+async def test_get_verdicts_for_post_deserializes_red_flags(conn):
+    verdict = make_verdict(user_id=1, red_flags=["no salary", "vague role"])
+    await store_verdict(conn, verdict, channel_id=5, message_id=6)
+    verdicts = await get_verdicts_for_post(conn, channel_id=5, message_id=6)
+    assert verdicts[0].red_flags == ["no salary", "vague role"]
+
+
+async def test_get_verdicts_for_post_empty_red_flags(conn):
+    v = PersonalizedVerdict(user_id=1, score=5, reason="ok", matched=False, apply="", red_flags=[])
+    await store_verdict(conn, v, channel_id=7, message_id=8)
+    verdicts = await get_verdicts_for_post(conn, channel_id=7, message_id=8)
+    assert verdicts[0].red_flags == []
+
+
+async def test_get_verdicts_for_post_no_results(conn):
+    verdicts = await get_verdicts_for_post(conn, channel_id=999, message_id=999)
+    assert verdicts == []
+
+
+# --- Batch lifecycle ---
+
+
+async def test_save_pending_batch_inserts_with_submitted_status(conn):
+    request_map = {"111:222:42": [111, 222, 42]}
+    await save_pending_batch(conn, batch_id="batch_001", request_map=request_map)
+    pending = await get_pending_batches(conn)
+    assert any(p["batch_id"] == "batch_001" for p in pending)
+
+
+async def test_save_pending_batch_double_insert_is_idempotent(conn):
+    """INSERT OR IGNORE: second insert with same batch_id must not raise or duplicate."""
+    request_map = {"111:222:42": [111, 222, 42]}
+    await save_pending_batch(conn, batch_id="batch_dup", request_map=request_map)
+    await save_pending_batch(conn, batch_id="batch_dup", request_map=request_map)
+    pending = await get_pending_batches(conn)
+    matching = [p for p in pending if p["batch_id"] == "batch_dup"]
+    assert len(matching) == 1
+
+
+async def test_get_pending_batches_returns_only_submitted_rows(conn):
+    """Rows with status != 'submitted' must not be returned."""
+    await save_pending_batch(conn, "batch_submitted", {"a:b:c": [1, 2, 3]})
+    await save_pending_batch(conn, "batch_to_complete", {"d:e:f": [4, 5, 6]})
+    await mark_batch_complete(conn, "batch_to_complete", status="complete")
+
+    pending = await get_pending_batches(conn)
+    batch_ids = {p["batch_id"] for p in pending}
+    assert "batch_submitted" in batch_ids
+    assert "batch_to_complete" not in batch_ids
+
+
+async def test_mark_batch_complete_removes_from_pending(conn):
+    await save_pending_batch(conn, "batch_fin", {"x:y:z": [1, 2, 3]})
+    await mark_batch_complete(conn, "batch_fin", status="complete")
+    pending = await get_pending_batches(conn)
+    assert not any(p["batch_id"] == "batch_fin" for p in pending)
+
+
+async def test_mark_batch_failed_removes_from_pending(conn):
+    await save_pending_batch(conn, "batch_fail", {"x:y:z": [1, 2, 3]})
+    await mark_batch_complete(conn, "batch_fail", status="failed")
+    pending = await get_pending_batches(conn)
+    assert not any(p["batch_id"] == "batch_fail" for p in pending)
+
+
+async def test_init_db_idempotent_no_error_on_double_call(conn):
+    """Calling init_db twice on same connection must not raise."""
+    await init_db(conn, owner_chat_id=OWNER_ID)  # second call
+    # Verify the owner still exists only once
+    user = await get_user(conn, OWNER_ID)
+    assert user is not None
+    assert user.is_admin is True

@@ -3,11 +3,11 @@
 **Workflow:** When working in this directory, follow the principal engineer workflow in [.claude/PRINCIPAL.md](.claude/PRINCIPAL.md).
 
 ## What This Is
-A multi-user Telegram job-filter bot written in Python 3.12+. It monitors public job channels via Pyrogram, scrapes linked pages, scores posts with Claude AI **once per post**, and fans out matching notifications to each user based on their personal filters.
+A multi-user Telegram job-filter bot written in Python 3.12+. It monitors public job channels via Pyrogram, scrapes linked pages, scores each post **per user** against their personal profile via the Anthropic Message Batches API, and notifies matching users. Notification latency is near-real-time (minutes) rather than instant, in exchange for a 50% cost discount and full personalization.
 
 ## Tech Stack
 - **Python 3.12+**, **aiogram 3.26.0** (bot/commands), **Pyrogram** (channel listener)
-- **Anthropic Claude API** (job post scoring — generic, not per-user)
+- **Anthropic Claude API — Message Batches** (per-user personalized scoring, 50% batch discount)
 - **aiosqlite** (multi-user config, dedup, notification tracking)
 - **httpx + trafilatura** (HTTP scraping)
 - **pytest + pytest-asyncio** (`asyncio_mode = "auto"`) for async tests
@@ -21,15 +21,17 @@ ahsoka/
     log_handler.py  # TelegramLogHandler — forwards INFO+ logs to a dedicated Telegram bot
     notifier.py     # format_notification() + send_notification()
   pipeline/
-    scraper.py      # HTTP scraping; skips t.me links (handled by tg_resolver)
-    tg_resolver.py  # Resolves t.me deep links via Pyrogram client
-    scorer.py       # Claude API: generic score 0–10 + reason; rate-limit handling
-    dedup.py        # is_duplicate()
+    scraper.py         # HTTP scraping; skips t.me links (handled by tg_resolver)
+    tg_resolver.py     # Resolves t.me deep links via Pyrogram client
+    scorer.py          # build_personalized_prompt() + parse_verdict() — batch request builders
+    batch_queue.py     # BatchQueue: buffers (post, content, config snapshot) per (post, user)
+    batch_submitter.py # BatchSubmitter: wraps Anthropic messages.batches API, submit + poll
+    dedup.py           # is_duplicate()
     keyword_filter.py  # Fast keyword pre-filter (no LLM cost)
     keyword_index.py   # Union of all users' keywords for shared pre-filter
-    user_filter.py     # Per-user post-scoring filter (threshold, keywords, paused)
-  models.py         # Post, Score, User, UserConfig dataclasses
-  main.py           # Entry point; pipeline_worker; fan-out; log bot setup
+    user_filter.py     # Thin validator: not paused AND matched AND score >= threshold
+  models.py         # Post, Score, PersonalizedVerdict, User, UserConfig dataclasses
+  main.py           # Entry point; pipeline_worker, batch_worker, fan-out; log bot setup
   config.py         # Settings (pydantic); instantiated at module level
   database.py       # aiosqlite: schema, migration, multi-user CRUD
   watcher/
@@ -37,24 +39,31 @@ ahsoka/
     handler.py      # on_raw_update → puts Post into asyncio.Queue
     poller.py       # Fallback: polls each channel every 60s
 tests/
-  test_commands.py      # Command handlers + FSM states (name-based handler lookup)
-  test_log_handler.py   # TelegramLogHandler
-  test_models.py        # Post.from_message()
-  test_database.py      # Multi-user database CRUD
-  test_notifier.py      # format_notification()
-  test_scraper.py       # Scraper incl. t.me-skip behavior
-  test_keyword_filter.py # Keyword filtering
-  test_tg_resolver.py   # is_tg_link / resolve_tg_link
-  test_scorer.py        # Claude scorer (generic, no UserConfig)
-  test_dedup.py         # is_duplicate()
+  test_commands.py         # Command handlers + FSM states (name-based handler lookup)
+  test_log_handler.py      # TelegramLogHandler
+  test_models.py           # Post.from_message(), PersonalizedVerdict
+  test_database.py         # Multi-user database CRUD, post_verdicts, pending_batches
+  test_notifier.py         # format_notification()
+  test_scraper.py          # Scraper incl. t.me-skip behavior
+  test_keyword_filter.py   # Keyword filtering
+  test_tg_resolver.py      # is_tg_link / resolve_tg_link
+  test_scorer.py           # build_personalized_prompt + parse_verdict
+  test_batch_queue.py      # BatchQueue enqueue/flush/drain + snapshot semantics
+  test_batch_submitter.py  # BatchSubmitter submit/poll + retry + result mapping
+  test_user_filter.py      # Thin paused/threshold/matched validator
+  test_main.py             # pipeline_worker, batch_worker, _recover_pending_batches
+  test_dedup.py            # is_duplicate()
 ```
 
 ## Key Design Decisions
 
 ### Multi-User Architecture
-- **Score once, fan out**: each post is scored by Claude once globally, then per-user filters (keywords, threshold, paused) determine who receives notifications. API cost scales with post volume, not user count.
-- **Union keyword pre-filter**: `KeywordIndex` maintains a union of all users' keywords. Posts are only sent to Claude if they match at least one user's keyword (or any user has empty keywords = match all).
-- **Per-user config**: each user has their own `UserConfig` (stack, seniority, keywords, threshold, etc.) stored in a columnar `user_config` table.
+- **Per-user scoring via Anthropic Message Batches API**: each post is scored once per user with a fully personalized prompt (stack, seniority, remote, **location, salary_min, salary_max**, keywords, threshold all load-bearing). Requests are buffered in a `BatchQueue` and flushed to `messages.batches.create` for a 50% cost discount. Notifications are near-real-time (flush interval + batch processing, typically 1–15 min), not instant. Cost scales linearly with users × posts; re-evaluate at >15 users.
+- **Union keyword pre-filter**: `KeywordIndex` still runs before enqueue. A post matching zero users' keywords never hits the batch queue, so API budget scales with *relevant* posts, not raw volume.
+- **Config snapshot at enqueue time**: `BatchQueue.enqueue` deep-copies each `UserConfig` so in-flight verdicts reflect what we scored for. Mid-batch config edits only affect the next batch.
+- **Per-user config**: each user has their own `UserConfig` (stack, seniority, keywords, threshold, location, salary bounds, etc.) stored in a columnar `user_config` table.
+- **Thin post-verdict validator**: `user_filter.matches_user(verdict, config)` checks only `not paused AND verdict.matched AND score >= threshold`. All stack/seniority/remote/location/salary reasoning lives in the scoring prompt.
+- **Startup batch recovery**: `_recover_pending_batches` polls any in-flight batches from a crashed run (tracked in `pending_batches` table) and stores their verdicts. Notifications are **not** re-sent on recovery (original Post/UserConfig objects are gone from memory); verdicts are stored for auditability.
 
 ### Bot Commands (commands.py)
 - Two routers: `user_router` (open to all, checks not banned) and `admin_router` (admin-only)
@@ -75,9 +84,9 @@ def get_handler_map(dp: Dispatcher) -> dict[str, object]:
 ```
 
 ### Database Schema
-Five tables: `users` (registry), `user_config` (per-user settings), `seen_posts` (dedup+scoring), `watched_channels` (shared watchlist), `user_notified` (per-user notification tracking).
+Seven tables: `users` (registry), `user_config` (per-user settings), `seen_posts` (dedup; scoring columns now nullable), `watched_channels` (shared watchlist), `user_notified` (per-user notification tracking), `post_verdicts` (per-(post, user) `PersonalizedVerdict`), `pending_batches` (in-flight batch recovery state).
 
-Migration from old single-user key-value `user_config` is handled automatically in `init_db()`.
+Migrations are additive and idempotent via `CREATE TABLE IF NOT EXISTS` in `init_db()`. The old single-user key-value `user_config` migration is still handled automatically.
 
 ### Notification Format
 Post link is placed first in the message to trigger Telegram's rich link preview for easy bookmarking. Format: link → score → apply → body → footer.

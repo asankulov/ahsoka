@@ -1,117 +1,124 @@
-from datetime import datetime
-
+"""Tests for ahsoka.pipeline.user_filter — new signature: matches_user(verdict, config)."""
 import pytest
 
-from ahsoka.models import Post, Score, UserConfig
+from ahsoka.models import PersonalizedVerdict, UserConfig
 from ahsoka.pipeline.user_filter import matches_user
 
 
-def make_post(text: str = "Python backend developer needed") -> Post:
-    return Post(channel_id=1, message_id=1, channel_name="test", text=text, timestamp=datetime.now())
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def make_score(**kwargs) -> Score:
-    defaults = dict(score=8, reason="Good", stack=["python", "django"], seniority="senior", remote="remote")
-    defaults.update(kwargs)
-    return Score(**defaults)
-
-
-def make_config(**kwargs) -> UserConfig:
-    defaults = dict(user_id=1, notify_chat_id=1, threshold=7)
-    defaults.update(kwargs)
-    return UserConfig(**defaults)
-
-
-# --- Basic checks (paused, threshold, keywords) ---
-
-def test_paused_user_never_matches():
-    assert not matches_user(make_post(), make_score(), make_config(paused=True))
-
-
-def test_below_threshold_does_not_match():
-    assert not matches_user(make_post(), make_score(score=5), make_config(threshold=7))
-
-
-def test_at_threshold_matches():
-    assert matches_user(make_post(), make_score(score=7), make_config(threshold=7))
-
-
-def test_keywords_filter_still_works():
-    assert not matches_user(make_post("Go developer"), make_score(), make_config(keywords="python"))
-
-
-def test_keywords_match_passes():
-    assert matches_user(make_post("Python developer"), make_score(), make_config(keywords="python"))
-
-
-# --- Stack matching ---
-
-def test_empty_user_stack_matches_any():
-    assert matches_user(make_post(), make_score(stack=["go", "rust"]), make_config(stack=""))
-
-
-def test_stack_overlap_matches():
-    assert matches_user(make_post(), make_score(stack=["python", "django"]), make_config(stack="python go"))
-
-
-def test_stack_no_overlap_does_not_match():
-    assert not matches_user(make_post(), make_score(stack=["go", "rust"]), make_config(stack="python django"))
-
-
-def test_stack_match_is_case_insensitive():
-    assert matches_user(make_post(), make_score(stack=["python"]), make_config(stack="Python"))
-
-
-# --- Seniority matching ---
-
-def test_empty_user_seniority_matches_any():
-    assert matches_user(make_post(), make_score(seniority="junior"), make_config(seniority=""))
-
-
-def test_score_seniority_any_matches_all_users():
-    assert matches_user(make_post(), make_score(seniority="any"), make_config(seniority="senior"))
-
-
-def test_seniority_exact_match():
-    assert matches_user(make_post(), make_score(seniority="senior"), make_config(seniority="senior"))
-
-
-def test_seniority_mismatch():
-    assert not matches_user(make_post(), make_score(seniority="junior"), make_config(seniority="senior"))
-
-
-# --- Remote matching ---
-
-def test_empty_user_remote_matches_any():
-    assert matches_user(make_post(), make_score(remote="onsite"), make_config(remote=""))
-
-
-def test_score_remote_unknown_matches_all_users():
-    assert matches_user(make_post(), make_score(remote="unknown"), make_config(remote="remote"))
-
-
-def test_remote_exact_match():
-    assert matches_user(make_post(), make_score(remote="remote"), make_config(remote="remote"))
-
-
-def test_remote_mismatch():
-    assert not matches_user(make_post(), make_score(remote="onsite"), make_config(remote="remote"))
-
-
-# --- Combinations ---
-
-def test_all_filters_must_pass():
-    """Stack matches but seniority doesn't — should not match."""
-    assert not matches_user(
-        make_post(),
-        make_score(stack=["python"], seniority="junior"),
-        make_config(stack="python", seniority="senior"),
+def make_verdict(
+    user_id: int = 1,
+    score: int = 8,
+    matched: bool = True,
+    reason: str = "Good fit",
+    apply: str = "",
+    red_flags: list | None = None,
+) -> PersonalizedVerdict:
+    return PersonalizedVerdict(
+        user_id=user_id,
+        score=score,
+        matched=matched,
+        reason=reason,
+        apply=apply,
+        red_flags=red_flags or [],
     )
 
 
-def test_everything_matches():
-    assert matches_user(
-        make_post("Python senior remote"),
-        make_score(score=9, stack=["python"], seniority="senior", remote="remote"),
-        make_config(threshold=7, keywords="python", stack="python", seniority="senior", remote="remote"),
-    )
+def make_config(
+    user_id: int = 1,
+    threshold: int = 7,
+    paused: bool = False,
+) -> UserConfig:
+    return UserConfig(user_id=user_id, notify_chat_id=user_id, threshold=threshold, paused=paused)
+
+
+# ---------------------------------------------------------------------------
+# Paused
+# ---------------------------------------------------------------------------
+
+
+def test_paused_user_returns_false_regardless_of_score():
+    verdict = make_verdict(score=10, matched=True)
+    config = make_config(paused=True, threshold=5)
+    assert matches_user(verdict, config) is False
+
+
+def test_paused_user_returns_false_regardless_of_matched():
+    verdict = make_verdict(score=9, matched=True)
+    config = make_config(paused=True)
+    assert matches_user(verdict, config) is False
+
+
+# ---------------------------------------------------------------------------
+# Threshold
+# ---------------------------------------------------------------------------
+
+
+def test_score_below_threshold_returns_false_even_if_matched():
+    verdict = make_verdict(score=5, matched=True)
+    config = make_config(threshold=7, paused=False)
+    assert matches_user(verdict, config) is False
+
+
+def test_score_at_threshold_is_not_below():
+    verdict = make_verdict(score=7, matched=True)
+    config = make_config(threshold=7, paused=False)
+    # score == threshold: check what the code does (score < threshold → False)
+    # 7 < 7 is False, so we do NOT return False here
+    assert matches_user(verdict, config) is True
+
+
+def test_score_above_threshold_passes_threshold_check():
+    verdict = make_verdict(score=9, matched=True)
+    config = make_config(threshold=7, paused=False)
+    assert matches_user(verdict, config) is True
+
+
+# ---------------------------------------------------------------------------
+# matched flag
+# ---------------------------------------------------------------------------
+
+
+def test_verdict_not_matched_returns_false_even_if_score_above_threshold():
+    verdict = make_verdict(score=9, matched=False)
+    config = make_config(threshold=7, paused=False)
+    assert matches_user(verdict, config) is False
+
+
+def test_verdict_matched_false_returns_false_regardless_of_other_fields():
+    verdict = make_verdict(score=10, matched=False)
+    config = make_config(threshold=1, paused=False)
+    assert matches_user(verdict, config) is False
+
+
+# ---------------------------------------------------------------------------
+# All conditions True → True
+# ---------------------------------------------------------------------------
+
+
+def test_all_conditions_met_returns_true():
+    verdict = make_verdict(score=8, matched=True)
+    config = make_config(threshold=7, paused=False)
+    assert matches_user(verdict, config) is True
+
+
+def test_minimum_passing_combination():
+    verdict = make_verdict(score=7, matched=True)
+    config = make_config(threshold=7, paused=False)
+    assert matches_user(verdict, config) is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: old signature (post, score, config) must not be accepted
+# This is a type-level concern — we just verify the new 2-arg API works cleanly.
+# ---------------------------------------------------------------------------
+
+
+def test_function_accepts_exactly_two_args():
+    import inspect
+    sig = inspect.signature(matches_user)
+    assert len(sig.parameters) == 2
