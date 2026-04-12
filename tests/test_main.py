@@ -148,6 +148,87 @@ async def test_fan_out_uses_verdict_to_score_adapter(conn):
     assert captured_score.apply == expected_score.apply
 
 
+async def test_fan_out_logs_verdict_before_guard_when_not_matched(conn, caplog):
+    """INFO log fires with correct field values even when verdict is not matched (guard skips)."""
+    import logging
+    from ahsoka.main import _fan_out_verdicts
+
+    post = make_post(channel_id=555, message_id=999)
+    config = make_config(threshold=8)
+    verdict = make_verdict(user_id=42, score=3, matched=False)
+    bot = AsyncMock()
+
+    with patch("ahsoka.main.send_notification", new_callable=AsyncMock) as mock_send, \
+         caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        await _fan_out_verdicts(conn, bot, [(post, config, verdict)])
+
+    mock_send.assert_not_called()
+
+    log_lines = [r.message for r in caplog.records if "verdict" in r.message]
+    assert len(log_lines) == 1, f"Expected 1 verdict log line, got: {log_lines}"
+    line = log_lines[0]
+    assert "user_id=42" in line
+    assert "post=555/999" in line
+    assert "matched=False" in line
+    assert "score=3" in line
+    assert "threshold=8" in line
+
+
+async def test_fan_out_logs_verdict_before_guard_when_matched(conn, caplog):
+    """INFO log fires with correct field values when verdict matches and processing continues."""
+    import logging
+    from ahsoka.main import _fan_out_verdicts
+
+    post = make_post(channel_id=111, message_id=222)
+    config = make_config(threshold=5)
+    verdict = make_verdict(user_id=42, score=9, matched=True)
+    bot = AsyncMock()
+
+    with patch("ahsoka.main.matches_user", return_value=True), \
+         patch("ahsoka.main.send_notification", new_callable=AsyncMock) as mock_send, \
+         caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        await _fan_out_verdicts(conn, bot, [(post, config, verdict)])
+
+    mock_send.assert_called_once()
+
+    log_lines = [r.message for r in caplog.records if "verdict" in r.message]
+    assert len(log_lines) == 1, f"Expected 1 verdict log line, got: {log_lines}"
+    line = log_lines[0]
+    assert "user_id=42" in line
+    assert "post=111/222" in line
+    assert "matched=True" in line
+    assert "score=9" in line
+    assert "threshold=5" in line
+
+
+async def test_fan_out_logs_exactly_once_per_verdict(conn, caplog):
+    """The INFO log fires exactly once per verdict — not inside dedup or notification branches."""
+    import logging
+    from ahsoka.main import _fan_out_verdicts
+
+    post = make_post(channel_id=333, message_id=444)
+    config_a = make_config(user_id=1, threshold=5)
+    config_b = make_config(user_id=2, threshold=5)
+    verdict_a = make_verdict(user_id=1, score=7, matched=True)
+    verdict_b = make_verdict(user_id=2, score=2, matched=False)
+    bot = AsyncMock()
+
+    results = [
+        (post, config_a, verdict_a),
+        (post, config_b, verdict_b),
+    ]
+
+    with patch("ahsoka.main.matches_user", side_effect=[True, False]), \
+         patch("ahsoka.main.send_notification", new_callable=AsyncMock), \
+         caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        await _fan_out_verdicts(conn, bot, results)
+
+    verdict_log_lines = [r.message for r in caplog.records if "verdict" in r.message]
+    assert len(verdict_log_lines) == 2, (
+        f"Expected exactly 2 verdict log lines (one per verdict), got: {verdict_log_lines}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # pipeline_worker
 # ---------------------------------------------------------------------------
