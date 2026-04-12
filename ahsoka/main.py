@@ -43,6 +43,11 @@ async def _fan_out_verdicts(
 ) -> None:
     """For each (post, config, verdict) triple: check matches_user, dedup, notify."""
     for post, config, verdict in results:
+        logger.info(
+            "verdict user_id=%d post=%s/%s matched=%s score=%d threshold=%d",
+            verdict.user_id, post.channel_id, post.message_id,
+            verdict.matched, verdict.score, config.threshold,
+        )
         if not matches_user(verdict, config):
             continue
         if await db.is_notified(conn, config.user_id, post.channel_id, post.message_id, url):
