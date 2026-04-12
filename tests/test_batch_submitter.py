@@ -458,3 +458,196 @@ def test_sdk_result_to_dict_succeeded_missing_message():
     result = _sdk_result_to_dict(sdk_result)
     assert result["result"]["type"] == "error"
     assert "missing message" in result["result"]["error"]["message"]
+
+
+def test_sdk_result_to_dict_block_without_text_attribute():
+    """Content block without a .text attribute is converted to {type: <type>} dict."""
+    block = MagicMock(spec=[])  # spec=[] means no attributes at all
+    # Give it a type attribute but no text attribute
+    type(block).type = property(lambda self: "image")
+
+    msg = MagicMock()
+    msg.content = [block]
+
+    inner = MagicMock()
+    inner.type = "succeeded"
+    inner.message = msg
+
+    sdk_result = MagicMock()
+    sdk_result.result = inner
+
+    result = _sdk_result_to_dict(sdk_result)
+    assert result["result"]["type"] == "succeeded"
+    content = result["result"]["message"]["content"]
+    assert len(content) == 1
+    assert content[0]["type"] == "image"
+    assert "text" not in content[0]
+
+
+# ---------------------------------------------------------------------------
+# poll_and_process — retrieve exception and results fetch exception branches
+# ---------------------------------------------------------------------------
+
+
+async def test_poll_and_process_retries_on_retrieve_exception(conn):
+    """retrieve() raises once → logs warning, sleeps, retries, succeeds on second call."""
+    submitter, client = make_submitter(conn)
+
+    batch_ended = MagicMock(processing_status="ended")
+    client.messages.batches.retrieve = AsyncMock(
+        side_effect=[RuntimeError("transient"), batch_ended]
+    )
+
+    custom_id = "111_222_42"
+    sdk_result = _make_sdk_result(custom_id, score=7)
+
+    async def fake_results(batch_id):
+        async def _gen():
+            yield sdk_result
+        return _gen()
+
+    client.messages.batches.results = fake_results
+
+    from ahsoka.database import save_pending_batch
+    await save_pending_batch(conn, "batch_retrieve_err", {custom_id: [111, 222, 42]})
+
+    reqs = [make_request(make_post(111, 222), make_config(42))]
+
+    with patch("ahsoka.pipeline.batch_submitter.asyncio.sleep", new_callable=AsyncMock):
+        results = await submitter.poll_and_process("batch_retrieve_err", reqs)
+
+    # Eventually completes after retry
+    assert len(results) == 1
+    assert results[0][2].score == 7
+
+
+async def test_poll_and_process_results_fetch_exception_marks_failed(conn):
+    """results() raises → logs error, marks batch failed, returns partial results."""
+    submitter, client = make_submitter(conn)
+
+    batch_ended = MagicMock(processing_status="ended")
+    client.messages.batches.retrieve = AsyncMock(return_value=batch_ended)
+    client.messages.batches.results = AsyncMock(side_effect=RuntimeError("network error"))
+
+    from ahsoka.database import save_pending_batch, get_pending_batches
+    custom_id = "111_222_42"
+    await save_pending_batch(conn, "batch_results_err", {custom_id: [111, 222, 42]})
+
+    reqs = [make_request(make_post(111, 222), make_config(42))]
+
+    with patch("ahsoka.pipeline.batch_submitter.asyncio.sleep", new_callable=AsyncMock):
+        results = await submitter.poll_and_process("batch_results_err", reqs)
+
+    # Returns empty (or partial) results without raising
+    assert results == []
+
+    # Batch should be marked failed and removed from pending
+    pending = await get_pending_batches(conn)
+    assert not any(p["batch_id"] == "batch_results_err" for p in pending)
+
+
+# ---------------------------------------------------------------------------
+# recover — retrieve exception and sleep/continue branch, unknown custom_id
+# ---------------------------------------------------------------------------
+
+
+async def test_recover_retries_on_retrieve_exception(conn):
+    """recover(): retrieve() raises → logs warning, sleeps, retries, eventually ends."""
+    submitter, client = make_submitter(conn)
+
+    batch_ended = MagicMock(processing_status="ended")
+    client.messages.batches.retrieve = AsyncMock(
+        side_effect=[RuntimeError("transient"), batch_ended]
+    )
+
+    custom_id = "111_222_42"
+    sdk_result = _make_sdk_result(custom_id, score=8)
+
+    async def fake_results(batch_id):
+        async def _gen():
+            yield sdk_result
+        return _gen()
+
+    client.messages.batches.results = fake_results
+
+    from ahsoka.database import save_pending_batch
+    await save_pending_batch(conn, "batch_rec_retry", {custom_id: [111, 222, 42]})
+
+    request_map = {custom_id: [111, 222, 42]}
+
+    with patch("ahsoka.pipeline.batch_submitter.asyncio.sleep", new_callable=AsyncMock), \
+         patch("ahsoka.pipeline.batch_submitter.db.store_verdict", new_callable=AsyncMock) as mock_store, \
+         patch("ahsoka.pipeline.batch_submitter.db.mark_batch_complete", new_callable=AsyncMock):
+        await submitter.recover("batch_rec_retry", request_map)
+
+    # After retry, verdict should have been stored
+    mock_store.assert_called_once()
+
+
+async def test_recover_sleeps_and_polls_again_when_processing(conn):
+    """recover(): batch is processing → sleep → poll again → ended → store verdict."""
+    submitter, client = make_submitter(conn)
+
+    batch_processing = MagicMock(processing_status="processing")
+    batch_ended = MagicMock(processing_status="ended")
+    client.messages.batches.retrieve = AsyncMock(
+        side_effect=[batch_processing, batch_ended]
+    )
+
+    custom_id = "111_222_42"
+    sdk_result = _make_sdk_result(custom_id, score=6)
+
+    async def fake_results(batch_id):
+        async def _gen():
+            yield sdk_result
+        return _gen()
+
+    client.messages.batches.results = fake_results
+
+    from ahsoka.database import save_pending_batch
+    await save_pending_batch(conn, "batch_rec_sleep", {custom_id: [111, 222, 42]})
+
+    request_map = {custom_id: [111, 222, 42]}
+
+    with patch("ahsoka.pipeline.batch_submitter.asyncio.sleep", new_callable=AsyncMock) as mock_sleep, \
+         patch("ahsoka.pipeline.batch_submitter.db.store_verdict", new_callable=AsyncMock) as mock_store, \
+         patch("ahsoka.pipeline.batch_submitter.db.mark_batch_complete", new_callable=AsyncMock):
+        await submitter.recover("batch_rec_sleep", request_map)
+
+    # asyncio.sleep should have been called at least once (for the processing state)
+    assert mock_sleep.call_count >= 1
+    mock_store.assert_called_once()
+
+
+async def test_recover_skips_unknown_custom_id_in_results(conn):
+    """recover(): custom_id in results not in request_map → logs warning, skips."""
+    submitter, client = make_submitter(conn)
+
+    batch_ended = MagicMock(processing_status="ended")
+    client.messages.batches.retrieve = AsyncMock(return_value=batch_ended)
+
+    # Result has a custom_id not in request_map
+    unknown_result = _make_sdk_result("999_999_999", score=5)
+
+    async def fake_results(batch_id):
+        async def _gen():
+            yield unknown_result
+        return _gen()
+
+    client.messages.batches.results = fake_results
+
+    from ahsoka.database import save_pending_batch
+    known_id = "111_222_42"
+    await save_pending_batch(conn, "batch_rec_unknown", {known_id: [111, 222, 42]})
+
+    request_map = {known_id: [111, 222, 42]}
+
+    with patch("ahsoka.pipeline.batch_submitter.db.store_verdict", new_callable=AsyncMock) as mock_store, \
+         patch("ahsoka.pipeline.batch_submitter.db.mark_batch_complete", new_callable=AsyncMock), \
+         patch("ahsoka.pipeline.batch_submitter.logger") as mock_logger:
+        await submitter.recover("batch_rec_unknown", request_map)
+
+    # Unknown custom_id skipped — store_verdict not called for it
+    mock_store.assert_not_called()
+    # Warning logged for the unknown custom_id
+    assert mock_logger.warning.called
