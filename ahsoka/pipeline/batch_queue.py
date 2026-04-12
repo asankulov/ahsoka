@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class BatchRequest:
     """Single pending score request; config is a snapshot taken at enqueue time."""
-    custom_id: str          # "{channel_id}:{message_id}:{user_id}"
+    custom_id: str          # "{channel_id}_{message_id}_{user_id}"
     post: Post
     content: str
     config: UserConfig      # immutable snapshot — never mutated after creation
@@ -53,7 +53,7 @@ class BatchQueue:
             for config in configs:
                 snapshot = copy.deepcopy(config)
                 req = BatchRequest(
-                    custom_id=f"{post.channel_id}:{post.message_id}:{config.user_id}",
+                    custom_id=f"{post.channel_id}_{post.message_id}_{config.user_id}",
                     post=post,
                     content=content,
                     config=snapshot,

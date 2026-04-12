@@ -59,7 +59,7 @@ class BatchSubmitter:
             prompt_dict = build_personalized_prompt(req.post, req.content, req.config)
             prompt_dict["params"]["model"] = self._model
             api_requests.append(prompt_dict)
-            cid, mid, uid = req.custom_id.split(":")
+            cid, mid, uid = req.custom_id.split("_")
             request_map[req.custom_id] = (int(cid), int(mid), int(uid))
 
         last_exc: Exception | None = None
@@ -138,7 +138,7 @@ class BatchSubmitter:
                 custom_id = result.custom_id
                 # parse the result — the SDK object has .result.type / .result.message
                 result_dict = _sdk_result_to_dict(result)
-                uid_str = custom_id.split(":")[-1] if ":" in custom_id else "0"
+                uid_str = custom_id.split("_")[-1] if "_" in custom_id else "0"
                 user_id = int(uid_str)
                 verdict = parse_verdict(result_dict, user_id)
 

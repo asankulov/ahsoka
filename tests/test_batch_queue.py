@@ -73,7 +73,7 @@ async def test_batch_request_custom_id_format():
     await q.enqueue(post, "content", [config])
     drained = await q.drain()
     assert len(drained) == 1
-    assert drained[0].custom_id == "111:222:42"
+    assert drained[0].custom_id == "111_222_42"
 
 
 async def test_batch_request_custom_id_uses_post_channel_and_message_ids():
@@ -82,7 +82,7 @@ async def test_batch_request_custom_id_uses_post_channel_and_message_ids():
     config = make_config(user_id=55)
     await q.enqueue(post, "content", [config])
     drained = await q.drain()
-    assert drained[0].custom_id == "999:777:55"
+    assert drained[0].custom_id == "999_777_55"
 
 
 # ---------------------------------------------------------------------------
