@@ -75,7 +75,7 @@ def test_custom_id_format():
     post = make_post(channel_id=111, message_id=222)
     config = make_config(user_id=42)
     result = build_personalized_prompt(post, "content", config)
-    assert result["custom_id"] == "111:222:42"
+    assert result["custom_id"] == "111_222_42"
 
 
 def test_max_tokens_is_512():

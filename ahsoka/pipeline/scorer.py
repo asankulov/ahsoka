@@ -75,7 +75,7 @@ def build_personalized_prompt(
 
     Shape:
         {
-            "custom_id": "<channel_id>:<message_id>:<user_id>",
+            "custom_id": "<channel_id>_<message_id>_<user_id>",
             "params": {
                 "model": str,
                 "max_tokens": int,
@@ -99,7 +99,7 @@ def build_personalized_prompt(
         content=content[:4000],
     )
     return {
-        "custom_id": f"{post.channel_id}:{post.message_id}:{config.user_id}",
+        "custom_id": f"{post.channel_id}_{post.message_id}_{config.user_id}",
         "params": {
             "max_tokens": 512,
             "system": _SYSTEM_PROMPT,

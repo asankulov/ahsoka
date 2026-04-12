@@ -39,7 +39,7 @@ def make_request(
     p = post or make_post()
     c = config or make_config()
     return BatchRequest(
-        custom_id=f"{p.channel_id}:{p.message_id}:{c.user_id}",
+        custom_id=f"{p.channel_id}_{p.message_id}_{c.user_id}",
         post=p,
         content=content,
         config=c,
@@ -83,7 +83,7 @@ async def test_submit_calls_batches_create_with_model_injected(conn):
     api_requests = create_call.kwargs["requests"]
     assert len(api_requests) == 1
     assert api_requests[0]["params"]["model"] == "claude-haiku"
-    assert api_requests[0]["custom_id"] == "111:222:42"
+    assert api_requests[0]["custom_id"] == "111_222_42"
 
 
 async def test_submit_saves_pending_batch_to_db(conn):
@@ -164,7 +164,7 @@ async def test_poll_and_process_polls_until_ended(conn):
         side_effect=[batch_processing, batch_ended]
     )
 
-    custom_id = "111:222:42"
+    custom_id = "111_222_42"
     sdk_result = _make_sdk_result(custom_id, score=8)
 
     async def fake_results(batch_id):
@@ -202,8 +202,8 @@ async def test_poll_and_process_maps_custom_id_to_correct_post_and_config(conn):
     req1 = make_request(post1, config1)
     req2 = make_request(post2, config2)
 
-    sdk_r1 = _make_sdk_result("100:1:10", score=7)
-    sdk_r2 = _make_sdk_result("200:2:20", score=9)
+    sdk_r1 = _make_sdk_result("100_1_10", score=7)
+    sdk_r2 = _make_sdk_result("200_2_20", score=9)
 
     async def fake_results(batch_id):
         async def _gen():
@@ -215,8 +215,8 @@ async def test_poll_and_process_maps_custom_id_to_correct_post_and_config(conn):
 
     from ahsoka.database import save_pending_batch
     await save_pending_batch(conn, "batch_map_test", {
-        "100:1:10": [100, 1, 10],
-        "200:2:20": [200, 2, 20],
+        "100_1_10": [100, 1, 10],
+        "200_2_20": [200, 2, 20],
     })
 
     results = await submitter.poll_and_process("batch_map_test", [req1, req2])
@@ -234,7 +234,7 @@ async def test_poll_and_process_marks_complete_on_success(conn):
     batch_ended = MagicMock(processing_status="ended")
     client.messages.batches.retrieve = AsyncMock(return_value=batch_ended)
 
-    custom_id = "111:222:42"
+    custom_id = "111_222_42"
     sdk_result = _make_sdk_result(custom_id)
 
     async def fake_results(batch_id):
@@ -393,7 +393,7 @@ async def test_recover_success_path_stores_verdict_and_marks_complete(conn):
     batch_ended = MagicMock(processing_status="ended")
     client.messages.batches.retrieve = AsyncMock(return_value=batch_ended)
 
-    custom_id = "111:222:42"
+    custom_id = "111_222_42"
     sdk_result = _make_sdk_result(custom_id, score=8)
 
     async def fake_results(batch_id):
