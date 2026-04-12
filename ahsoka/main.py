@@ -257,9 +257,8 @@ async def main() -> None:
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
-    register_bot_commands(dp, conn, settings, watched_channels, pyro, keyword_index)
-
     anthropic = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    register_bot_commands(dp, conn, settings, watched_channels, pyro, keyword_index, anthropic)
 
     batch_queue = BatchQueue(
         flush_size=settings.batch_flush_size,
