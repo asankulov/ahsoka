@@ -15,6 +15,35 @@ from ahsoka.pipeline.keyword_index import KeywordIndex
 
 logger = logging.getLogger(__name__)
 
+# Batch API pricing per token (USD). Keys are model-name prefixes; longest match wins.
+# Prices reflect the 50% batch-API discount vs. standard rates.
+_BATCH_PRICING: dict[str, tuple[float, float, float, float]] = {
+    # prefix → (input, output, cache_write, cache_read) per token
+    "claude-haiku-3-5":  (0.40e-6, 2.00e-6, 0.50e-6, 0.04e-6),
+    "claude-haiku-4-5":  (0.40e-6, 2.00e-6, 0.50e-6, 0.04e-6),
+    "claude-sonnet-3-5": (1.50e-6, 7.50e-6, 1.875e-6, 0.15e-6),
+    "claude-sonnet-4":   (1.50e-6, 7.50e-6, 1.875e-6, 0.15e-6),
+    "claude-sonnet-4-6": (1.50e-6, 7.50e-6, 1.875e-6, 0.15e-6),
+}
+
+
+def _pricing_for(model: str) -> tuple[float, float, float, float] | None:
+    """Return (input, output, cache_write, cache_read) per-token prices, or None if unknown."""
+    match = None
+    for prefix, prices in _BATCH_PRICING.items():
+        if model.startswith(prefix):
+            if match is None or len(prefix) > len(match[0]):
+                match = (prefix, prices)
+    return match[1] if match else None
+
+
+def _fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}K"
+    return str(n)
+
 
 class WaitingForInput(StatesGroup):
     setstack      = State()
@@ -601,11 +630,47 @@ def register_bot_commands(
             (scored_posts,) = await cur.fetchone()  # type: ignore[misc]
         async with conn.execute("SELECT COUNT(*) FROM user_notified") as cur:
             (total_notified,) = await cur.fetchone()  # type: ignore[misc]
+
+        usage_by_model = await db.get_total_usage(conn)
+        if not usage_by_model:
+            api_line = "API: no data yet"
+        else:
+            total_in = total_out = total_cw = total_cr = total_batches = 0
+            total_cost = 0.0
+            has_unknown_model = False
+            for model, u in usage_by_model.items():
+                in_tok = u["input_tokens"] + u["cache_creation_input_tokens"]
+                out_tok = u["output_tokens"]
+                cr_tok = u["cache_read_input_tokens"]
+                total_in     += in_tok
+                total_out    += out_tok
+                total_cr     += cr_tok
+                total_batches += u["batches"]
+                prices = _pricing_for(model)
+                if prices:
+                    p_in, p_out, p_cw, p_cr = prices
+                    total_cost += (
+                        u["input_tokens"] * p_in
+                        + u["output_tokens"] * p_out
+                        + u["cache_creation_input_tokens"] * p_cw
+                        + u["cache_read_input_tokens"] * p_cr
+                    )
+                else:
+                    has_unknown_model = True
+
+            cached_part = f" ({_fmt_tokens(total_cr)} cached)" if total_cr > 0 else ""
+            cost_part = f" · est. ${total_cost:.2f}" if not has_unknown_model else " · est. unknown"
+            api_line = (
+                f"API: {_fmt_tokens(total_in)} in{cached_part} / {_fmt_tokens(total_out)} out"
+                f" · {total_batches} batches{cost_part}"
+            )
+
         lines = [
             f"Users: {len(active)} active, {len(users)} total",
             f"Channels: {len(watched_channels)} watched",
             f"Posts: {total_posts} seen, {scored_posts} scored",
             f"Notifications: {total_notified} sent",
+            api_line,
             f"Debug mode: {'ON' if debug_mode[0] else 'off'}",
         ]
         await message.reply("\n".join(lines))

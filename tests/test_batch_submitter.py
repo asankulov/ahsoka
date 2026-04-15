@@ -145,6 +145,7 @@ def _make_sdk_result(custom_id: str, score: int = 7) -> MagicMock:
 
     msg = MagicMock()
     msg.content = [block]
+    msg.usage = None  # explicit None so token-accumulation code skips it
 
     inner_result = MagicMock()
     inner_result.type = "succeeded"
@@ -651,3 +652,100 @@ async def test_recover_skips_unknown_custom_id_in_results(conn):
     mock_store.assert_not_called()
     # Warning logged for the unknown custom_id
     assert mock_logger.warning.called
+
+
+# ---------------------------------------------------------------------------
+# Token usage accumulation
+# ---------------------------------------------------------------------------
+
+
+def _make_sdk_result_with_usage(
+    custom_id: str,
+    score: int = 7,
+    input_tokens: int = 100,
+    output_tokens: int = 20,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+) -> MagicMock:
+    """Like _make_sdk_result but adds a usage object to the message."""
+    result = _make_sdk_result(custom_id, score)
+    usage = MagicMock()
+    usage.input_tokens = input_tokens
+    usage.output_tokens = output_tokens
+    usage.cache_creation_input_tokens = cache_creation_input_tokens
+    usage.cache_read_input_tokens = cache_read_input_tokens
+    result.result.message.usage = usage
+    return result
+
+
+async def test_poll_and_process_saves_token_usage(conn):
+    """poll_and_process aggregates usage tokens across results and calls save_batch_usage."""
+    submitter, client = make_submitter(conn, model="claude-haiku-4-5-20251001")
+
+    batch_ended = MagicMock(processing_status="ended")
+    client.messages.batches.retrieve = AsyncMock(return_value=batch_ended)
+
+    r1 = _make_sdk_result_with_usage("111_222_42", input_tokens=500, output_tokens=100)
+    r2 = _make_sdk_result_with_usage("111_222_43", input_tokens=300, output_tokens=50,
+                                     cache_read_input_tokens=200)
+
+    async def fake_results(batch_id):
+        async def _gen():
+            yield r1
+            yield r2
+        return _gen()
+
+    client.messages.batches.results = fake_results
+
+    from ahsoka.database import save_pending_batch, get_total_usage
+    await save_pending_batch(conn, "batch_usage_test", {
+        "111_222_42": [111, 222, 42],
+        "111_222_43": [111, 222, 43],
+    })
+
+    req1 = make_request(make_post(111, 222), make_config(42))
+    req2 = make_request(make_post(111, 222), make_config(43))
+
+    await submitter.poll_and_process("batch_usage_test", [req1, req2])
+
+    usage = await get_total_usage(conn)
+    assert "claude-haiku-4-5-20251001" in usage
+    u = usage["claude-haiku-4-5-20251001"]
+    assert u["input_tokens"] == 800
+    assert u["output_tokens"] == 150
+    assert u["cache_read_input_tokens"] == 200
+    assert u["succeeded"] == 2
+    assert u["batches"] == 1
+
+
+async def test_recover_saves_token_usage(conn):
+    """recover() accumulates tokens from results and calls save_batch_usage."""
+    submitter, client = make_submitter(conn, model="claude-haiku-4-5-20251001")
+
+    batch_ended = MagicMock(processing_status="ended")
+    client.messages.batches.retrieve = AsyncMock(return_value=batch_ended)
+
+    custom_id = "111_222_42"
+    sdk_result = _make_sdk_result_with_usage(custom_id, input_tokens=400, output_tokens=80)
+
+    async def fake_results(batch_id):
+        async def _gen():
+            yield sdk_result
+        return _gen()
+
+    client.messages.batches.results = fake_results
+
+    from ahsoka.database import save_pending_batch, get_total_usage
+    await save_pending_batch(conn, "batch_rec_usage", {custom_id: [111, 222, 42]})
+
+    request_map = {custom_id: [111, 222, 42]}
+
+    with patch("ahsoka.pipeline.batch_submitter.db.store_verdict", new_callable=AsyncMock):
+        await submitter.recover("batch_rec_usage", request_map)
+
+    usage = await get_total_usage(conn)
+    assert "claude-haiku-4-5-20251001" in usage
+    u = usage["claude-haiku-4-5-20251001"]
+    assert u["input_tokens"] == 400
+    assert u["output_tokens"] == 80
+    assert u["succeeded"] == 1
