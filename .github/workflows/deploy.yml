@@ -3,6 +3,11 @@ name: CI/CD
 on:
   push:
     branches: [main]
+    paths:
+      - "ahsoka/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/deploy.yml"
   pull_request:
     branches: [main]
   workflow_dispatch:
