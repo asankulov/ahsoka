@@ -356,7 +356,21 @@ def register_bot_commands(
         if not watched_channels:
             await message.reply("No channels being watched.")
             return
-        lines = [str(c) for c in sorted(watched_channels)]
+        lines = []
+        for c in sorted(watched_channels):
+            if message.bot is None:
+                lines.append(str(c))
+                continue
+            try:
+                chat = await message.bot.get_chat(c)
+                title = chat.title or str(c)
+                if chat.username:
+                    lines.append(f"{title} (https://t.me/{chat.username})")
+                else:
+                    stripped = str(c).lstrip("-")[3:]
+                    lines.append(f"{title} (https://t.me/c/{stripped})")
+            except Exception:
+                lines.append(str(c))
         await message.reply("Watched channels:\n" + "\n".join(lines))
 
     @user_router.message(Command("help"))
@@ -592,7 +606,15 @@ def register_bot_commands(
             if u.is_banned:
                 flags.append("banned")
             flag_str = f" ({', '.join(flags)})" if flags else ""
-            lines.append(f"  {u.user_id}{flag_str}")
+            username_str = ""
+            if message.bot is not None:
+                try:
+                    chat = await message.bot.get_chat(u.user_id)
+                    if chat.username:
+                        username_str = f" @{chat.username}"
+                except Exception:
+                    pass
+            lines.append(f"  {u.user_id}{username_str}{flag_str}")
         await message.reply(f"Registered users ({len(users)}):\n" + "\n".join(lines))
 
     @admin_router.message(Command("ban"))
