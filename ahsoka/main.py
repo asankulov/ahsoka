@@ -289,10 +289,10 @@ async def main() -> None:
         except Exception as exc:
             logger.error("Log bot health check failed: %s — verify LOG_BOT_TOKEN", exc)
         _tg_handler = TelegramLogHandler(log_bot, settings.owner_chat_id)
-        _tg_handler.setLevel(logging.DEBUG)
+        _tg_handler.setLevel(logging.ERROR)
         _tg_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s\n%(message)s"))
         logging.getLogger().addHandler(_tg_handler)
-        logger.info("Telegram log handler registered (INFO+) via dedicated log bot")
+        logger.info("Telegram log handler registered (ERROR+) via dedicated log bot")
 
     # Sync command menu and bot description with Telegram
     try:

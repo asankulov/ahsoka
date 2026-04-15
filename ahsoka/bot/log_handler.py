@@ -1,4 +1,4 @@
-"""TelegramLogHandler — forwards WARNING+ log records to a dedicated Telegram bot."""
+"""TelegramLogHandler — forwards ERROR+ log records to a dedicated Telegram bot."""
 import asyncio
 import logging
 
