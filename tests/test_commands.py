@@ -10,10 +10,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 from aiogram import Dispatcher
 
-from ahsoka.bot.commands import register_bot_commands, WaitingForInput
+from ahsoka.bot.commands import register_bot_commands, WaitingForInput, _fmt_tokens, _pricing_for
 from ahsoka.config import Settings
 from ahsoka.database import (
     get_user_config, init_db, load_watched_channels, get_or_create_user, get_user,
+    save_batch_usage,
 )
 
 
@@ -771,3 +772,80 @@ async def test_admin_middleware_blocks_non_admin(conn, settings):
 
     await middleware(fake_handler, msg, {})
     assert called is False
+
+
+# ---------------------------------------------------------------------------
+# /stats (admin)
+# ---------------------------------------------------------------------------
+
+
+async def test_stats_no_api_data(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/stats")
+    await h["cmd_stats"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "no data" in reply_text.lower()
+
+
+async def test_stats_shows_api_line_when_usage_exists(conn, settings):
+    await save_batch_usage(
+        conn, "batch_x1", "claude-haiku-4-5-20251001",
+        input_tokens=500_000, output_tokens=20_000,
+        cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        succeeded=10,
+    )
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/stats")
+    await h["cmd_stats"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "API:" in reply_text
+    assert "batches" in reply_text
+    assert "est. $" in reply_text
+
+
+async def test_stats_shows_cached_tokens_when_nonzero(conn, settings):
+    await save_batch_usage(
+        conn, "batch_x2", "claude-haiku-4-5-20251001",
+        input_tokens=100_000, output_tokens=5_000,
+        cache_creation_input_tokens=10_000, cache_read_input_tokens=50_000,
+        succeeded=4,
+    )
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/stats")
+    await h["cmd_stats"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "cached" in reply_text
+
+
+async def test_stats_cancels_waiting_state(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    ctx = make_ctx()
+    await h["cmd_stats"](make_msg("/stats"), ctx)
+    ctx.clear.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Helper unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_fmt_tokens_millions():
+    assert _fmt_tokens(1_200_000) == "1.2M"
+
+
+def test_fmt_tokens_thousands():
+    assert _fmt_tokens(45_000) == "45K"
+
+
+def test_fmt_tokens_small():
+    assert _fmt_tokens(500) == "500"
+
+
+def test_pricing_for_known_model():
+    prices = _pricing_for("claude-haiku-4-5-20251001")
+    assert prices is not None
+    assert len(prices) == 4
+
+
+def test_pricing_for_unknown_model():
+    assert _pricing_for("gpt-99") is None

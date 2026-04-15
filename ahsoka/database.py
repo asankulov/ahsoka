@@ -82,6 +82,17 @@ CREATE TABLE IF NOT EXISTS pending_batches (
     status       TEXT NOT NULL,
     request_map  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS batch_usage (
+    batch_id                    TEXT PRIMARY KEY,
+    model                       TEXT NOT NULL,
+    input_tokens                INTEGER NOT NULL DEFAULT 0,
+    output_tokens               INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_input_tokens     INTEGER NOT NULL DEFAULT 0,
+    succeeded                   INTEGER NOT NULL DEFAULT 0,
+    recorded_at                 TEXT NOT NULL
+);
 """
 
 
@@ -575,3 +586,60 @@ async def mark_batch_complete(
         (status, batch_id),
     )
     await conn.commit()
+
+
+# --- Batch usage / cost tracking ---
+
+
+async def save_batch_usage(
+    conn: aiosqlite.Connection,
+    batch_id: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_creation_input_tokens: int,
+    cache_read_input_tokens: int,
+    succeeded: int,
+) -> None:
+    """Persist aggregated token counts for a completed batch."""
+    recorded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    await conn.execute(
+        """INSERT OR REPLACE INTO batch_usage
+           (batch_id, model, input_tokens, output_tokens,
+            cache_creation_input_tokens, cache_read_input_tokens,
+            succeeded, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            batch_id, model, input_tokens, output_tokens,
+            cache_creation_input_tokens, cache_read_input_tokens,
+            succeeded, recorded_at,
+        ),
+    )
+    await conn.commit()
+
+
+async def get_total_usage(conn: aiosqlite.Connection) -> dict:
+    """Return aggregated token counts across all recorded batches, grouped by model."""
+    async with conn.execute(
+        """SELECT model,
+                  SUM(input_tokens),
+                  SUM(output_tokens),
+                  SUM(cache_creation_input_tokens),
+                  SUM(cache_read_input_tokens),
+                  SUM(succeeded),
+                  COUNT(*)
+           FROM batch_usage
+           GROUP BY model"""
+    ) as cur:
+        rows = await cur.fetchall()
+    return {
+        row[0]: {
+            "input_tokens": row[1] or 0,
+            "output_tokens": row[2] or 0,
+            "cache_creation_input_tokens": row[3] or 0,
+            "cache_read_input_tokens": row[4] or 0,
+            "succeeded": row[5] or 0,
+            "batches": row[6] or 0,
+        }
+        for row in rows
+    }

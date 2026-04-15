@@ -8,6 +8,7 @@ from ahsoka.database import (
     get_all_active_configs,
     get_or_create_user,
     get_pending_batches,
+    get_total_usage,
     get_user,
     get_user_config,
     get_verdicts_for_post,
@@ -20,6 +21,7 @@ from ahsoka.database import (
     mark_notified,
     mark_seen,
     remove_channel,
+    save_batch_usage,
     save_pending_batch,
     seed_channels,
     set_notify_target,
@@ -373,3 +375,92 @@ async def test_init_db_idempotent_no_error_on_double_call(conn):
     user = await get_user(conn, OWNER_ID)
     assert user is not None
     assert user.is_admin is True
+
+
+# --- Batch usage ---
+
+
+async def test_save_batch_usage_inserts_row(conn):
+    await save_batch_usage(
+        conn, "batch_u1", "claude-haiku-4-5-20251001",
+        input_tokens=1000, output_tokens=200,
+        cache_creation_input_tokens=50, cache_read_input_tokens=300,
+        succeeded=5,
+    )
+    usage = await get_total_usage(conn)
+    assert "claude-haiku-4-5-20251001" in usage
+    u = usage["claude-haiku-4-5-20251001"]
+    assert u["input_tokens"] == 1000
+    assert u["output_tokens"] == 200
+    assert u["cache_creation_input_tokens"] == 50
+    assert u["cache_read_input_tokens"] == 300
+    assert u["succeeded"] == 5
+    assert u["batches"] == 1
+
+
+async def test_save_batch_usage_upsert_replaces_row(conn):
+    """INSERT OR REPLACE: second save_batch_usage for same batch_id overwrites."""
+    await save_batch_usage(
+        conn, "batch_u2", "claude-haiku-4-5-20251001",
+        input_tokens=100, output_tokens=50,
+        cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        succeeded=1,
+    )
+    await save_batch_usage(
+        conn, "batch_u2", "claude-haiku-4-5-20251001",
+        input_tokens=999, output_tokens=888,
+        cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        succeeded=3,
+    )
+    usage = await get_total_usage(conn)
+    u = usage["claude-haiku-4-5-20251001"]
+    assert u["input_tokens"] == 999
+    assert u["batches"] == 1  # still one row
+
+
+async def test_get_total_usage_empty_returns_empty_dict(conn):
+    usage = await get_total_usage(conn)
+    assert usage == {}
+
+
+async def test_get_total_usage_sums_across_batches(conn):
+    await save_batch_usage(
+        conn, "batch_s1", "claude-haiku-4-5-20251001",
+        input_tokens=500, output_tokens=100,
+        cache_creation_input_tokens=10, cache_read_input_tokens=20,
+        succeeded=2,
+    )
+    await save_batch_usage(
+        conn, "batch_s2", "claude-haiku-4-5-20251001",
+        input_tokens=300, output_tokens=80,
+        cache_creation_input_tokens=5, cache_read_input_tokens=15,
+        succeeded=3,
+    )
+    usage = await get_total_usage(conn)
+    u = usage["claude-haiku-4-5-20251001"]
+    assert u["input_tokens"] == 800
+    assert u["output_tokens"] == 180
+    assert u["cache_creation_input_tokens"] == 15
+    assert u["cache_read_input_tokens"] == 35
+    assert u["succeeded"] == 5
+    assert u["batches"] == 2
+
+
+async def test_get_total_usage_groups_by_model(conn):
+    await save_batch_usage(
+        conn, "batch_m1", "claude-haiku-4-5-20251001",
+        input_tokens=100, output_tokens=10,
+        cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        succeeded=1,
+    )
+    await save_batch_usage(
+        conn, "batch_m2", "claude-sonnet-4-6",
+        input_tokens=200, output_tokens=20,
+        cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        succeeded=1,
+    )
+    usage = await get_total_usage(conn)
+    assert "claude-haiku-4-5-20251001" in usage
+    assert "claude-sonnet-4-6" in usage
+    assert usage["claude-haiku-4-5-20251001"]["input_tokens"] == 100
+    assert usage["claude-sonnet-4-6"]["input_tokens"] == 200

@@ -133,9 +133,18 @@ class BatchSubmitter:
 
         # Fetch results
         results: list[tuple[Post, UserConfig, PersonalizedVerdict]] = []
+        total_input = total_output = total_cache_write = total_cache_read = succeeded_count = 0
         try:
             async for result in await self._client.messages.batches.results(batch_id):
                 custom_id = result.custom_id
+                # Accumulate token usage before converting to plain dict
+                usage = getattr(getattr(result.result, "message", None), "usage", None)
+                if usage:
+                    total_input      += getattr(usage, "input_tokens", 0) or 0
+                    total_output     += getattr(usage, "output_tokens", 0) or 0
+                    total_cache_write += getattr(usage, "cache_creation_input_tokens", 0) or 0
+                    total_cache_read  += getattr(usage, "cache_read_input_tokens", 0) or 0
+                    succeeded_count  += 1
                 # parse the result — the SDK object has .result.type / .result.message
                 result_dict = _sdk_result_to_dict(result)
                 uid_str = custom_id.split("_")[-1] if "_" in custom_id else "0"
@@ -159,6 +168,10 @@ class BatchSubmitter:
             batch_id, duration_s, len(results),
         )
         await db.mark_batch_complete(self._conn, batch_id, status="complete")
+        await db.save_batch_usage(
+            self._conn, batch_id, self._model,
+            total_input, total_output, total_cache_write, total_cache_read, succeeded_count,
+        )
         return results
 
 
@@ -192,6 +205,7 @@ class BatchSubmitter:
 
             await asyncio.sleep(self._poll_interval)
 
+        total_input = total_output = total_cache_write = total_cache_read = succeeded_count = 0
         try:
             async for result in await self._client.messages.batches.results(batch_id):
                 custom_id = result.custom_id
@@ -200,6 +214,14 @@ class BatchSubmitter:
                     logger.warning("Recovery: unknown custom_id %s in batch %s", custom_id, batch_id)
                     continue
                 channel_id, message_id, user_id = mapping
+                # Accumulate token usage
+                usage = getattr(getattr(result.result, "message", None), "usage", None)
+                if usage:
+                    total_input      += getattr(usage, "input_tokens", 0) or 0
+                    total_output     += getattr(usage, "output_tokens", 0) or 0
+                    total_cache_write += getattr(usage, "cache_creation_input_tokens", 0) or 0
+                    total_cache_read  += getattr(usage, "cache_read_input_tokens", 0) or 0
+                    succeeded_count  += 1
                 result_dict = _sdk_result_to_dict(result)
                 verdict = parse_verdict(result_dict, user_id)
                 await db.store_verdict(self._conn, verdict, channel_id, message_id)
@@ -209,6 +231,10 @@ class BatchSubmitter:
             return
 
         await db.mark_batch_complete(self._conn, batch_id, status="complete")
+        await db.save_batch_usage(
+            self._conn, batch_id, self._model,
+            total_input, total_output, total_cache_write, total_cache_read, succeeded_count,
+        )
         logger.info("Recovery: batch %s completed and verdicts stored", batch_id)
 
 
