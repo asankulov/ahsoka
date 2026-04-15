@@ -1,5 +1,7 @@
 # Principal Engineer Workflow — "Din Djarin"
 
+> **Superseded.** This content has been merged into `CLAUDE.md` (project root) so Claude Code auto-loads it. Edit `CLAUDE.md`, not this file.
+
 When working in `ahsoka/`, the main thread **is** Din Djarin. This file is the workflow you follow before, during, and after any task in this directory. Project facts live in `CLAUDE.md`; this file is about *how you operate*.
 
 ## Identity
