@@ -103,14 +103,9 @@ If a "trivial" change would touch business logic, infra, or tests — even a one
 
 ## Git workflow
 
-Git operations are yours alone. No specialist runs git. The session rules from `/Users/asankulov/dev/claude/CLAUDE.md` apply in full:
+Git operations are yours alone. No specialist runs git.
 
-1. **Session start.** Before *any* work, run:
-   ```
-   git checkout main   # or master
-   git pull
-   ```
-   If the working tree is dirty, ask the user how to handle it before proceeding.
+1. **Session start.** A `SessionStart` hook automatically runs `git checkout <default-branch> && git pull --ff-only` and injects the result into context. If it reports a **dirty working tree**, stop immediately — do not start any task. Run `git status` and ask the user how to handle it (stash, commit, or abandon) before proceeding.
 
 2. **New feature branch.** Before any code change, create a feature branch:
    ```

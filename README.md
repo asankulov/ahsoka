@@ -10,12 +10,21 @@ Pyrogram user client
        │
        ▼  asyncio.Queue
   dedup            — already seen? drop
-  keyword index    — union of all users' keywords; no match = skip Claude
-  scraper          — httpx + trafilatura; fallback to raw post text
-  scorer           — Claude → generic score 0–10 + reason + apply info
-  fan-out          — per-user filter (keywords, threshold, paused)
+  keyword index    — union of all users' keywords; no match = skip API
+  scraper          — httpx + trafilatura; t.me links via Pyrogram
+       │
+       ▼  BatchQueue (buffers per-user scoring requests)
+  batch submitter  — flushes to Anthropic Message Batches API (50% discount)
+                     polls until complete (typically 1–15 min)
+       │
+       ▼  per-(post, user) PersonalizedVerdict
+  user filter      — not paused AND matched AND score >= threshold
   notifier         — sends to each matching user's DM or channel
 ```
+
+Each post is scored **once per user** with a fully personalised prompt — stack,
+seniority, remote, location, and salary range are all load-bearing. Notifications
+are near-real-time (minutes), not instant. API cost scales with users × posts.
 
 Notifications include a link preview for easy bookmarking:
 
@@ -68,6 +77,12 @@ CLAUDE_MODEL=claude-haiku-4-5-20251001
 DEFAULT_SCORE_THRESHOLD=7
 SCRAPE_TIMEOUT_S=5.0
 DB_PATH=ahsoka.db
+
+# Batch scoring tunables (optional — defaults shown)
+# BATCH_FLUSH_SIZE=50           # flush when this many requests are queued
+# BATCH_FLUSH_SECONDS=600       # flush after this many seconds regardless
+# BATCH_POLL_INTERVAL_SECONDS=60
+# BATCH_MAX_WAIT_SECONDS=1800
 ```
 
 ## Bot commands
@@ -105,17 +120,22 @@ Any user can `/start` the bot and configure their own filters:
 | `/users` | `/users` | List registered users |
 | `/ban` | `/ban 123456` | Ban a user |
 | `/unban` | `/unban 123456` | Unban a user |
-| `/stats` | `/stats` | Usage statistics |
+| `/stats` | `/stats` | Usage statistics + API cost estimate |
+| `/debug` | `/debug on` | Toggle debug scoring mode (forward a post to score it live) |
+| `/admin` | `/admin` | Show admin command help |
 
 ## Storage
 
-SQLite (`ahsoka.db`). Five tables:
+SQLite (`ahsoka.db`). Eight tables:
 
 - `users` — registered users with admin/ban status and notification target
-- `user_config` — per-user filter settings (stack, keywords, threshold, etc.)
-- `seen_posts` — dedup + global scores; rows older than 30 days are deleted automatically
+- `user_config` — per-user filter settings (stack, seniority, location, salary, keywords, threshold, etc.)
+- `seen_posts` — dedup log; rows older than 30 days are pruned automatically
 - `watched_channels` — shared watchlist, seeded from `CHANNEL_IDS` on first run
-- `user_notified` — tracks which posts were sent to which users
+- `user_notified` — tracks which posts were sent to which users (prevents duplicate notifications)
+- `post_verdicts` — per-(post, user) `PersonalizedVerdict` for auditability
+- `pending_batches` — in-flight Anthropic batch state for crash recovery
+- `batch_usage` — token counts and estimated cost per completed batch
 
 ## Running tests
 

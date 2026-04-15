@@ -1,5 +1,16 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "branch=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||'); branch=${branch:-main}; if git status --porcelain | grep -q .; then printf '%s' '{\"systemMessage\":\"DIRTY WORKING TREE — surface to user before any work.\",\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Working tree is dirty. Do NOT start any task. Run git status immediately and ask the user how to handle it (stash, commit, or abandon changes).\"}}'; else git checkout \"$branch\" 2>/dev/null; git pull --ff-only 2>/dev/null; printf '{\"systemMessage\":\"Session ready: on %s, up to date.\",\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Session initialized: checked out %s and pulled latest. Remember: create a feature branch before making any code changes.\"}}' \"$branch\" \"$branch\"; fi",
+            "statusMessage": "Syncing git..."
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Agent",
