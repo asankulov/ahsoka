@@ -942,3 +942,235 @@ async def test_batch_worker_shutdown_flush_exception_logged(conn):
 
     # The exception during shutdown flush should be logged
     assert mock_logger.exception.called
+
+
+# ---------------------------------------------------------------------------
+# main() — recovery_task concurrency and shutdown inclusion
+#
+# These tests exercise the two structural properties introduced by the
+# "create_task recovery" fix:
+#   1. dp.start_polling is created as a task concurrently with recovery
+#      (i.e. main() does not await _recover_pending_batches before proceeding).
+#   2. recovery_task is present in all_tasks so it gets cancelled on shutdown.
+#
+# main() has a very large setup surface (Bot, Dispatcher, Pyrogram, aiosqlite,
+# Anthropic, …).  We patch every external call to nothing, keep the event loop
+# running just long enough to verify the ordering, then cancel gather.
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_pyro():
+    """Return a minimal async context manager standing in for the Pyrogram client."""
+
+    class _FakePyro:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        def get_dialogs(self):
+            return self
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    return _FakePyro()
+
+
+def _make_fake_bot():
+    bot = AsyncMock()
+    bot.send_message = AsyncMock()
+    bot.set_my_commands = AsyncMock()
+    bot.set_my_description = AsyncMock()
+    bot.set_my_short_description = AsyncMock()
+    bot.session = MagicMock(close=AsyncMock())
+    return bot
+
+
+def _make_fake_settings():
+    return MagicMock(
+        db_path=":memory:",
+        owner_chat_id=1,
+        channel_ids=[],
+        bot_token="tok",
+        anthropic_api_key="key",
+        claude_model="claude-3-5-haiku-20241022",
+        batch_flush_size=10,
+        batch_flush_seconds=60,
+        batch_poll_interval_seconds=5,
+        batch_max_wait_seconds=1800,
+        scrape_timeout_s=10,
+        log_bot_token=None,
+    )
+
+
+import contextlib
+
+
+def _build_main_patches(fake_pyro, fake_bot, fake_settings, fake_dp, recovery_coro):
+    """Return a list of patch() calls for main() scaffolding (for use with ExitStack)."""
+    return [
+        patch("ahsoka.main.aiosqlite.connect", new_callable=AsyncMock,
+              return_value=AsyncMock(close=AsyncMock())),
+        patch("ahsoka.main.db.init_db", new_callable=AsyncMock),
+        patch("ahsoka.main.db.seed_channels", new_callable=AsyncMock),
+        patch("ahsoka.main.db.load_watched_channels", new_callable=AsyncMock, return_value=set()),
+        patch("ahsoka.main.KeywordIndex", return_value=MagicMock(rebuild=AsyncMock())),
+        patch("ahsoka.main.build_pyrogram_client", return_value=fake_pyro),
+        patch("ahsoka.main.register_watcher_handlers"),
+        patch("ahsoka.main.Bot", return_value=fake_bot),
+        patch("ahsoka.main.Dispatcher", return_value=fake_dp),
+        patch("ahsoka.main.AsyncAnthropic"),
+        patch("ahsoka.main.register_bot_commands"),
+        patch("ahsoka.main.BatchQueue"),
+        patch("ahsoka.main.BatchSubmitter"),
+        patch("ahsoka.main.pipeline_worker", new_callable=AsyncMock),
+        patch("ahsoka.main.batch_worker", new_callable=AsyncMock),
+        patch("ahsoka.main.cleanup_worker", new_callable=AsyncMock),
+        patch("ahsoka.main.channel_poller", new_callable=AsyncMock),
+        patch("ahsoka.main.settings", fake_settings),
+        patch("ahsoka.main._recover_pending_batches", recovery_coro),
+    ]
+
+
+@contextlib.asynccontextmanager
+async def _main_env(
+    recovery_coro=None,
+    start_polling_coro=None,
+    extra_patches=None,
+):
+    """
+    Async context manager that patches every external dependency of main()
+    and runs it as a background task.  Yields the running task so callers
+    can await it or cancel it.
+
+    recovery_coro: coroutine function to substitute for _recover_pending_batches.
+                   Defaults to an immediate no-op.
+    start_polling_coro: coroutine function to substitute for dp.start_polling.
+                        Defaults to raising CancelledError immediately (stops gather).
+    extra_patches: additional patch() objects applied after the base set.
+    """
+    from ahsoka.main import main as _main
+
+    if recovery_coro is None:
+        async def recovery_coro(*_a, **_kw):
+            pass
+
+    if start_polling_coro is None:
+        async def start_polling_coro(*_a, **_kw):
+            raise asyncio.CancelledError
+
+    fake_pyro = _make_fake_pyro()
+    fake_bot = _make_fake_bot()
+    fake_settings = _make_fake_settings()
+    fake_dp = MagicMock(
+        start_polling=start_polling_coro,
+        storage=MagicMock(close=AsyncMock()),
+    )
+
+    all_patches = _build_main_patches(fake_pyro, fake_bot, fake_settings, fake_dp, recovery_coro)
+    if extra_patches:
+        all_patches.extend(extra_patches)
+
+    with contextlib.ExitStack() as stack:
+        for p in all_patches:
+            stack.enter_context(p)
+        task = asyncio.create_task(_main())
+        try:
+            yield task
+        finally:
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+
+
+async def test_main_recovery_task_included_in_all_tasks():
+    """recovery_task is included in all_tasks so it is cancelled on shutdown.
+
+    We capture the tasks passed to asyncio.gather and verify that at least one
+    of them wraps the _recover_pending_batches coroutine (i.e. create_task was
+    called on it, and the resulting Task was added to all_tasks).
+    """
+    gathered_tasks: list = []
+    _real_gather = asyncio.gather
+
+    async def capturing_gather(*tasks, **kwargs):
+        gathered_tasks.extend(tasks)
+        # Cancel all tasks immediately so the test doesn't hang
+        for t in tasks:
+            if hasattr(t, "cancel"):
+                t.cancel()
+        return await _real_gather(*tasks, return_exceptions=True)
+
+    # slow_recovery stays alive long enough for gather to capture it
+    async def slow_recovery(*_a, **_kw):
+        await asyncio.sleep(9999)
+
+    with patch("ahsoka.main.asyncio.gather", side_effect=capturing_gather):
+        async with _main_env(recovery_coro=slow_recovery):
+            # Give main() a few event-loop ticks to reach the gather call
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+    assert gathered_tasks, "asyncio.gather was never called — main() exited before reaching gather"
+
+    # Identify Tasks whose coroutine name contains "recover"
+    recovery_tasks = [
+        t for t in gathered_tasks
+        if asyncio.isfuture(t)
+        and hasattr(t, "get_coro")
+        and "_recover" in getattr(t.get_coro(), "__name__", "")
+    ]
+    assert recovery_tasks, (
+        "recovery_task not found in asyncio.gather arguments — "
+        "it may have been dropped from all_tasks. "
+        f"Coro names seen: {[getattr(t.get_coro(), '__name__', '?') for t in gathered_tasks if asyncio.isfuture(t) and hasattr(t, 'get_coro')]}"
+    )
+
+
+async def test_main_start_polling_not_blocked_by_recovery():
+    """dp.start_polling is called concurrently with recovery, not after it completes.
+
+    Recovery is patched to a slow coroutine that yields control 20 times before
+    finishing.  dp.start_polling is patched to record when it fires and then
+    raise CancelledError to unblock gather.  We assert that polling_started is
+    True and recovery_finished is False — proving the two run concurrently.
+    """
+    recovery_finished = False
+    polling_started = False
+
+    async def slow_recovery(*_a, **_kw):
+        nonlocal recovery_finished
+        for _ in range(20):
+            await asyncio.sleep(0)
+        recovery_finished = True
+
+    async def fake_start_polling(*_a, **_kw):
+        nonlocal polling_started
+        polling_started = True
+        raise asyncio.CancelledError
+
+    async with _main_env(
+        recovery_coro=slow_recovery,
+        start_polling_coro=fake_start_polling,
+    ) as task:
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    assert polling_started, (
+        "dp.start_polling was never called — main() may have exited before reaching gather"
+    )
+    # If recovery_finished is True here, it means recovery completed before polling
+    # was even scheduled — that would be the old sequential (broken) behaviour.
+    assert not recovery_finished, (
+        "recovery_finished=True before dp.start_polling fired — "
+        "_recover_pending_batches appears to have been awaited directly, blocking polling."
+    )

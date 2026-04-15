@@ -308,8 +308,9 @@ async def main() -> None:
     except Exception as exc:
         logger.warning("Failed to update bot command menu: %s", exc)
 
-    # Recover any in-flight batches from a previous run
-    await _recover_pending_batches(conn, bot, submitter)
+    # Recover any in-flight batches from a previous run — run as a background task
+    # so dp.start_polling() is not blocked while recovery polls for up to ~30 min.
+    recovery_task = asyncio.create_task(_recover_pending_batches(conn, bot, submitter))
 
     workers = [
         asyncio.create_task(
@@ -336,7 +337,7 @@ async def main() -> None:
 
         polling = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
         poller = asyncio.create_task(channel_poller(pyro, queue, watched_channels))
-        all_tasks = [polling, poller, cleanup, batch_task, *workers]
+        all_tasks = [polling, poller, cleanup, batch_task, recovery_task, *workers]
         try:
             await asyncio.gather(*all_tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):

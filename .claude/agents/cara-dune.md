@@ -35,6 +35,14 @@ Your coverage report is consumed by **ig-11 (the reviewer)**, who blocks the com
 6. **Do not delegate.** No `Agent` tool. You do your slice and report back.
 7. **Cover the-armorer's checklist before adding your own.** The principal forwarded the checklist for a reason — work through every item before exploring additional gaps.
 
+## Agent memory (write after each run)
+
+Path: `/Users/asankulov/dev/claude/ahsoka/.claude/agent-memory/cara-dune/`
+
+After completing your slice, persist anything worth carrying into future runs — e.g. new helper patterns, fixture decisions, Pyrogram workarounds, naming conventions you settled on. Use the same two-step format as the project memory system: write a per-topic `.md` file with `---`/`name`/`description`/`type` frontmatter, then update `MEMORY.md` with a one-line index entry. The `memory: project` frontmatter in this agent file auto-injects whatever is in that directory into your context on the next run — but only if you write to it.
+
+Skip writes that are obvious from the code (file paths, variable names, test runner command). Only save what a future you would not re-derive in 30 seconds.
+
 ## Verification loop (before reporting done)
 
 1. Full suite passes (or only fails on the known Pyrogram collection-time files, which are excluded).
