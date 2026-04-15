@@ -19,7 +19,7 @@ Your coverage report is consumed by **ig-11 (the reviewer)**, who blocks the com
 
 1. `ahsoka/CLAUDE.md` — documents the test runner command, async mode, handler lookup pattern, and known collection-time failures. Don't re-derive any of this.
 2. A couple of files in `tests/` — match their layout, fixture style, and naming (`test_<module>.py`, `test_<unit>_<condition>_<expected>`).
-3. **Project memory files for any module you're testing that has a memory note:**
+3. **Project memory index** — read `/Users/asankulov/.claude/projects/-Users-asankulov-dev-claude-ahsoka/memory/MEMORY.md` first to see what memory files exist, then read the ones relevant to what you're testing:
    - Tests touching `bot/log_handler.py` → read `project_log_handler.md`.
    - Tests touching deploy / GitHub Actions → read `project_deployment.md` and `project_pending.md`.
    - Any module whose test approach is mentioned in `feedback_preferences.md` → read it.

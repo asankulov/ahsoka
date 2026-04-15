@@ -16,13 +16,13 @@ def make_handler(send_side_effect=None) -> tuple[TelegramLogHandler, AsyncMock]:
     bot = MagicMock()
     bot.send_message = AsyncMock(side_effect=send_side_effect)
     handler = TelegramLogHandler(bot=bot, chat_id=999)
-    handler.setLevel(logging.WARNING)
+    handler.setLevel(logging.ERROR)
     return handler, bot
 
 
 def make_record(
     name: str = "ahsoka.pipeline",
-    level: int = logging.WARNING,
+    level: int = logging.ERROR,
     msg: str = "Something went wrong",
 ) -> logging.LogRecord:
     return logging.LogRecord(
@@ -98,7 +98,7 @@ async def test_non_noisy_logger_is_forwarded():
 
 async def test_root_logger_record_is_forwarded():
     handler, bot = make_handler()
-    record = make_record(name="root", level=logging.WARNING)
+    record = make_record(name="root", level=logging.ERROR)
     handler.emit(record)
     await asyncio.sleep(0)
     bot.send_message.assert_awaited_once()
@@ -173,7 +173,8 @@ def test_emit_outside_event_loop_does_not_raise():
 
 async def test_debug_record_not_forwarded_by_handler_level():
     handler, bot = make_handler()
-    # Route through a real Logger so level comparison (Logger → Handler) is exercised
+    # Route through a real Logger so level comparison (Logger → Handler) is exercised.
+    # Handler is set to ERROR; DEBUG is well below that threshold.
     test_logger = logging.getLogger("test.level_filter")
     test_logger.setLevel(logging.DEBUG)  # logger accepts all levels
     test_logger.addHandler(handler)
@@ -183,6 +184,29 @@ async def test_debug_record_not_forwarded_by_handler_level():
         bot.send_message.assert_not_awaited()
     finally:
         test_logger.removeHandler(handler)
+
+
+async def test_warning_record_not_forwarded_by_handler_level():
+    """WARNING is below the ERROR threshold — must NOT be forwarded."""
+    handler, bot = make_handler()
+    test_logger = logging.getLogger("test.warning_filter")
+    test_logger.setLevel(logging.DEBUG)  # logger accepts all levels
+    test_logger.addHandler(handler)
+    try:
+        test_logger.warning("should be filtered — below ERROR threshold")
+        await asyncio.sleep(0)
+        bot.send_message.assert_not_awaited()
+    finally:
+        test_logger.removeHandler(handler)
+
+
+async def test_error_record_forwarded():
+    """ERROR is exactly at the handler threshold — must be forwarded."""
+    handler, bot = make_handler()
+    record = make_record(level=logging.ERROR)
+    handler.handle(record)
+    await asyncio.sleep(0)
+    bot.send_message.assert_awaited_once()
 
 
 async def test_critical_record_forwarded():
