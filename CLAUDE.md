@@ -51,6 +51,8 @@ tests/
   test_user_filter.py      # Thin paused/threshold/matched validator
   test_main.py             # pipeline_worker, batch_worker, _recover_pending_batches
   test_dedup.py            # is_duplicate()
+  test_keyword_index.py    # KeywordIndex rebuild + passes()
+  test_watcher.py          # Watcher handler / poller
 ```
 
 ## Key Design Decisions
@@ -82,7 +84,7 @@ def get_handler_map(dp: Dispatcher) -> dict[str, object]:
 ```
 
 ### Database Schema
-Seven tables: `users` (registry), `user_config` (per-user settings), `seen_posts` (dedup; scoring columns now nullable), `watched_channels` (shared watchlist), `user_notified` (per-user notification tracking), `post_verdicts` (per-(post, user) `PersonalizedVerdict`), `pending_batches` (in-flight batch recovery state).
+Eight tables: `users` (registry), `user_config` (per-user settings), `seen_posts` (dedup; scoring columns now nullable), `watched_channels` (shared watchlist), `user_notified` (per-user notification tracking), `post_verdicts` (per-(post, user) `PersonalizedVerdict`), `pending_batches` (in-flight batch recovery state), `batch_usage` (token counts + cost per completed batch).
 
 Migrations are additive and idempotent via `CREATE TABLE IF NOT EXISTS` in `init_db()`. The old single-user key-value `user_config` migration is still handled automatically.
 
@@ -211,14 +213,9 @@ If a "trivial" change would touch business logic, infra, or tests — even a one
 
 ## Git workflow
 
-Git operations are yours alone. No specialist runs git. The session rules from `/Users/asankulov/dev/claude/CLAUDE.md` apply in full:
+Git operations are yours alone. No specialist runs git.
 
-1. **Session start.** Before *any* work, run:
-   ```
-   git checkout main   # or master
-   git pull
-   ```
-   If the working tree is dirty, ask the user how to handle it before proceeding.
+1. **Session start.** A `SessionStart` hook automatically runs `git checkout <default-branch> && git pull --ff-only` and injects the result into context. If it reports a **dirty working tree**, stop immediately — do not start any task. Run `git status` and ask the user how to handle it (stash, commit, or abandon) before proceeding.
 
 2. **New feature branch.** Before any code change, create a feature branch:
    ```
