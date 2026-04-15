@@ -75,10 +75,10 @@ def get_handlers_list(dp: Dispatcher, router_idx: int = 0) -> list:
     return [h.callback for h in router.message.handlers]
 
 
-def setup_dp(conn, settings, watched=None):
+def setup_dp(conn, settings, watched=None, anthropic=None):
     watched_channels: set[int] = watched if watched is not None else set()
     dp = Dispatcher()
-    register_bot_commands(dp, conn, settings, watched_channels)
+    register_bot_commands(dp, conn, settings, watched_channels, anthropic=anthropic)
     handlers = get_handler_map(dp)
     return dp, handlers, watched_channels
 
@@ -825,6 +825,42 @@ async def test_stats_cancels_waiting_state(conn, settings):
 
 
 # ---------------------------------------------------------------------------
+# /debug toggle
+# ---------------------------------------------------------------------------
+
+async def test_debug_on_enables_mode(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/debug on")
+    await h["cmd_debug"](msg, make_ctx())
+    msg.reply.assert_awaited_once()
+    assert "ON" in msg.reply.call_args[0][0]
+
+
+async def test_debug_off_disables_mode(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+    msg = make_msg("/debug off")
+    await h["cmd_debug"](msg, make_ctx())
+    assert "OFF" in msg.reply.call_args[0][0]
+
+
+async def test_debug_no_arg_shows_status(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/debug")
+    await h["cmd_debug"](msg, make_ctx())
+    msg.reply.assert_awaited_once()
+    reply_text = msg.reply.call_args[0][0]
+    assert "off" in reply_text.lower() or "ON" in reply_text
+
+
+async def test_debug_clears_state(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    ctx = make_ctx()
+    await h["cmd_debug"](make_msg("/debug on"), ctx)
+    ctx.clear.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # Helper unit tests
 # ---------------------------------------------------------------------------
 
@@ -849,3 +885,113 @@ def test_pricing_for_known_model():
 
 def test_pricing_for_unknown_model():
     assert _pricing_for("gpt-99") is None
+
+
+# ---------------------------------------------------------------------------
+# /admin and /stats mention debug
+# ---------------------------------------------------------------------------
+
+async def test_admin_help_mentions_debug(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/admin")
+    await h["cmd_admin"](msg, make_ctx())
+    assert "/debug" in msg.reply.call_args[0][0]
+
+
+async def test_stats_shows_debug_mode_off_by_default(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/stats")
+    await h["cmd_stats"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "debug" in reply_text.lower()
+    assert "off" in reply_text.lower()
+
+
+async def test_stats_shows_debug_mode_on_after_toggle(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+    msg = make_msg("/stats")
+    await h["cmd_stats"](msg, make_ctx())
+    assert "ON" in msg.reply.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# debug_forwarded_post handler
+# ---------------------------------------------------------------------------
+
+def make_forwarded_msg(channel_id: int = -100111, message_id: int = 42,
+                       username: str = "testchan", text: str = "Job posting") -> MagicMock:
+    msg = make_msg(text)
+    origin = MagicMock()
+    origin.type = "channel"
+    origin.chat.id = channel_id
+    origin.chat.username = username
+    origin.message_id = message_id
+    msg.forward_origin = origin
+    msg.caption = None
+    msg.entities = []
+    msg.caption_entities = None
+    return msg
+
+
+async def test_forwarded_post_ignored_when_debug_off(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_forwarded_msg()
+    await h["debug_forwarded_post"](msg)
+    msg.reply.assert_not_awaited()
+
+
+async def test_forwarded_post_scores_when_debug_on(conn, settings):
+    from unittest.mock import patch
+
+    fake_block = MagicMock()
+    fake_block.type = "text"
+    fake_block.text = (
+        '"score": 7, "reason": "good match", "matched": true, '
+        '"apply": "", "red_flags": [], "stack": ["Python"], '
+        '"seniority": "senior", "remote": "remote"}'
+    )
+    fake_response = MagicMock()
+    fake_response.content = [fake_block]
+
+    mock_anthropic = MagicMock()
+    mock_anthropic.messages.create = AsyncMock(return_value=fake_response)
+
+    settings.scrape_timeout_s = 5.0
+    settings.claude_model = "claude-haiku-4-5-20251001"
+
+    _, h, _ = setup_dp(conn, settings, anthropic=mock_anthropic)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    msg = make_forwarded_msg()
+    with patch("ahsoka.pipeline.scraper.scrape_content", new=AsyncMock(return_value="job text")):
+        await h["debug_forwarded_post"](msg)
+
+    mock_anthropic.messages.create.assert_awaited_once()
+    assert msg.reply.await_count >= 2  # "Scoring…" + results
+
+
+async def test_forwarded_post_no_anthropic_replies_unavailable(conn, settings):
+    _, h, _ = setup_dp(conn, settings, anthropic=None)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    msg = make_forwarded_msg()
+    await h["debug_forwarded_post"](msg)
+
+    msg.reply.assert_awaited_once()
+    assert "unavailable" in msg.reply.call_args[0][0].lower()
+
+
+async def test_forwarded_post_non_channel_origin_ignored(conn, settings):
+    mock_anthropic = MagicMock()
+    mock_anthropic.messages.create = AsyncMock()
+
+    _, h, _ = setup_dp(conn, settings, anthropic=mock_anthropic)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    msg = make_forwarded_msg()
+    # Remove message_id to simulate non-channel origin
+    del msg.forward_origin.message_id
+    await h["debug_forwarded_post"](msg)
+
+    mock_anthropic.messages.create.assert_not_awaited()

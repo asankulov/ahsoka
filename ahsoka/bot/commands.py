@@ -1,6 +1,7 @@
 import logging
 
 import aiosqlite
+from anthropic import AsyncAnthropic
 from aiogram import Dispatcher, F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -9,6 +10,7 @@ from aiogram.types import BotCommand, Message
 
 from ahsoka import database as db
 from ahsoka.config import Settings
+from ahsoka.models import Post
 from ahsoka.pipeline.keyword_index import KeywordIndex
 
 logger = logging.getLogger(__name__)
@@ -86,7 +88,10 @@ def register_bot_commands(
     watched_channels: set[int],
     pyro: object = None,
     keyword_index: KeywordIndex | None = None,
+    anthropic: AsyncAnthropic | None = None,
 ) -> None:
+    debug_mode: list[bool] = [False]
+
     user_router = Router()
     admin_router = Router()
 
@@ -120,6 +125,51 @@ def register_bot_commands(
     async def _rebuild_keywords() -> None:
         if keyword_index is not None:
             await keyword_index.rebuild(conn)
+
+    async def _run_debug_score(post: Post, message: Message) -> None:
+        from ahsoka.pipeline.scraper import scrape_content
+        from ahsoka.pipeline.scorer import build_personalized_prompt, parse_verdict
+
+        config = await db.get_user_config(conn, settings.owner_chat_id)
+        if config is None:
+            await message.reply("No config found for admin user.")
+            return
+
+        content = await scrape_content(post, timeout=settings.scrape_timeout_s)
+        prompt_dict = build_personalized_prompt(post, content, config)
+        params = prompt_dict["params"]
+        try:
+            response = await anthropic.messages.create(  # type: ignore[union-attr]
+                model=settings.claude_model,
+                max_tokens=params["max_tokens"],
+                system=params["system"],
+                messages=params["messages"],
+            )
+            response_dict = {
+                "result": {
+                    "type": "succeeded",
+                    "message": {"content": response.content},
+                }
+            }
+        except Exception as exc:
+            response_dict = {
+                "result": {
+                    "type": "errored",
+                    "error": {"message": str(exc)},
+                }
+            }
+        verdict = parse_verdict(response_dict, config.user_id)
+        match_sym = "\u2713" if verdict.matched else "\u2717"
+        lines: list[str] = [
+            f"DEBUG \u2014 {post.channel_name}/{post.message_id}",
+            f"Content: {len(content)} chars",
+            "",
+            f"score={verdict.score} {match_sym}",
+            verdict.reason,
+        ]
+        if verdict.red_flags:
+            lines.append(f"flags: {', '.join(verdict.red_flags)}")
+        await message.reply("\n".join(lines))
 
     # -------------------------------------------------------------------------
     # User commands
@@ -479,9 +529,24 @@ def register_bot_commands(
             "  /ban 123456 - Ban a user (stops notifications)",
             "  /unban 123456 - Unban a user",
             "  /stats - Show usage statistics (users, posts, notifications)",
+            "  /debug on/off - Toggle debug scoring mode (forward posts to score)",
             "  /admin - Show this help",
         ]
         await message.reply("\n".join(lines))
+
+    @admin_router.message(Command("debug"))
+    async def cmd_debug(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        arg = _arg(message.text).lower()
+        if arg == "on":
+            debug_mode[0] = True
+            await message.reply("Debug mode ON. Forward a job posting to score it.")
+        elif arg == "off":
+            debug_mode[0] = False
+            await message.reply("Debug mode OFF.")
+        else:
+            status = "ON" if debug_mode[0] else "OFF"
+            await message.reply(f"Debug mode is {status}. Use /debug on or /debug off.")
 
     @admin_router.message(Command("removechannel"))
     async def cmd_removechannel(message: Message, state: FSMContext) -> None:
@@ -606,8 +671,53 @@ def register_bot_commands(
             f"Posts: {total_posts} seen, {scored_posts} scored",
             f"Notifications: {total_notified} sent",
             api_line,
+            f"Debug mode: {'ON' if debug_mode[0] else 'off'}",
         ]
         await message.reply("\n".join(lines))
+
+    @admin_router.message(F.forward_origin.as_("origin"))
+    async def debug_forwarded_post(message: Message) -> None:
+        if not debug_mode[0]:
+            return
+        if anthropic is None:
+            await message.reply("Debug scoring unavailable: Anthropic client not configured.")
+            return
+
+        origin = message.forward_origin
+        if not hasattr(origin, "message_id"):
+            return
+
+        channel_id: int = origin.chat.id
+        message_id: int = origin.message_id
+        channel_name: str = getattr(origin.chat, "username", None) or str(channel_id)
+        text: str = message.text or message.caption or ""
+        entities = message.entities or message.caption_entities or []
+
+        seen: set[str] = set()
+        urls: list[str] = []
+        for entity in entities:
+            if len(urls) >= 3:
+                break
+            if entity.type == "text_link" and entity.url:
+                u = entity.url
+            elif entity.type == "url":
+                u = text[entity.offset: entity.offset + entity.length]
+            else:
+                continue
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
+
+        post = Post(
+            channel_id=channel_id,
+            message_id=message_id,
+            channel_name=channel_name,
+            text=text,
+            url=urls[0] if urls else None,
+            urls=urls,
+        )
+        await message.reply(f"Scoring post from {channel_name}/{message_id}\u2026")
+        await _run_debug_score(post, message)
 
     dp.include_router(user_router)
     dp.include_router(admin_router)
