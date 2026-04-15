@@ -995,3 +995,218 @@ async def test_forwarded_post_non_channel_origin_ignored(conn, settings):
     await h["debug_forwarded_post"](msg)
 
     mock_anthropic.messages.create.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Helper: make a message with a real AsyncMock bot
+# ---------------------------------------------------------------------------
+
+def make_msg_with_bot(text: str, user_id: int = USER_ID) -> MagicMock:
+    """Create a mock Message where message.bot is an AsyncMock-capable object."""
+    msg = make_msg(text, user_id=user_id)
+    bot = MagicMock()
+    bot.get_chat = AsyncMock()
+    msg.bot = bot
+    return msg
+
+
+# ---------------------------------------------------------------------------
+# /channels — get_chat resolution
+# ---------------------------------------------------------------------------
+
+async def test_channels_public_channel_shows_username_link(conn, settings):
+    """Public channel (has username) → line shows 'title (https://t.me/username)'."""
+    channel_id = -1001234567
+    _, h, watched = setup_dp(conn, settings)
+    watched.add(channel_id)
+
+    chat = MagicMock()
+    chat.title = "Python Jobs"
+    chat.username = "pythonjobs"
+
+    msg = make_msg_with_bot("/channels")
+    msg.bot.get_chat = AsyncMock(return_value=chat)
+
+    await h["cmd_channels"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "Python Jobs (https://t.me/pythonjobs)" in reply_text
+
+
+async def test_channels_private_channel_shows_c_link(conn, settings):
+    """Private channel (no username) → line shows 'title (https://t.me/c/stripped_id)'."""
+    channel_id = -1001234567
+    _, h, watched = setup_dp(conn, settings)
+    watched.add(channel_id)
+
+    chat = MagicMock()
+    chat.title = "Private Jobs"
+    chat.username = None
+
+    msg = make_msg_with_bot("/channels")
+    msg.bot.get_chat = AsyncMock(return_value=chat)
+
+    await h["cmd_channels"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    # stripped_id: str(-1001234567).lstrip("-")[3:] == "1234567"
+    assert "Private Jobs (https://t.me/c/1234567)" in reply_text
+
+
+async def test_channels_get_chat_raises_falls_back_to_raw_id(conn, settings):
+    """get_chat raising → falls back to raw channel_id string, no exception propagated."""
+    channel_id = -1001234567
+    _, h, watched = setup_dp(conn, settings)
+    watched.add(channel_id)
+
+    msg = make_msg_with_bot("/channels")
+    msg.bot.get_chat = AsyncMock(side_effect=Exception("Forbidden"))
+
+    await h["cmd_channels"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert str(channel_id) in reply_text
+
+
+async def test_channels_bot_none_falls_back_to_raw_id(conn, settings):
+    """message.bot is None → falls back to raw channel_id for every channel."""
+    channel_id = -1001234567
+    _, h, watched = setup_dp(conn, settings)
+    watched.add(channel_id)
+
+    msg = make_msg("/channels")
+    msg.bot = None
+
+    await h["cmd_channels"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert str(channel_id) in reply_text
+
+
+# Empty watchlist already covered by test_channels_empty_set above.
+
+
+# ---------------------------------------------------------------------------
+# /users — get_chat username resolution
+# ---------------------------------------------------------------------------
+
+async def test_users_empty_list_replies_no_users(conn, settings):
+    """Empty user list → replies 'No registered users.'"""
+    # Use owner_chat_id=0 so init_db skips owner insertion, giving us a clean user table.
+    async with aiosqlite.connect(":memory:") as fresh_conn:
+        from ahsoka.database import init_db as _init_db
+        await _init_db(fresh_conn, owner_chat_id=0)
+        dp2 = Dispatcher()
+        s2 = MagicMock(spec=Settings)
+        s2.owner_chat_id = 0
+        register_bot_commands(dp2, fresh_conn, s2, set())
+        h2 = get_handler_map(dp2)
+
+        msg = make_msg("/users")
+        await h2["cmd_users"](msg, make_ctx())
+        reply_text = msg.reply.call_args[0][0]
+        assert "No registered users" in reply_text
+
+
+async def test_users_with_username_shows_at_handle(conn, settings):
+    """User with username → line shows '  {user_id} @{username}'."""
+    _, h, _ = setup_dp(conn, settings)
+
+    chat = MagicMock()
+    chat.username = "kylych"
+
+    msg = make_msg_with_bot("/users")
+    msg.bot.get_chat = AsyncMock(return_value=chat)
+
+    await h["cmd_users"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert f"  {OWNER_ID} @kylych" in reply_text
+
+
+async def test_users_without_username_shows_id_only(conn, settings):
+    """User with no username → line shows '  {user_id}' without @ handle."""
+    _, h, _ = setup_dp(conn, settings)
+
+    chat = MagicMock()
+    chat.username = None
+
+    msg = make_msg_with_bot("/users")
+    msg.bot.get_chat = AsyncMock(return_value=chat)
+
+    await h["cmd_users"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert f"  {OWNER_ID}" in reply_text
+    assert "@" not in reply_text
+
+
+async def test_users_get_chat_raises_shows_id_no_exception(conn, settings):
+    """get_chat raising → line shows '  {user_id}' unchanged, no exception propagated."""
+    _, h, _ = setup_dp(conn, settings)
+
+    msg = make_msg_with_bot("/users")
+    msg.bot.get_chat = AsyncMock(side_effect=Exception("Forbidden"))
+
+    await h["cmd_users"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert f"  {OWNER_ID}" in reply_text
+
+
+async def test_users_bot_none_shows_id_no_username(conn, settings):
+    """message.bot is None → username_str stays empty, output is '  {user_id}{flag_str}'."""
+    _, h, _ = setup_dp(conn, settings)
+
+    msg = make_msg("/users")
+    msg.bot = None
+
+    await h["cmd_users"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert f"  {OWNER_ID}" in reply_text
+    assert "@" not in reply_text
+
+
+async def test_users_admin_flag_shown_with_username(conn, settings):
+    """Admin flag appears correctly when username resolves successfully."""
+    _, h, _ = setup_dp(conn, settings)
+
+    chat = MagicMock()
+    chat.username = "theadmin"
+
+    msg = make_msg_with_bot("/users")
+    msg.bot.get_chat = AsyncMock(return_value=chat)
+
+    await h["cmd_users"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    # OWNER_ID is admin by default (init_db sets is_admin=True for owner)
+    assert "admin" in reply_text
+    assert "@theadmin" in reply_text
+
+
+async def test_users_admin_flag_shown_when_get_chat_fails(conn, settings):
+    """Admin flag still appears even when get_chat raises."""
+    _, h, _ = setup_dp(conn, settings)
+
+    msg = make_msg_with_bot("/users")
+    msg.bot.get_chat = AsyncMock(side_effect=RuntimeError("network error"))
+
+    await h["cmd_users"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "admin" in reply_text
+
+
+async def test_users_banned_flag_shown_with_username(conn, settings):
+    """Banned flag appears alongside username when user is banned."""
+    from ahsoka.database import ban_user, get_or_create_user as _get_or_create_user
+    # Create a second non-admin user and ban them
+    await _get_or_create_user(conn, 77777)
+    await ban_user(conn, 77777)
+
+    _, h, _ = setup_dp(conn, settings)
+
+    async def fake_get_chat(user_id):
+        chat = MagicMock()
+        chat.username = "banned_person" if user_id == 77777 else None
+        return chat
+
+    msg = make_msg_with_bot("/users")
+    msg.bot.get_chat = fake_get_chat
+
+    await h["cmd_users"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "banned" in reply_text
+    assert "@banned_person" in reply_text
