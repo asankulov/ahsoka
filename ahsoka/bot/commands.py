@@ -129,6 +129,7 @@ def register_bot_commands(
     async def _run_debug_score(post: Post, message: Message) -> None:
         from ahsoka.pipeline.scraper import scrape_content
         from ahsoka.pipeline.scorer import build_personalized_prompt, parse_verdict
+        from ahsoka.pipeline.tg_resolver import is_tg_link, resolve_tg_link
 
         config = await db.get_user_config(conn, settings.owner_chat_id)
         if config is None:
@@ -136,6 +137,12 @@ def register_bot_commands(
             return
 
         content = await scrape_content(post, timeout=settings.scrape_timeout_s)
+        if pyro is not None:
+            for url in post.urls:
+                if is_tg_link(url):
+                    resolved = await resolve_tg_link(url, pyro)  # type: ignore[arg-type]
+                    if resolved:
+                        content += f"\n\n--- linked from {url} ---\n{resolved}"
         prompt_dict = build_personalized_prompt(post, content, config)
         params = prompt_dict["params"]
         try:

@@ -75,10 +75,10 @@ def get_handlers_list(dp: Dispatcher, router_idx: int = 0) -> list:
     return [h.callback for h in router.message.handlers]
 
 
-def setup_dp(conn, settings, watched=None, anthropic=None):
+def setup_dp(conn, settings, watched=None, anthropic=None, pyro=None):
     watched_channels: set[int] = watched if watched is not None else set()
     dp = Dispatcher()
-    register_bot_commands(dp, conn, settings, watched_channels, anthropic=anthropic)
+    register_bot_commands(dp, conn, settings, watched_channels, pyro=pyro, anthropic=anthropic)
     handlers = get_handler_map(dp)
     return dp, handlers, watched_channels
 
@@ -995,6 +995,230 @@ async def test_forwarded_post_non_channel_origin_ignored(conn, settings):
     await h["debug_forwarded_post"](msg)
 
     mock_anthropic.messages.create.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _run_debug_score — TG link resolution (checklist from the-armorer)
+# ---------------------------------------------------------------------------
+
+def _make_mock_anthropic() -> MagicMock:
+    """Return a minimal AsyncAnthropic-like mock that returns a parseable response."""
+    fake_block = MagicMock()
+    fake_block.type = "text"
+    fake_block.text = (
+        '"score": 5, "reason": "ok", "matched": true, '
+        '"apply": "", "red_flags": [], "stack": [], '
+        '"seniority": "", "remote": ""}'
+    )
+    fake_response = MagicMock()
+    fake_response.content = [fake_block]
+    mock = MagicMock()
+    mock.messages.create = AsyncMock(return_value=fake_response)
+    return mock
+
+
+def make_forwarded_msg_with_urls(urls: list[str], channel_id: int = -100111,
+                                  message_id: int = 42, username: str = "testchan",
+                                  text: str = "Job posting") -> MagicMock:
+    """Forwarded message carrying the given URLs as text_link entities."""
+    msg = make_forwarded_msg(channel_id=channel_id, message_id=message_id,
+                              username=username, text=text)
+    entities = []
+    for url in urls:
+        ent = MagicMock()
+        ent.type = "text_link"
+        ent.url = url
+        entities.append(ent)
+    msg.entities = entities
+    return msg
+
+
+async def test_debug_score_tg_link_resolved_and_appended(conn, settings):
+    """t.me link in post.urls + pyro is not None → resolve_tg_link called, result appended."""
+    from unittest.mock import patch
+
+    mock_anthropic = _make_mock_anthropic()
+    mock_pyro = MagicMock()
+    settings.scrape_timeout_s = 5.0
+    settings.claude_model = "claude-haiku-4-5-20251001"
+
+    _, h, _ = setup_dp(conn, settings, anthropic=mock_anthropic, pyro=mock_pyro)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    tg_url = "https://t.me/somechan/123"
+    msg = make_forwarded_msg_with_urls([tg_url])
+
+    with patch("ahsoka.pipeline.scraper.scrape_content", new=AsyncMock(return_value="base")), \
+         patch("ahsoka.pipeline.tg_resolver.is_tg_link", return_value=True), \
+         patch("ahsoka.pipeline.tg_resolver.resolve_tg_link",
+               new=AsyncMock(return_value="resolved text")) as mock_resolve:
+        await h["debug_forwarded_post"](msg)
+
+    mock_resolve.assert_awaited_once_with(tg_url, mock_pyro)
+    # The reply with debug output must mention the extra char count from appended content
+    reply_text = msg.reply.call_args_list[-1][0][0]
+    assert "Content:" in reply_text
+    # appended string is "\n\n--- linked from {url} ---\nresolved text"
+    appended = f"\n\n--- linked from {tg_url} ---\nresolved text"
+    expected_len = len("base") + len(appended)
+    assert str(expected_len) in reply_text
+
+
+async def test_debug_score_http_url_skips_resolve_tg_link(conn, settings):
+    """HTTP-only URLs → is_tg_link returns False → resolve_tg_link never called."""
+    from unittest.mock import patch
+
+    mock_anthropic = _make_mock_anthropic()
+    mock_pyro = MagicMock()
+    settings.scrape_timeout_s = 5.0
+    settings.claude_model = "claude-haiku-4-5-20251001"
+
+    _, h, _ = setup_dp(conn, settings, anthropic=mock_anthropic, pyro=mock_pyro)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    msg = make_forwarded_msg_with_urls(["https://example.com/job"])
+
+    with patch("ahsoka.pipeline.scraper.scrape_content", new=AsyncMock(return_value="base")), \
+         patch("ahsoka.pipeline.tg_resolver.is_tg_link", return_value=False), \
+         patch("ahsoka.pipeline.tg_resolver.resolve_tg_link",
+               new=AsyncMock()) as mock_resolve:
+        await h["debug_forwarded_post"](msg)
+
+    mock_resolve.assert_not_awaited()
+
+
+async def test_debug_score_resolve_returns_none_content_unchanged(conn, settings):
+    """resolve_tg_link returns None → if resolved: guard fires, content unchanged."""
+    from unittest.mock import patch
+
+    mock_anthropic = _make_mock_anthropic()
+    mock_pyro = MagicMock()
+    settings.scrape_timeout_s = 5.0
+    settings.claude_model = "claude-haiku-4-5-20251001"
+
+    _, h, _ = setup_dp(conn, settings, anthropic=mock_anthropic, pyro=mock_pyro)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    msg = make_forwarded_msg_with_urls(["https://t.me/chan/99"])
+
+    with patch("ahsoka.pipeline.scraper.scrape_content", new=AsyncMock(return_value="base")), \
+         patch("ahsoka.pipeline.tg_resolver.is_tg_link", return_value=True), \
+         patch("ahsoka.pipeline.tg_resolver.resolve_tg_link",
+               new=AsyncMock(return_value=None)):
+        await h["debug_forwarded_post"](msg)
+
+    reply_text = msg.reply.call_args_list[-1][0][0]
+    # Content length must equal len("base") — nothing was appended
+    assert f"Content: {len('base')} chars" in reply_text
+
+
+async def test_debug_score_resolve_returns_empty_string_content_unchanged(conn, settings):
+    """resolve_tg_link returns '' → if resolved: guard fires, content unchanged."""
+    from unittest.mock import patch
+
+    mock_anthropic = _make_mock_anthropic()
+    mock_pyro = MagicMock()
+    settings.scrape_timeout_s = 5.0
+    settings.claude_model = "claude-haiku-4-5-20251001"
+
+    _, h, _ = setup_dp(conn, settings, anthropic=mock_anthropic, pyro=mock_pyro)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    msg = make_forwarded_msg_with_urls(["https://t.me/chan/99"])
+
+    with patch("ahsoka.pipeline.scraper.scrape_content", new=AsyncMock(return_value="base")), \
+         patch("ahsoka.pipeline.tg_resolver.is_tg_link", return_value=True), \
+         patch("ahsoka.pipeline.tg_resolver.resolve_tg_link",
+               new=AsyncMock(return_value="")):
+        await h["debug_forwarded_post"](msg)
+
+    reply_text = msg.reply.call_args_list[-1][0][0]
+    assert f"Content: {len('base')} chars" in reply_text
+
+
+async def test_debug_score_pyro_none_skips_resolution_block(conn, settings):
+    """pyro is None → resolution block is skipped entirely, resolve_tg_link never called."""
+    from unittest.mock import patch
+
+    mock_anthropic = _make_mock_anthropic()
+    settings.scrape_timeout_s = 5.0
+    settings.claude_model = "claude-haiku-4-5-20251001"
+
+    # pyro=None (the default)
+    _, h, _ = setup_dp(conn, settings, anthropic=mock_anthropic)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    msg = make_forwarded_msg_with_urls(["https://t.me/somechan/1"])
+
+    with patch("ahsoka.pipeline.scraper.scrape_content", new=AsyncMock(return_value="base")), \
+         patch("ahsoka.pipeline.tg_resolver.is_tg_link") as mock_is_tg, \
+         patch("ahsoka.pipeline.tg_resolver.resolve_tg_link",
+               new=AsyncMock()) as mock_resolve:
+        await h["debug_forwarded_post"](msg)
+
+    mock_is_tg.assert_not_called()
+    mock_resolve.assert_not_awaited()
+
+
+async def test_debug_score_empty_urls_no_error(conn, settings):
+    """post.urls is empty → no error raised, no resolve_tg_link call."""
+    from unittest.mock import patch
+
+    mock_anthropic = _make_mock_anthropic()
+    mock_pyro = MagicMock()
+    settings.scrape_timeout_s = 5.0
+    settings.claude_model = "claude-haiku-4-5-20251001"
+
+    _, h, _ = setup_dp(conn, settings, anthropic=mock_anthropic, pyro=mock_pyro)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    # No entities → urls=[]
+    msg = make_forwarded_msg()
+
+    with patch("ahsoka.pipeline.scraper.scrape_content", new=AsyncMock(return_value="base")), \
+         patch("ahsoka.pipeline.tg_resolver.is_tg_link") as mock_is_tg, \
+         patch("ahsoka.pipeline.tg_resolver.resolve_tg_link",
+               new=AsyncMock()) as mock_resolve:
+        await h["debug_forwarded_post"](msg)
+
+    mock_is_tg.assert_not_called()
+    mock_resolve.assert_not_awaited()
+    # Handler completed without exception → at least one reply was made
+    assert msg.reply.await_count >= 1
+
+
+async def test_debug_score_multiple_tg_links_all_resolved(conn, settings):
+    """Multiple t.me links in post.urls → each resolved in turn, all non-empty results appended."""
+    from unittest.mock import patch
+
+    mock_anthropic = _make_mock_anthropic()
+    mock_pyro = MagicMock()
+    settings.scrape_timeout_s = 5.0
+    settings.claude_model = "claude-haiku-4-5-20251001"
+
+    _, h, _ = setup_dp(conn, settings, anthropic=mock_anthropic, pyro=mock_pyro)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    url1 = "https://t.me/chan/1"
+    url2 = "https://t.me/chan/2"
+    msg = make_forwarded_msg_with_urls([url1, url2])
+
+    resolve_results = ["first resolved", "second resolved"]
+    resolve_mock = AsyncMock(side_effect=resolve_results)
+
+    with patch("ahsoka.pipeline.scraper.scrape_content", new=AsyncMock(return_value="base")), \
+         patch("ahsoka.pipeline.tg_resolver.is_tg_link", return_value=True), \
+         patch("ahsoka.pipeline.tg_resolver.resolve_tg_link", new=resolve_mock):
+        await h["debug_forwarded_post"](msg)
+
+    assert resolve_mock.await_count == 2
+    expected_content = (
+        "base"
+        f"\n\n--- linked from {url1} ---\nfirst resolved"
+        f"\n\n--- linked from {url2} ---\nsecond resolved"
+    )
+    reply_text = msg.reply.call_args_list[-1][0][0]
+    assert f"Content: {len(expected_content)} chars" in reply_text
 
 
 # ---------------------------------------------------------------------------
