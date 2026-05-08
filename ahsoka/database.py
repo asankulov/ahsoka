@@ -416,7 +416,8 @@ async def get_all_active_configs(conn: aiosqlite.Connection) -> list[UserConfig]
     async with conn.execute(
         """SELECT u.user_id, u.notify_chat_id,
                   c.stack, c.seniority, c.remote, c.location,
-                  c.salary_min, c.salary_max, c.threshold, c.paused, c.keywords
+                  c.salary_min, c.salary_max, c.threshold, c.paused, c.keywords,
+                  u.is_banned
            FROM users u JOIN user_config c ON u.user_id = c.user_id
            WHERE u.is_banned = 0""",
     ) as cur:
@@ -427,9 +428,19 @@ async def get_all_active_configs(conn: aiosqlite.Connection) -> list[UserConfig]
             stack=r[2], seniority=r[3], remote=r[4], location=r[5],
             salary_min=r[6], salary_max=r[7], threshold=r[8],
             paused=bool(r[9]), keywords=r[10],
+            is_banned=bool(r[11]),
         )
         for r in rows
     ]
+
+
+async def is_user_banned(conn: aiosqlite.Connection, user_id: int) -> bool:
+    """Return True if the user exists and has is_banned = 1."""
+    async with conn.execute(
+        "SELECT is_banned FROM users WHERE user_id = ?", (user_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return bool(row and row[0])
 
 
 # --- Notification tracking ---

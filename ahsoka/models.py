@@ -118,3 +118,4 @@ class UserConfig:
     threshold: int = 7
     paused: bool = False
     keywords: str = ""
+    is_banned: bool = False

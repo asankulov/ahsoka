@@ -50,6 +50,10 @@ async def _fan_out_verdicts(
         )
         if not matches_user(verdict, config):
             continue
+        # Fresh ban check: catches users banned after enqueue while the batch was in flight.
+        if await db.is_user_banned(conn, config.user_id):
+            logger.info("Skipping notification for banned user %d", config.user_id)
+            continue
         if await db.is_notified(conn, config.user_id, post.channel_id, post.message_id, url):
             continue
         try:

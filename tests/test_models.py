@@ -154,3 +154,36 @@ def test_from_message_skips_unknown_entity_types():
     msg = make_message(text="bold text", entities=entities)
     post = Post.from_message(msg)
     assert post.urls == ["https://good.com"]
+
+
+# ---------------------------------------------------------------------------
+# UserConfig.is_banned field
+# ---------------------------------------------------------------------------
+
+def test_user_config_is_banned_defaults_to_false():
+    from ahsoka.models import UserConfig
+    config = UserConfig(user_id=1, notify_chat_id=1)
+    assert config.is_banned is False
+
+
+def test_user_config_is_banned_can_be_set_true():
+    from ahsoka.models import UserConfig
+    config = UserConfig(user_id=1, notify_chat_id=1, is_banned=True)
+    assert config.is_banned is True
+
+
+def test_user_config_is_banned_survives_deepcopy():
+    """Batch queue snapshots use deepcopy; is_banned must not reset."""
+    import copy
+    from ahsoka.models import UserConfig
+    config = UserConfig(user_id=1, notify_chat_id=1, is_banned=True)
+    cloned = copy.deepcopy(config)
+    assert cloned.is_banned is True
+
+
+def test_user_config_is_banned_false_survives_deepcopy():
+    import copy
+    from ahsoka.models import UserConfig
+    config = UserConfig(user_id=1, notify_chat_id=1, is_banned=False)
+    cloned = copy.deepcopy(config)
+    assert cloned.is_banned is False
