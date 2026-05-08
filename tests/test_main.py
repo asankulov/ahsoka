@@ -201,6 +201,61 @@ async def test_fan_out_logs_verdict_before_guard_when_matched(conn, caplog):
     assert "threshold=5" in line
 
 
+async def test_fan_out_skips_notification_when_db_ban_check_returns_true(conn):
+    """Race condition / late ban: matches_user passes but is_user_banned returns True → no notification."""
+    from ahsoka.main import _fan_out_verdicts
+
+    post = make_post()
+    config = make_config()
+    verdict = make_verdict()
+    bot = AsyncMock()
+
+    with patch("ahsoka.main.matches_user", return_value=True), \
+         patch("ahsoka.main.db.is_user_banned", new_callable=AsyncMock, return_value=True), \
+         patch("ahsoka.main.send_notification", new_callable=AsyncMock) as mock_send:
+        await _fan_out_verdicts(conn, bot, [(post, config, verdict)])
+
+    mock_send.assert_not_called()
+
+
+async def test_fan_out_logs_info_when_skipping_banned_user(conn, caplog):
+    """When db.is_user_banned returns True, an INFO log is emitted for the skip."""
+    import logging
+    from ahsoka.main import _fan_out_verdicts
+
+    post = make_post()
+    config = make_config(user_id=42)
+    verdict = make_verdict(user_id=42)
+    bot = AsyncMock()
+
+    with patch("ahsoka.main.matches_user", return_value=True), \
+         patch("ahsoka.main.db.is_user_banned", new_callable=AsyncMock, return_value=True), \
+         patch("ahsoka.main.send_notification", new_callable=AsyncMock), \
+         caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        await _fan_out_verdicts(conn, bot, [(post, config, verdict)])
+
+    ban_log_lines = [r.message for r in caplog.records if "banned" in r.message.lower()]
+    assert len(ban_log_lines) >= 1, f"Expected a banned-user log, got: {caplog.records}"
+    assert "42" in ban_log_lines[0]
+
+
+async def test_fan_out_proceeds_normally_when_db_ban_check_returns_false(conn):
+    """is_user_banned returns False → send_notification called as normal."""
+    from ahsoka.main import _fan_out_verdicts
+
+    post = make_post()
+    config = make_config()
+    verdict = make_verdict()
+    bot = AsyncMock()
+
+    with patch("ahsoka.main.matches_user", return_value=True), \
+         patch("ahsoka.main.db.is_user_banned", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.send_notification", new_callable=AsyncMock) as mock_send:
+        await _fan_out_verdicts(conn, bot, [(post, config, verdict)])
+
+    mock_send.assert_called_once()
+
+
 async def test_fan_out_logs_exactly_once_per_verdict(conn, caplog):
     """The INFO log fires exactly once per verdict — not inside dedup or notification branches."""
     import logging

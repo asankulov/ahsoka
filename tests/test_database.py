@@ -15,6 +15,7 @@ from ahsoka.database import (
     init_db,
     is_notified,
     is_seen,
+    is_user_banned,
     list_users,
     load_watched_channels,
     mark_batch_complete,
@@ -168,6 +169,49 @@ async def test_get_all_active_configs_excludes_banned(conn):
     configs = await get_all_active_configs(conn)
     user_ids = {c.user_id for c in configs}
     assert 11111 not in user_ids
+
+
+async def test_get_all_active_configs_populates_is_banned_false(conn):
+    """Configs returned for unbanned users must have is_banned=False."""
+    await get_or_create_user(conn, 22222)
+    configs = await get_all_active_configs(conn)
+    user_map = {c.user_id: c for c in configs}
+    assert 22222 in user_map
+    assert user_map[22222].is_banned is False
+
+
+async def test_get_all_active_configs_owner_is_banned_false(conn):
+    """The owner (created on init_db) should have is_banned=False in their config."""
+    configs = await get_all_active_configs(conn)
+    owner_configs = [c for c in configs if c.user_id == OWNER_ID]
+    assert len(owner_configs) == 1
+    assert owner_configs[0].is_banned is False
+
+
+# --- is_user_banned ---
+
+
+async def test_is_user_banned_returns_true_when_banned(conn):
+    await get_or_create_user(conn, 77777)
+    await ban_user(conn, 77777)
+    assert await is_user_banned(conn, 77777) is True
+
+
+async def test_is_user_banned_returns_false_when_not_banned(conn):
+    await get_or_create_user(conn, 88888)
+    assert await is_user_banned(conn, 88888) is False
+
+
+async def test_is_user_banned_returns_false_for_nonexistent_user(conn):
+    """User ID that does not exist in the table must return False, not raise."""
+    assert await is_user_banned(conn, 999999999) is False
+
+
+async def test_is_user_banned_returns_false_after_unban(conn):
+    await get_or_create_user(conn, 55555)
+    await ban_user(conn, 55555)
+    await unban_user(conn, 55555)
+    assert await is_user_banned(conn, 55555) is False
 
 
 # --- Notification tracking ---

@@ -32,8 +32,9 @@ def make_config(
     user_id: int = 1,
     threshold: int = 7,
     paused: bool = False,
+    is_banned: bool = False,
 ) -> UserConfig:
-    return UserConfig(user_id=user_id, notify_chat_id=user_id, threshold=threshold, paused=paused)
+    return UserConfig(user_id=user_id, notify_chat_id=user_id, threshold=threshold, paused=paused, is_banned=is_banned)
 
 
 # ---------------------------------------------------------------------------
@@ -122,3 +123,47 @@ def test_function_accepts_exactly_two_args():
     import inspect
     sig = inspect.signature(matches_user)
     assert len(sig.parameters) == 2
+
+
+# ---------------------------------------------------------------------------
+# Banned
+# ---------------------------------------------------------------------------
+
+
+def test_banned_user_returns_false_regardless_of_score():
+    verdict = make_verdict(score=10, matched=True)
+    config = make_config(is_banned=True, threshold=1, paused=False)
+    assert matches_user(verdict, config) is False
+
+
+def test_banned_user_returns_false_regardless_of_matched():
+    verdict = make_verdict(score=10, matched=True)
+    config = make_config(is_banned=True)
+    assert matches_user(verdict, config) is False
+
+
+def test_banned_user_returns_false_even_when_not_paused():
+    """Ban is checked before pause; not-paused does not override ban."""
+    verdict = make_verdict(score=10, matched=True)
+    config = make_config(is_banned=True, paused=False, threshold=1)
+    assert matches_user(verdict, config) is False
+
+
+def test_banned_and_paused_user_returns_false():
+    verdict = make_verdict(score=10, matched=True)
+    config = make_config(is_banned=True, paused=True, threshold=1)
+    assert matches_user(verdict, config) is False
+
+
+def test_not_banned_unaffected_all_conditions_met():
+    """is_banned=False must not block an otherwise-passing verdict."""
+    verdict = make_verdict(score=8, matched=True)
+    config = make_config(is_banned=False, threshold=7, paused=False)
+    assert matches_user(verdict, config) is True
+
+
+def test_not_banned_unaffected_score_below_threshold():
+    """is_banned=False with low score still returns False (threshold guard fires)."""
+    verdict = make_verdict(score=3, matched=True)
+    config = make_config(is_banned=False, threshold=7, paused=False)
+    assert matches_user(verdict, config) is False
