@@ -1189,6 +1189,32 @@ async def test_main_recovery_task_included_in_all_tasks():
     )
 
 
+async def test_fan_out_banned_user_real_db_no_notification(conn):
+    """Integration: user inserted as banned in real DB → send_notification never called.
+
+    This test does NOT mock is_user_banned.  The whole point is to verify the
+    real DB path in _fan_out_verdicts works end-to-end: a user whose is_banned
+    column is 1 must never receive a notification, regardless of matches_user.
+    """
+    from ahsoka.main import _fan_out_verdicts
+    from ahsoka.database import get_or_create_user, ban_user
+
+    user_id = 42
+    await get_or_create_user(conn, user_id)
+    await ban_user(conn, user_id)
+
+    post = make_post()
+    config = make_config(user_id=user_id, notify_chat_id=user_id)
+    verdict = make_verdict(user_id=user_id, score=9, matched=True)
+    bot = AsyncMock()
+
+    with patch("ahsoka.main.matches_user", return_value=True), \
+         patch("ahsoka.main.send_notification", new_callable=AsyncMock) as mock_send:
+        await _fan_out_verdicts(conn, bot, [(post, config, verdict)])
+
+    mock_send.assert_not_called()
+
+
 async def test_main_start_polling_not_blocked_by_recovery():
     """dp.start_polling is called concurrently with recovery, not after it completes.
 

@@ -632,6 +632,9 @@ def register_bot_commands(
             await message.reply("Usage: /ban <user_id>")
             return
         target_id = int(parts[1])
+        if not await db.get_user(conn, target_id):
+            await message.reply(f"User {target_id} not found.")
+            return
         await db.ban_user(conn, target_id)
         await _rebuild_keywords()
         await message.reply(f"User {target_id} banned.")
@@ -644,6 +647,9 @@ def register_bot_commands(
             await message.reply("Usage: /unban <user_id>")
             return
         target_id = int(parts[1])
+        if not await db.get_user(conn, target_id):
+            await message.reply(f"User {target_id} not found.")
+            return
         await db.unban_user(conn, target_id)
         await _rebuild_keywords()
         await message.reply(f"User {target_id} unbanned.")

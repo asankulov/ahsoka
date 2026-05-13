@@ -75,10 +75,11 @@ def get_handlers_list(dp: Dispatcher, router_idx: int = 0) -> list:
     return [h.callback for h in router.message.handlers]
 
 
-def setup_dp(conn, settings, watched=None, anthropic=None, pyro=None):
+def setup_dp(conn, settings, watched=None, anthropic=None, pyro=None, keyword_index=None):
     watched_channels: set[int] = watched if watched is not None else set()
     dp = Dispatcher()
-    register_bot_commands(dp, conn, settings, watched_channels, pyro=pyro, anthropic=anthropic)
+    register_bot_commands(dp, conn, settings, watched_channels, pyro=pyro,
+                          keyword_index=keyword_index, anthropic=anthropic)
     handlers = get_handler_map(dp)
     return dp, handlers, watched_channels
 
@@ -1434,3 +1435,177 @@ async def test_users_banned_flag_shown_with_username(conn, settings):
     reply_text = msg.reply.call_args[0][0]
     assert "banned" in reply_text
     assert "@banned_person" in reply_text
+
+
+# ---------------------------------------------------------------------------
+# /ban and /unban admin commands
+# ---------------------------------------------------------------------------
+
+TARGET_ID = 55555  # a non-owner user used in ban/unban tests
+
+
+async def _setup_target_user(conn, target_id: int = TARGET_ID) -> None:
+    """Insert target_id into the DB so get_user returns a real User row."""
+    from ahsoka.database import get_or_create_user as _goc
+    await _goc(conn, target_id)
+
+
+async def test_ban_happy_path_calls_ban_user_and_replies_banned(conn, settings):
+    """User exists → ban_user called, reply contains 'banned'."""
+    from ahsoka.database import ban_user as _ban_user, get_user
+    await _setup_target_user(conn)
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg(f"/ban {TARGET_ID}")
+    await h["cmd_ban"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "banned" in reply_text.lower()
+    user = await get_user(conn, TARGET_ID)
+    assert user is not None and user.is_banned
+
+
+async def test_ban_user_not_found_replies_not_found_no_ban(conn, settings):
+    """get_user returns None → reply contains 'not found', ban_user NOT called."""
+    from unittest.mock import patch
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/ban 99999")
+    with patch("ahsoka.bot.commands.db.ban_user", new_callable=AsyncMock) as mock_ban, \
+         patch("ahsoka.bot.commands.db.get_user", new_callable=AsyncMock, return_value=None):
+        await h["cmd_ban"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "not found" in reply_text.lower()
+    mock_ban.assert_not_called()
+
+
+async def test_ban_user_not_found_does_not_rebuild_keywords(conn, settings):
+    """get_user returns None → _rebuild_keywords NOT called."""
+    from unittest.mock import patch
+    mock_index = MagicMock()
+    mock_index.rebuild = AsyncMock()
+    _, h, _ = setup_dp(conn, settings, keyword_index=mock_index)
+    msg = make_msg("/ban 99999")
+    with patch("ahsoka.bot.commands.db.get_user", new_callable=AsyncMock, return_value=None):
+        await h["cmd_ban"](msg, make_ctx())
+    mock_index.rebuild.assert_not_called()
+
+
+async def test_ban_bad_syntax_no_arg_replies_usage(conn, settings):
+    """No argument → reply is 'Usage: /ban <user_id>', no DB calls."""
+    from unittest.mock import patch
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/ban")
+    with patch("ahsoka.bot.commands.db.get_user", new_callable=AsyncMock) as mock_get, \
+         patch("ahsoka.bot.commands.db.ban_user", new_callable=AsyncMock) as mock_ban:
+        await h["cmd_ban"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "Usage: /ban" in reply_text
+    mock_get.assert_not_called()
+    mock_ban.assert_not_called()
+
+
+async def test_ban_bad_syntax_non_digit_replies_usage(conn, settings):
+    """Non-digit argument → reply is 'Usage: /ban <user_id>', no DB calls."""
+    from unittest.mock import patch
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/ban someuser")
+    with patch("ahsoka.bot.commands.db.get_user", new_callable=AsyncMock) as mock_get, \
+         patch("ahsoka.bot.commands.db.ban_user", new_callable=AsyncMock) as mock_ban:
+        await h["cmd_ban"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "Usage: /ban" in reply_text
+    mock_get.assert_not_called()
+    mock_ban.assert_not_called()
+
+
+async def test_ban_bad_syntax_too_many_args_replies_usage(conn, settings):
+    """Two numeric arguments → reply is 'Usage: /ban <user_id>', no DB calls."""
+    from unittest.mock import patch
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/ban 123 456")
+    with patch("ahsoka.bot.commands.db.get_user", new_callable=AsyncMock) as mock_get, \
+         patch("ahsoka.bot.commands.db.ban_user", new_callable=AsyncMock) as mock_ban:
+        await h["cmd_ban"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "Usage: /ban" in reply_text
+    mock_get.assert_not_called()
+    mock_ban.assert_not_called()
+
+
+async def test_unban_happy_path_calls_unban_user_and_replies_unbanned(conn, settings):
+    """User exists and is banned → unban_user called, reply contains 'unbanned'."""
+    from ahsoka.database import ban_user as _ban_user, get_user, unban_user as _unban_user
+    await _setup_target_user(conn)
+    await _ban_user(conn, TARGET_ID)
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg(f"/unban {TARGET_ID}")
+    await h["cmd_unban"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "unbanned" in reply_text.lower()
+    user = await get_user(conn, TARGET_ID)
+    assert user is not None and not user.is_banned
+
+
+async def test_unban_user_not_found_replies_not_found_no_unban(conn, settings):
+    """get_user returns None → reply contains 'not found', unban_user NOT called."""
+    from unittest.mock import patch
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/unban 99999")
+    with patch("ahsoka.bot.commands.db.unban_user", new_callable=AsyncMock) as mock_unban, \
+         patch("ahsoka.bot.commands.db.get_user", new_callable=AsyncMock, return_value=None):
+        await h["cmd_unban"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "not found" in reply_text.lower()
+    mock_unban.assert_not_called()
+
+
+async def test_unban_user_not_found_does_not_rebuild_keywords(conn, settings):
+    """get_user returns None → _rebuild_keywords NOT called."""
+    from unittest.mock import patch
+    mock_index = MagicMock()
+    mock_index.rebuild = AsyncMock()
+    _, h, _ = setup_dp(conn, settings, keyword_index=mock_index)
+    msg = make_msg("/unban 99999")
+    with patch("ahsoka.bot.commands.db.get_user", new_callable=AsyncMock, return_value=None):
+        await h["cmd_unban"](msg, make_ctx())
+    mock_index.rebuild.assert_not_called()
+
+
+async def test_unban_bad_syntax_no_arg_replies_usage(conn, settings):
+    """No argument → reply is 'Usage: /unban <user_id>', no DB calls."""
+    from unittest.mock import patch
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/unban")
+    with patch("ahsoka.bot.commands.db.get_user", new_callable=AsyncMock) as mock_get, \
+         patch("ahsoka.bot.commands.db.unban_user", new_callable=AsyncMock) as mock_unban:
+        await h["cmd_unban"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "Usage: /unban" in reply_text
+    mock_get.assert_not_called()
+    mock_unban.assert_not_called()
+
+
+async def test_unban_bad_syntax_non_digit_replies_usage(conn, settings):
+    """Non-digit argument → reply is 'Usage: /unban <user_id>', no DB calls."""
+    from unittest.mock import patch
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/unban someuser")
+    with patch("ahsoka.bot.commands.db.get_user", new_callable=AsyncMock) as mock_get, \
+         patch("ahsoka.bot.commands.db.unban_user", new_callable=AsyncMock) as mock_unban:
+        await h["cmd_unban"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "Usage: /unban" in reply_text
+    mock_get.assert_not_called()
+    mock_unban.assert_not_called()
+
+
+async def test_unban_bad_syntax_too_many_args_replies_usage(conn, settings):
+    """Two numeric arguments → reply is 'Usage: /unban <user_id>', no DB calls."""
+    from unittest.mock import patch
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/unban 123 456")
+    with patch("ahsoka.bot.commands.db.get_user", new_callable=AsyncMock) as mock_get, \
+         patch("ahsoka.bot.commands.db.unban_user", new_callable=AsyncMock) as mock_unban:
+        await h["cmd_unban"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "Usage: /unban" in reply_text
+    mock_get.assert_not_called()
+    mock_unban.assert_not_called()
