@@ -1732,6 +1732,9 @@ async def test_export_happy_path_sends_document_with_expected_filename(conn, set
 
 
 async def test_export_happy_path_file_bytes_contain_expected_fields(conn, settings):
+    """No pyro wired in -> bodies can't be fetched, so the entry falls back to
+    the unavailable marker plus the post's URL bullet(s); no verdict metadata
+    (score/apply/reason/red flags) is rendered anywhere."""
     _, h, _ = setup_dp(conn, settings)
     await _seed_export_post(conn, EXPORT_TARGET)
 
@@ -1746,12 +1749,11 @@ async def test_export_happy_path_file_bytes_contain_expected_fields(conn, settin
     file_arg = msg.reply_document.call_args[0][0]
     md = file_arg.data.decode("utf-8")
     assert f"## User {EXPORT_TARGET}" in md
-    assert "https://t.me/publicchan/5" in md
-    assert "Score: 8/10" in md
-    assert "Apply: hr@example.com" in md
-    assert "Reason: Great fit" in md
-    assert "Red flags: vague comp" in md
-    assert "Job URL(s): https://example.com/job" in md
+    assert "### [-1009876543210/5](https://t.me/publicchan/5)" in md
+    assert "_(original message unavailable)_" in md
+    assert "- https://example.com/job" in md
+    for forbidden in ("Score:", "Apply:", "Reason:", "Red flags:"):
+        assert forbidden not in md
 
 
 async def test_export_happy_path_get_chat_called_once_per_distinct_channel(conn, settings):
@@ -1873,3 +1875,207 @@ async def test_export_happy_path_pyro_get_chat_failure_falls_back_and_logs_debug
     ]
     assert len(debug_lines) == 1
     assert str(CHAN_A) in debug_lines[0]
+
+
+# ---------------------------------------------------------------------------
+# /export — original-message body embedding via pyro.get_messages
+# ---------------------------------------------------------------------------
+
+def _make_tg_message(msg_id, text=None, caption=None, entities=None,
+                      caption_entities=None, empty=False):
+    """A minimal duck-typed stand-in for a Pyrogram Message — never import pyrogram."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        id=msg_id, empty=empty, text=text, caption=caption,
+        entities=entities, caption_entities=caption_entities,
+    )
+
+
+async def test_export_pyro_get_messages_body_embedded_with_inline_links(conn, settings):
+    """pyro.get_messages returns the original message; its entities are converted
+    to Markdown and embedded verbatim under the post's heading."""
+    from types import SimpleNamespace
+    mock_pyro = MagicMock()
+    mock_pyro.get_chat = AsyncMock(return_value=MagicMock(username="chan"))
+    tg_msg = _make_tg_message(
+        5, text="Great job, apply here",
+        entities=[SimpleNamespace(type="text_link", offset=17, length=4,
+                                   url="https://apply.example.com")],
+    )
+    mock_pyro.get_messages = AsyncMock(return_value=[tg_msg])
+    _, h, _ = setup_dp(conn, settings, pyro=mock_pyro)
+    await _seed_export_post(conn, EXPORT_TARGET)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+
+    await h["cmd_export"](msg, make_ctx())
+
+    mock_pyro.get_messages.assert_awaited_once_with(CHAN_A, [5])
+    file_arg = msg.reply_document.call_args[0][0]
+    md = file_arg.data.decode("utf-8")
+    assert "Great job, apply [here](https://apply.example.com)" in md
+    assert "_(original message unavailable)_" not in md
+
+
+async def test_export_pyro_none_falls_back_to_unavailable_but_still_sends_document(conn, settings):
+    _, h, _ = setup_dp(conn, settings)  # pyro=None (default)
+    await _seed_export_post(conn, EXPORT_TARGET)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+    msg.bot.get_chat = AsyncMock(return_value=MagicMock(username="chan"))
+
+    await h["cmd_export"](msg, make_ctx())
+
+    msg.reply_document.assert_awaited_once()
+    file_arg = msg.reply_document.call_args[0][0]
+    md = file_arg.data.decode("utf-8")
+    assert "_(original message unavailable)_" in md
+    assert "- https://example.com/job" in md
+
+
+async def test_export_pyro_get_messages_raises_falls_back_and_logs_debug(conn, settings, caplog):
+    mock_pyro = MagicMock()
+    mock_pyro.get_chat = AsyncMock(return_value=MagicMock(username="chan"))
+    mock_pyro.get_messages = AsyncMock(side_effect=RuntimeError("flood wait"))
+    _, h, _ = setup_dp(conn, settings, pyro=mock_pyro)
+    await _seed_export_post(conn, EXPORT_TARGET)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+
+    with caplog.at_level(logging.DEBUG, logger="ahsoka.bot.commands"):
+        await h["cmd_export"](msg, make_ctx())
+
+    msg.reply_document.assert_awaited_once()
+    file_arg = msg.reply_document.call_args[0][0]
+    md = file_arg.data.decode("utf-8")
+    assert "_(original message unavailable)_" in md
+
+    debug_lines = [
+        r.getMessage() for r in caplog.records
+        if "could not fetch" in r.getMessage()
+    ]
+    assert len(debug_lines) == 1
+    assert str(CHAN_A) in debug_lines[0]
+
+
+async def test_export_pyro_get_messages_skips_empty_and_textless_messages(conn, settings):
+    """An `empty=True` message and a message with neither text nor caption are
+    both skipped, so they render via the unavailable fallback, not a crash."""
+    mock_pyro = MagicMock()
+    mock_pyro.get_chat = AsyncMock(return_value=MagicMock(username="chan"))
+    empty_msg = _make_tg_message(5, empty=True)
+    textless_msg = _make_tg_message(6, text=None, caption=None)
+    mock_pyro.get_messages = AsyncMock(return_value=[empty_msg, textless_msg])
+    _, h, _ = setup_dp(conn, settings, pyro=mock_pyro)
+    await _seed_export_post(conn, EXPORT_TARGET, channel_id=CHAN_A, message_id=5)
+    await _seed_export_post(conn, EXPORT_TARGET, channel_id=CHAN_A, message_id=6)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+
+    await h["cmd_export"](msg, make_ctx())
+
+    file_arg = msg.reply_document.call_args[0][0]
+    md = file_arg.data.decode("utf-8")
+    assert md.count("_(original message unavailable)_") == 2
+
+
+async def test_export_pyro_get_messages_uses_caption_fallback_for_media(conn, settings):
+    """A media post has no `.text`, only `.caption`/`.caption_entities` —
+    cmd_export must fall back to those for the body."""
+    from types import SimpleNamespace
+    mock_pyro = MagicMock()
+    mock_pyro.get_chat = AsyncMock(return_value=MagicMock(username="chan"))
+    media_msg = _make_tg_message(
+        5, text=None, caption="Photo caption bold",
+        caption_entities=[SimpleNamespace(type="bold", offset=6, length=7)],
+    )
+    mock_pyro.get_messages = AsyncMock(return_value=[media_msg])
+    _, h, _ = setup_dp(conn, settings, pyro=mock_pyro)
+    await _seed_export_post(conn, EXPORT_TARGET)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+
+    await h["cmd_export"](msg, make_ctx())
+
+    file_arg = msg.reply_document.call_args[0][0]
+    md = file_arg.data.decode("utf-8")
+    assert "Photo **caption** bold" in md
+
+
+async def test_export_pyro_get_messages_chunks_over_200_ids(conn, settings):
+    """More than 200 message ids in one channel must be split into multiple
+    get_messages calls, each of at most 200 ids."""
+    mock_pyro = MagicMock()
+    mock_pyro.get_chat = AsyncMock(return_value=MagicMock(username="chan"))
+    mock_pyro.get_messages = AsyncMock(return_value=[])
+    _, h, _ = setup_dp(conn, settings, pyro=mock_pyro)
+    for mid in range(1, 251):
+        await _seed_export_post(
+            conn, EXPORT_TARGET, channel_id=CHAN_A, message_id=mid,
+            sent_at="2020-01-15 08:00:00",
+        )
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+
+    await h["cmd_export"](msg, make_ctx())
+
+    assert mock_pyro.get_messages.call_count == 2
+    call_args = mock_pyro.get_messages.call_args_list
+    chunk_sizes = sorted(len(c.args[1]) for c in call_args)
+    assert chunk_sizes == [50, 200]
+    assert all(c.args[0] == CHAN_A for c in call_args)
+
+
+async def test_export_entities_to_markdown_raises_falls_back_to_raw_text(conn, settings):
+    """If entity conversion itself blows up (e.g. an unexpected Pyrogram
+    shape), the raw message text is used as-is rather than losing the body
+    or crashing the export."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    mock_pyro = MagicMock()
+    mock_pyro.get_chat = AsyncMock(return_value=MagicMock(username="chan"))
+    tg_msg = _make_tg_message(
+        5, text="Raw fallback text",
+        entities=[SimpleNamespace(type="bold", offset=0, length=3)],
+    )
+    mock_pyro.get_messages = AsyncMock(return_value=[tg_msg])
+    _, h, _ = setup_dp(conn, settings, pyro=mock_pyro)
+    await _seed_export_post(conn, EXPORT_TARGET)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+
+    with patch("ahsoka.bot.commands.entities_to_markdown", side_effect=RuntimeError("boom")):
+        await h["cmd_export"](msg, make_ctx())
+
+    msg.reply_document.assert_awaited_once()
+    file_arg = msg.reply_document.call_args[0][0]
+    md = file_arg.data.decode("utf-8")
+    assert "Raw fallback text" in md
+    assert "**" not in md  # no markdown conversion applied — raw text used verbatim
+
+
+async def test_export_all_dedupes_message_ids_across_users_before_fetching(conn, settings):
+    """/export all can surface the same (channel_id, message_id) once per
+    notified user; get_messages must receive each id only once per channel."""
+    OTHER_USER = 77777
+    await get_or_create_user(conn, OTHER_USER)
+    mock_pyro = MagicMock()
+    mock_pyro.get_chat = AsyncMock(return_value=MagicMock(username="chan"))
+    mock_pyro.get_messages = AsyncMock(return_value=[])
+    _, h, _ = setup_dp(conn, settings, pyro=mock_pyro)
+    await _seed_export_post(conn, EXPORT_TARGET, channel_id=CHAN_A, message_id=5)
+    await _seed_export_post(conn, OTHER_USER, channel_id=CHAN_A, message_id=5)
+
+    msg = make_msg_with_bot("/export all 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+
+    await h["cmd_export"](msg, make_ctx())
+
+    mock_pyro.get_messages.assert_awaited_once_with(CHAN_A, [5])
