@@ -6,6 +6,7 @@ from pyrogram import Client
 from pyrogram.raw import types as raw_types
 
 from ahsoka.models import Post
+from ahsoka.text_utils import slice_utf16
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ def register_watcher_handlers(
             if isinstance(entity, raw_types.MessageEntityTextUrl):
                 u = entity.url
             elif isinstance(entity, raw_types.MessageEntityUrl):
-                u = text[entity.offset : entity.offset + entity.length]
+                u = slice_utf16(text, entity.offset, entity.length)
             else:
                 continue
             if u and u not in seen:

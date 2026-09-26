@@ -1191,6 +1191,55 @@ async def test_debug_score_empty_urls_no_error(conn, settings):
     assert msg.reply.await_count >= 1
 
 
+def make_forwarded_msg_with_url_entity(offset: int, length: int, channel_id: int = -100111,
+                                        message_id: int = 42, username: str = "testchan",
+                                        text: str = "Job posting") -> MagicMock:
+    """Forwarded message carrying a single MessageEntity(type="url") — the
+    aiogram-side path that used to slice `text` with plain Python indices."""
+    msg = make_forwarded_msg(channel_id=channel_id, message_id=message_id,
+                              username=username, text=text)
+    ent = MagicMock()
+    ent.type = "url"
+    ent.offset = offset
+    ent.length = length
+    msg.entities = [ent]
+    return msg
+
+
+async def test_debug_forwarded_post_url_entity_with_emoji_before_it_sliced_correctly(conn, settings):
+    """UTF-16 regression guard for the aiogram 'url' entity path: an emoji
+    before the URL must not shift/truncate the extracted URL. Uses a t.me URL
+    so the correctly-sliced value can be asserted via resolve_tg_link's call
+    args — the old plain-str slice would have passed a corrupted string here.
+    """
+    from unittest.mock import patch
+
+    mock_anthropic = _make_mock_anthropic()
+    mock_pyro = MagicMock()
+    settings.scrape_timeout_s = 5.0
+    settings.claude_model = "claude-haiku-4-5-20251001"
+
+    _, h, _ = setup_dp(conn, settings, anthropic=mock_anthropic, pyro=mock_pyro)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    tg_url = "https://t.me/somechan/123"
+    text = "\U0001F680 Apply " + tg_url + " now"
+    offset = len("\U0001F680 Apply ".encode("utf-16-le")) // 2  # == 9
+    length = len(tg_url)  # ASCII URL: UTF-16 length == Python str length == 25
+
+    msg = make_forwarded_msg_with_url_entity(offset, length, text=text)
+
+    with patch("ahsoka.pipeline.scraper.scrape_content", new=AsyncMock(return_value="base")), \
+         patch("ahsoka.pipeline.tg_resolver.is_tg_link", return_value=True), \
+         patch("ahsoka.pipeline.tg_resolver.resolve_tg_link",
+               new=AsyncMock(return_value="resolved")) as mock_resolve:
+        await h["debug_forwarded_post"](msg)
+
+    # If the old plain-str slice were still in effect, this would be called
+    # with a shifted/truncated string like "ttps://t.me/somechan/123 " instead.
+    mock_resolve.assert_awaited_once_with(tg_url, mock_pyro)
+
+
 async def test_debug_score_multiple_tg_links_all_resolved(conn, settings):
     """Multiple t.me links in post.urls → each resolved in turn, all non-empty results appended."""
     from unittest.mock import patch
