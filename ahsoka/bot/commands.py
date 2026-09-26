@@ -14,6 +14,7 @@ from ahsoka.bot.export import parse_range, render_markdown
 from ahsoka.config import Settings
 from ahsoka.models import Post
 from ahsoka.pipeline.keyword_index import KeywordIndex
+from ahsoka.text_utils import slice_utf16
 
 logger = logging.getLogger(__name__)
 
@@ -817,7 +818,7 @@ def register_bot_commands(
             if entity.type == "text_link" and entity.url:
                 u = entity.url
             elif entity.type == "url":
-                u = text[entity.offset: entity.offset + entity.length]
+                u = slice_utf16(text, entity.offset, entity.length)
             else:
                 continue
             if u and u not in seen:
