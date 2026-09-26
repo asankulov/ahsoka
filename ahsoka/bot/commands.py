@@ -10,7 +10,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BotCommand, BufferedInputFile, Message
 
 from ahsoka import database as db
-from ahsoka.bot.export import parse_range, render_markdown
+from ahsoka.bot.export import entities_to_markdown, parse_range, render_markdown
 from ahsoka.config import Settings
 from ahsoka.models import Post
 from ahsoka.pipeline.keyword_index import KeywordIndex
@@ -723,7 +723,42 @@ def register_bot_commands(
                 logger.debug("export: could not resolve channel %d for a link", channel_id)
                 links[channel_id] = None
 
-        md = render_markdown(sections, start, end, links, retention_note)
+        # Fetch the original messages so the export can embed the full body — the
+        # bot client can't read channel history, only the Pyrogram user client can.
+        bodies: dict[tuple[int, int], str | None] = {}
+        if pyro is not None:
+            by_channel: dict[int, list[int]] = {}
+            for post in posts:
+                by_channel.setdefault(post.channel_id, []).append(post.message_id)
+            for channel_id, raw_ids in by_channel.items():
+                message_ids = list(dict.fromkeys(raw_ids))  # /export all repeats posts per user
+                for i in range(0, len(message_ids), 200):
+                    chunk = message_ids[i : i + 200]
+                    try:
+                        messages = await pyro.get_messages(channel_id, chunk)  # type: ignore[union-attr]
+                    except Exception:
+                        logger.debug(
+                            "export: could not fetch %d message(s) for channel %d",
+                            len(chunk), channel_id,
+                        )
+                        continue
+                    for msg in messages:
+                        if getattr(msg, "empty", False):
+                            continue
+                        text = msg.text or msg.caption or ""
+                        if not text:
+                            continue
+                        ents = msg.entities or msg.caption_entities or []
+                        try:
+                            bodies[(channel_id, msg.id)] = entities_to_markdown(str(text), ents)
+                        except Exception:
+                            logger.debug(
+                                "export: entity conversion failed for %d/%d, using raw text",
+                                channel_id, msg.id,
+                            )
+                            bodies[(channel_id, msg.id)] = str(text)
+
+        md = render_markdown(sections, start, end, links, bodies, retention_note)
         end_label = end - timedelta(seconds=1)
         filename = f"export_{target_label}_{start:%Y%m%d}-{end_label:%Y%m%d}.md"
         await message.reply_document(
