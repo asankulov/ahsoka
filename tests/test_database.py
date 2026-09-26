@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 import aiosqlite
 
@@ -6,6 +8,7 @@ from ahsoka.database import (
     ban_user,
     delete_old_posts,
     get_all_active_configs,
+    get_notified_posts,
     get_or_create_user,
     get_pending_batches,
     get_total_usage,
@@ -33,6 +36,8 @@ from ahsoka.database import (
 from ahsoka.models import PersonalizedVerdict
 
 OWNER_ID = 12345
+EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
+FAR_FUTURE = datetime(2100, 1, 1, tzinfo=timezone.utc)
 
 
 @pytest.fixture
@@ -508,3 +513,127 @@ async def test_get_total_usage_groups_by_model(conn):
     assert "claude-sonnet-4-6" in usage
     assert usage["claude-haiku-4-5-20251001"]["input_tokens"] == 100
     assert usage["claude-sonnet-4-6"]["input_tokens"] == 200
+
+
+# --- get_notified_posts (export) ---
+
+
+async def _set_sent_at(conn, user_id, channel_id, message_id, sent_at, url=""):
+    await conn.execute(
+        "UPDATE user_notified SET sent_at = ? "
+        "WHERE user_id = ? AND channel_id = ? AND message_id = ? AND url = ?",
+        (sent_at, user_id, channel_id, message_id, url),
+    )
+    await conn.commit()
+
+
+async def test_get_notified_posts_user_id_none_returns_all_users(conn):
+    await get_or_create_user(conn, 11111)
+    await mark_notified(conn, OWNER_ID, 1, 1)
+    await mark_notified(conn, 11111, 2, 2)
+    posts = await get_notified_posts(conn, None, EPOCH, FAR_FUTURE)
+    assert {p.user_id for p in posts} == {OWNER_ID, 11111}
+
+
+async def test_get_notified_posts_filters_by_specific_user_id(conn):
+    await get_or_create_user(conn, 11111)
+    await mark_notified(conn, OWNER_ID, 1, 1)
+    await mark_notified(conn, 11111, 2, 2)
+    posts = await get_notified_posts(conn, OWNER_ID, EPOCH, FAR_FUTURE)
+    assert len(posts) == 1
+    assert posts[0].user_id == OWNER_ID
+
+
+async def test_get_notified_posts_user_with_no_matches_returns_empty(conn):
+    await get_or_create_user(conn, 22222)
+    await mark_notified(conn, OWNER_ID, 1, 1)
+    posts = await get_notified_posts(conn, 22222, EPOCH, FAR_FUTURE)
+    assert posts == []
+
+
+async def test_get_notified_posts_collapses_multi_url_rows_with_min_sent_at(conn):
+    """Two user_notified rows (url='' and a real url) for the same post collapse
+    into one NotifiedPost with the earliest sent_at and only the non-empty url."""
+    await mark_notified(conn, OWNER_ID, 1, 1, url="")
+    await mark_notified(conn, OWNER_ID, 1, 1, url="https://example.com/job")
+    await _set_sent_at(conn, OWNER_ID, 1, 1, "2026-01-01 00:00:00", url="")
+    await _set_sent_at(conn, OWNER_ID, 1, 1, "2026-06-01 00:00:00", url="https://example.com/job")
+
+    posts = await get_notified_posts(conn, OWNER_ID, EPOCH, FAR_FUTURE)
+    assert len(posts) == 1
+    assert posts[0].sent_at == "2026-01-01 00:00:00"
+    assert posts[0].urls == ["https://example.com/job"]
+
+
+async def test_get_notified_posts_without_verdict_has_empty_fields(conn):
+    await mark_notified(conn, OWNER_ID, 1, 1)
+    posts = await get_notified_posts(conn, OWNER_ID, EPOCH, FAR_FUTURE)
+    assert len(posts) == 1
+    p = posts[0]
+    assert p.score is None
+    assert p.reason == ""
+    assert p.apply == ""
+    assert p.red_flags == []
+
+
+async def test_get_notified_posts_start_boundary_inclusive(conn):
+    await mark_notified(conn, OWNER_ID, 1, 1)
+    await _set_sent_at(conn, OWNER_ID, 1, 1, "2026-06-01 00:00:00")
+    start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 6, 2, tzinfo=timezone.utc)
+    posts = await get_notified_posts(conn, OWNER_ID, start, end)
+    assert len(posts) == 1
+
+
+async def test_get_notified_posts_end_boundary_exclusive(conn):
+    await mark_notified(conn, OWNER_ID, 1, 1)
+    await _set_sent_at(conn, OWNER_ID, 1, 1, "2026-06-02 00:00:00")
+    start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 6, 2, tzinfo=timezone.utc)
+    posts = await get_notified_posts(conn, OWNER_ID, start, end)
+    assert posts == []
+
+
+async def test_get_notified_posts_red_flags_null_becomes_empty_list(conn):
+    await mark_notified(conn, OWNER_ID, 1, 1)
+    await conn.execute(
+        "INSERT INTO post_verdicts "
+        "(channel_id, message_id, user_id, score, reason, matched, apply, red_flags, scored_at) "
+        "VALUES (1, 1, ?, 7, 'ok', 1, '', NULL, '2026-01-01T00:00:00Z')",
+        (OWNER_ID,),
+    )
+    await conn.commit()
+    posts = await get_notified_posts(conn, OWNER_ID, EPOCH, FAR_FUTURE)
+    assert posts[0].red_flags == []
+
+
+async def test_get_notified_posts_red_flags_empty_json_array_becomes_empty_list(conn):
+    await mark_notified(conn, OWNER_ID, 1, 1)
+    verdict = PersonalizedVerdict(
+        user_id=OWNER_ID, score=5, reason="ok", matched=False, apply="", red_flags=[]
+    )
+    await store_verdict(conn, verdict, channel_id=1, message_id=1)
+    posts = await get_notified_posts(conn, OWNER_ID, EPOCH, FAR_FUTURE)
+    assert posts[0].red_flags == []
+
+
+async def test_get_notified_posts_red_flags_real_list_deserialized(conn):
+    await mark_notified(conn, OWNER_ID, 1, 1)
+    await store_verdict(
+        conn, make_verdict(user_id=OWNER_ID, red_flags=["no salary", "vague role"]),
+        channel_id=1, message_id=1,
+    )
+    posts = await get_notified_posts(conn, OWNER_ID, EPOCH, FAR_FUTURE)
+    assert posts[0].red_flags == ["no salary", "vague role"]
+
+
+async def test_get_notified_posts_with_verdict_maps_score_reason_apply(conn):
+    await mark_notified(conn, OWNER_ID, 1, 1)
+    await store_verdict(
+        conn, make_verdict(user_id=OWNER_ID, score=9, reason="Solid match", apply="apply@co.com"),
+        channel_id=1, message_id=1,
+    )
+    posts = await get_notified_posts(conn, OWNER_ID, EPOCH, FAR_FUTURE)
+    assert posts[0].score == 9
+    assert posts[0].reason == "Solid match"
+    assert posts[0].apply == "apply@co.com"

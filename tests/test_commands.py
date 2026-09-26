@@ -4,6 +4,8 @@ Handlers are registered as closures inside register_bot_commands, so we extract
 their callbacks directly from the aiogram Router and call them with mock Messages.
 The middleware is bypassed intentionally — its logic is verified by dedicated tests.
 """
+import logging
+
 import pytest
 import aiosqlite
 from unittest.mock import AsyncMock, MagicMock
@@ -14,8 +16,9 @@ from ahsoka.bot.commands import register_bot_commands, WaitingForInput, _fmt_tok
 from ahsoka.config import Settings
 from ahsoka.database import (
     get_user_config, init_db, load_watched_channels, get_or_create_user, get_user,
-    save_batch_usage,
+    save_batch_usage, mark_notified, store_verdict,
 )
+from ahsoka.models import PersonalizedVerdict
 
 
 # ---------------------------------------------------------------------------
@@ -1609,3 +1612,264 @@ async def test_unban_bad_syntax_too_many_args_replies_usage(conn, settings):
     assert "Usage: /unban" in reply_text
     mock_get.assert_not_called()
     mock_unban.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# /export admin command
+# ---------------------------------------------------------------------------
+
+CHAN_A = -1009876543210
+CHAN_B = -1001111111111
+EXPORT_TARGET = OWNER_ID
+
+
+async def _set_export_sent_at(conn, user_id, channel_id, message_id, sent_at):
+    await conn.execute(
+        "UPDATE user_notified SET sent_at = ? "
+        "WHERE user_id = ? AND channel_id = ? AND message_id = ?",
+        (sent_at, user_id, channel_id, message_id),
+    )
+    await conn.commit()
+
+
+async def _seed_export_post(conn, user_id, channel_id=CHAN_A, message_id=5,
+                             sent_at="2020-01-15 08:00:00", score=8):
+    await mark_notified(conn, user_id, channel_id, message_id, url="https://example.com/job")
+    await _set_export_sent_at(conn, user_id, channel_id, message_id, sent_at)
+    await store_verdict(
+        conn,
+        PersonalizedVerdict(
+            user_id=user_id, score=score, reason="Great fit", matched=True,
+            apply="hr@example.com", red_flags=["vague comp"],
+        ),
+        channel_id=channel_id, message_id=message_id,
+    )
+
+
+async def test_export_too_few_args_replies_usage(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/export")
+    await h["cmd_export"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "Usage: /export" in reply_text
+
+
+async def test_export_non_digit_non_all_target_replies_usage(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/export bogus 30m")
+    await h["cmd_export"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "Usage: /export" in reply_text
+
+
+async def test_export_unknown_user_replies_not_found(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/export 424242 30m")
+    await h["cmd_export"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert reply_text == "User 424242 not found."
+
+
+async def test_export_all_case_insensitive_treated_as_all(conn, settings):
+    from unittest.mock import patch
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/export ALL 30m")
+    with patch(
+        "ahsoka.bot.commands.db.get_notified_posts", new_callable=AsyncMock, return_value=[]
+    ) as mock_get:
+        await h["cmd_export"](msg, make_ctx())
+    mock_get.assert_awaited_once()
+    assert mock_get.call_args[0][1] is None  # user_id positional arg is None for "all"
+    reply_text = msg.reply.call_args[0][0]
+    assert "No notifications found" in reply_text
+
+
+async def test_export_parse_failure_replies_usage(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg(f"/export {EXPORT_TARGET} not-a-valid-offset")
+    await h["cmd_export"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "Usage: /export" in reply_text
+
+
+async def test_export_empty_result_replies_text_no_document(conn, settings):
+    """Recent, empty range -> plain text reply, no retention note, reply_document not called."""
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg(f"/export {EXPORT_TARGET} 5m")
+    msg.reply_document = AsyncMock()
+    await h["cmd_export"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert reply_text == "No notifications found for that range."
+    msg.reply_document.assert_not_called()
+
+
+async def test_export_empty_result_retention_note_when_start_older_than_30d(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+    await h["cmd_export"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "No notifications found for that range." in reply_text
+    assert "only retained for 30 days" in reply_text
+    msg.reply_document.assert_not_called()
+
+
+async def test_export_happy_path_sends_document_with_expected_filename(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    await _seed_export_post(conn, EXPORT_TARGET)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+    chat = MagicMock()
+    chat.username = "publicchan"
+    msg.bot.get_chat = AsyncMock(return_value=chat)
+
+    await h["cmd_export"](msg, make_ctx())
+
+    msg.reply_document.assert_awaited_once()
+    file_arg = msg.reply_document.call_args[0][0]
+    assert file_arg.filename == f"export_{EXPORT_TARGET}_20200101-20200201.md"
+
+
+async def test_export_happy_path_file_bytes_contain_expected_fields(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    await _seed_export_post(conn, EXPORT_TARGET)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+    chat = MagicMock()
+    chat.username = "publicchan"
+    msg.bot.get_chat = AsyncMock(return_value=chat)
+
+    await h["cmd_export"](msg, make_ctx())
+
+    file_arg = msg.reply_document.call_args[0][0]
+    md = file_arg.data.decode("utf-8")
+    assert f"## User {EXPORT_TARGET}" in md
+    assert "https://t.me/publicchan/5" in md
+    assert "Score: 8/10" in md
+    assert "Apply: hr@example.com" in md
+    assert "Reason: Great fit" in md
+    assert "Red flags: vague comp" in md
+    assert "Job URL(s): https://example.com/job" in md
+
+
+async def test_export_happy_path_get_chat_called_once_per_distinct_channel(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    await _seed_export_post(conn, EXPORT_TARGET, channel_id=CHAN_A, message_id=5)
+    await _seed_export_post(conn, EXPORT_TARGET, channel_id=CHAN_B, message_id=6)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+    msg.bot.get_chat = AsyncMock(return_value=MagicMock(username="chan"))
+
+    await h["cmd_export"](msg, make_ctx())
+
+    assert msg.bot.get_chat.call_count == 2
+    called_channel_ids = {c.args[0] for c in msg.bot.get_chat.call_args_list}
+    assert called_channel_ids == {CHAN_A, CHAN_B}
+
+
+async def test_export_happy_path_get_chat_exception_falls_back_to_private_link(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    await _seed_export_post(conn, EXPORT_TARGET, channel_id=CHAN_A, message_id=5)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+    msg.bot.get_chat = AsyncMock(side_effect=RuntimeError("network error"))
+
+    await h["cmd_export"](msg, make_ctx())
+
+    msg.reply_document.assert_awaited_once()
+    file_arg = msg.reply_document.call_args[0][0]
+    md = file_arg.data.decode("utf-8")
+    assert "https://t.me/c/9876543210/5" in md
+
+
+async def test_export_all_target_includes_multiple_users_sections(conn, settings):
+    OTHER_USER = 66666
+    await get_or_create_user(conn, OTHER_USER)
+    _, h, _ = setup_dp(conn, settings)
+    await _seed_export_post(conn, EXPORT_TARGET, channel_id=CHAN_A, message_id=5)
+    await _seed_export_post(conn, OTHER_USER, channel_id=CHAN_A, message_id=6)
+
+    msg = make_msg_with_bot(f"/export all 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+    msg.bot.get_chat = AsyncMock(return_value=MagicMock(username="chan"))
+
+    await h["cmd_export"](msg, make_ctx())
+
+    file_arg = msg.reply_document.call_args[0][0]
+    md = file_arg.data.decode("utf-8")
+    assert f"## User {EXPORT_TARGET}" in md
+    assert f"## User {OTHER_USER}" in md
+
+
+async def test_export_happy_path_logs_audit_info(conn, settings, caplog):
+    _, h, _ = setup_dp(conn, settings)
+    await _seed_export_post(conn, EXPORT_TARGET)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+    msg.bot.get_chat = AsyncMock(return_value=MagicMock(username="chan"))
+
+    with caplog.at_level(logging.INFO, logger="ahsoka.bot.commands"):
+        await h["cmd_export"](msg, make_ctx())
+
+    audit_lines = [r.getMessage() for r in caplog.records if "export admin_id=" in r.getMessage()]
+    assert len(audit_lines) == 1
+    assert f"target={EXPORT_TARGET}" in audit_lines[0]
+    assert "count=1" in audit_lines[0]
+
+
+# ---------------------------------------------------------------------------
+# /export — pyro-preferred channel resolution (review follow-up)
+# ---------------------------------------------------------------------------
+
+async def test_export_happy_path_prefers_pyro_get_chat_over_bot(conn, settings):
+    """When pyro is wired in, cmd_export resolves channel usernames via
+    pyro.get_chat and never touches message.bot.get_chat."""
+    mock_pyro = MagicMock()
+    mock_pyro.get_chat = AsyncMock(return_value=MagicMock(username="pyrochan"))
+    _, h, _ = setup_dp(conn, settings, pyro=mock_pyro)
+    await _seed_export_post(conn, EXPORT_TARGET)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+    msg.bot.get_chat = AsyncMock(return_value=MagicMock(username="botchan"))
+
+    await h["cmd_export"](msg, make_ctx())
+
+    mock_pyro.get_chat.assert_awaited_once_with(CHAN_A)
+    msg.bot.get_chat.assert_not_called()
+
+    file_arg = msg.reply_document.call_args[0][0]
+    md = file_arg.data.decode("utf-8")
+    assert "https://t.me/pyrochan/5" in md
+
+
+async def test_export_happy_path_pyro_get_chat_failure_falls_back_and_logs_debug(conn, settings, caplog):
+    """When pyro.get_chat raises, the document still goes out with the
+    t.me/c/... fallback link, and a debug line names the channel_id."""
+    mock_pyro = MagicMock()
+    mock_pyro.get_chat = AsyncMock(side_effect=RuntimeError("flood wait"))
+    _, h, _ = setup_dp(conn, settings, pyro=mock_pyro)
+    await _seed_export_post(conn, EXPORT_TARGET, channel_id=CHAN_A, message_id=5)
+
+    msg = make_msg_with_bot(f"/export {EXPORT_TARGET} 2020-01-01 2020-02-01")
+    msg.reply_document = AsyncMock()
+
+    with caplog.at_level(logging.DEBUG, logger="ahsoka.bot.commands"):
+        await h["cmd_export"](msg, make_ctx())
+
+    msg.reply_document.assert_awaited_once()
+    file_arg = msg.reply_document.call_args[0][0]
+    md = file_arg.data.decode("utf-8")
+    assert "https://t.me/c/9876543210/5" in md
+
+    debug_lines = [
+        r.getMessage() for r in caplog.records
+        if "could not resolve channel" in r.getMessage()
+    ]
+    assert len(debug_lines) == 1
+    assert str(CHAN_A) in debug_lines[0]
