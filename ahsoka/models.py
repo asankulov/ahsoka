@@ -106,6 +106,20 @@ class User:
 
 
 @dataclass
+class NotifiedPost:
+    """A single notified post row, joined with its stored verdict (if any), for export."""
+    user_id: int
+    channel_id: int
+    message_id: int
+    sent_at: str
+    urls: list[str] = field(default_factory=list)
+    score: int | None = None
+    reason: str = ""
+    apply: str = ""
+    red_flags: list[str] = field(default_factory=list)
+
+
+@dataclass
 class UserConfig:
     user_id: int = 0
     notify_chat_id: int = 0

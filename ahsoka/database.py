@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
-from ahsoka.models import PersonalizedVerdict, User, UserConfig
+from ahsoka.models import NotifiedPost, PersonalizedVerdict, User, UserConfig
 
 logger = logging.getLogger(__name__)
 
@@ -474,6 +474,57 @@ async def mark_notified(
         (user_id, channel_id, message_id, url),
     )
     await conn.commit()
+
+
+# --- Export ---
+
+
+async def get_notified_posts(
+    conn: aiosqlite.Connection,
+    user_id: int | None,
+    start: datetime,
+    end: datetime,
+) -> list[NotifiedPost]:
+    """Return notified posts (joined with stored verdicts) in [start, end) UTC.
+
+    One row per (user_id, channel_id, message_id): user_notified rows for the
+    same post are collapsed via GROUP BY (a post can have multiple url variants
+    stored — see main.py's mark_notified call — so we take the earliest sent_at
+    and concatenate the non-empty urls, which are unique per post via the
+    table's UNIQUE(user_id, channel_id, message_id, url) constraint).
+    """
+    start_str = start.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    end_str = end.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    async with conn.execute(
+        """SELECT n.user_id, n.channel_id, n.message_id,
+                  MIN(n.sent_at) AS sent_at,
+                  group_concat(NULLIF(n.url, ''), char(10)) AS urls,
+                  v.score, v.reason, v.apply, v.red_flags
+           FROM user_notified n
+           LEFT JOIN post_verdicts v
+               ON v.channel_id = n.channel_id
+              AND v.message_id = n.message_id
+              AND v.user_id = n.user_id
+           WHERE n.sent_at >= ? AND n.sent_at < ? AND (? IS NULL OR n.user_id = ?)
+           GROUP BY n.user_id, n.channel_id, n.message_id
+           ORDER BY n.user_id, MIN(n.sent_at)""",
+        (start_str, end_str, user_id, user_id),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [
+        NotifiedPost(
+            user_id=row[0],
+            channel_id=row[1],
+            message_id=row[2],
+            sent_at=row[3],
+            urls=[u for u in (row[4] or "").split("\n") if u],
+            score=row[5],
+            reason=row[6] or "",
+            apply=row[7] or "",
+            red_flags=json.loads(row[8]) if row[8] else [],
+        )
+        for row in rows
+    ]
 
 
 # --- Cleanup ---

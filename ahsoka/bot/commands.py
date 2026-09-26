@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 from anthropic import AsyncAnthropic
@@ -6,9 +7,10 @@ from aiogram import Dispatcher, F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BotCommand, Message
+from aiogram.types import BotCommand, BufferedInputFile, Message
 
 from ahsoka import database as db
+from ahsoka.bot.export import parse_range, render_markdown
 from ahsoka.config import Settings
 from ahsoka.models import Post
 from ahsoka.pipeline.keyword_index import KeywordIndex
@@ -551,6 +553,7 @@ def register_bot_commands(
             "  /unban 123456 - Unban a user",
             "  /stats - Show usage statistics (users, posts, notifications)",
             "  /debug on/off - Toggle debug scoring mode (forward posts to score)",
+            "  /export <user_id|all> <offset> - Export notified posts to Markdown",
             "  /admin - Show this help",
         ]
         await message.reply("\n".join(lines))
@@ -653,6 +656,84 @@ def register_bot_commands(
         await db.unban_user(conn, target_id)
         await _rebuild_keywords()
         await message.reply(f"User {target_id} unbanned.")
+
+    _EXPORT_USAGE = (
+        "Usage: /export <user_id|all> <offset>  (all times UTC)\n"
+        "Offset forms:\n"
+        "  relative: 30m, 24h, 7d, 2w\n"
+        "  since: 2026-09-01 or 2026-09-01T14:00\n"
+        "  range: 2026-09-01 2026-09-15"
+    )
+
+    @admin_router.message(Command("export"))
+    async def cmd_export(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        parts = (message.text or "").split()
+        if len(parts) < 3:
+            await message.reply(_EXPORT_USAGE)
+            return
+
+        target = parts[1]
+        target_id: int | None
+        if target.lower() == "all":
+            target_id = None
+            target_label = "all"
+        elif target.isdigit():
+            target_id = int(target)
+            target_label = target
+            if not await db.get_user(conn, target_id):
+                await message.reply(f"User {target_id} not found.")
+                return
+        else:
+            await message.reply(_EXPORT_USAGE)
+            return
+
+        now = datetime.now(timezone.utc)
+        time_range = parse_range(parts[2:], now)
+        if time_range is None:
+            await message.reply(_EXPORT_USAGE)
+            return
+        start, end = time_range
+        retention_note = start < now - timedelta(days=30)
+
+        posts = await db.get_notified_posts(conn, target_id, start, end)
+        if not posts:
+            note = (
+                "\n\nNote: notification history is only retained for 30 days."
+                if retention_note else ""
+            )
+            await message.reply(f"No notifications found for that range.{note}")
+            return
+
+        sections: dict[int, list] = {}
+        for post in posts:
+            sections.setdefault(post.user_id, []).append(post)
+
+        links: dict[int, str | None] = {}
+        for channel_id in {post.channel_id for post in posts}:
+            try:
+                if pyro is not None:
+                    # Source channels are joined by the Pyrogram user client, not the
+                    # bot, so prefer it — message.bot.get_chat usually 403s on them.
+                    chat = await pyro.get_chat(channel_id)  # type: ignore[union-attr]
+                else:
+                    chat = await message.bot.get_chat(channel_id)  # type: ignore[union-attr]
+                links[channel_id] = chat.username
+            except Exception:
+                logger.debug("export: could not resolve channel %d for a link", channel_id)
+                links[channel_id] = None
+
+        md = render_markdown(sections, start, end, links, retention_note)
+        end_label = end - timedelta(seconds=1)
+        filename = f"export_{target_label}_{start:%Y%m%d}-{end_label:%Y%m%d}.md"
+        await message.reply_document(
+            BufferedInputFile(md.encode("utf-8"), filename=filename),
+            caption=f"Export for {target_label}: {len(posts)} entr{'y' if len(posts) == 1 else 'ies'}.",
+        )
+        logger.info(
+            "export admin_id=%d target=%s start=%s end=%s count=%d",
+            _uid(message), target_label, start.isoformat(), end.isoformat(), len(posts),
+        )
 
     @admin_router.message(Command("stats"))
     async def cmd_stats(message: Message, state: FSMContext) -> None:
