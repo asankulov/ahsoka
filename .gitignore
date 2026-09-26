@@ -1,7 +1,7 @@
 # Project-specific
 ahsoka.db
-ahsoka/*.session
-ahsoka/*.session-journal
+*.session
+*.session-journal
 .claude/settings.local.json
 .claude/agent-memory/
 
