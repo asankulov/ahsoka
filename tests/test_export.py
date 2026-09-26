@@ -494,10 +494,24 @@ def test_entities_to_markdown_enum_like_type_uses_name_attribute():
     assert entities_to_markdown("hello bold world", entities) == "hello **bold** world"
 
 
+class _UnresolvableEntityType:
+    """Neither `.name` nor `.value` is a string (e.g. raw ints), and the
+    object itself is not a string either — entity_type_name resolves this to
+    None, and entities_to_markdown must skip the entity as plain text rather
+    than raising."""
+    name = 1
+    value = 2
+
+
+def test_entities_to_markdown_unresolvable_type_skipped_as_plain_text():
+    entities = [ent(_UnresolvableEntityType(), 6, 4)]
+    assert entities_to_markdown("hello bold world", entities) == "hello bold world"
+
+
 def test_entities_to_markdown_realistic_enum_doubles_end_to_end():
     """End-to-end with every entity using the realistic enum-name shape (never
     a bare lowercase string, never a string `.value`) — this must fail loudly
-    if `_entity_type` reverts to reading `.value`."""
+    if `entity_type_name` reverts to reading `.value`."""
     text = "start bold link end"
     entities = [
         ent(_enum_type("BOLD"), 6, 9),                                  # "bold link"

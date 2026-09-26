@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from ahsoka.models import NotifiedPost
+from ahsoka.text_utils import entity_type_name
 
 _RELATIVE_RE = re.compile(r"^(\d+)([mhdw])$")
 _UNIT_TO_KWARG = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
@@ -102,15 +103,6 @@ def _u16_len(s: str) -> int:
     return len(s.encode("utf-16-le")) // 2
 
 
-def _entity_type(entity: object) -> object:
-    # Real Pyrogram MessageEntityType members have raw-TL-class .value, not a
-    # string — only .name ("BOLD") is usable; plain str duck-types (no .name)
-    # pass through as-is.
-    etype = getattr(entity, "type", None)
-    name = getattr(etype, "name", None)
-    return name.lower() if isinstance(name, str) else etype
-
-
 def entities_to_markdown(text: str, entities: list) -> str:
     """Convert a Telegram message's plain text + entities into standard CommonMark.
 
@@ -137,12 +129,12 @@ def entities_to_markdown(text: str, entities: list) -> str:
         key=lambda e: (
             getattr(e, "offset", 0),
             -getattr(e, "length", 0),
-            0 if _entity_type(e) in _BLOCK_TYPES else 1,
+            0 if entity_type_name(getattr(e, "type", None)) in _BLOCK_TYPES else 1,
         ),
     )
 
     for entity in ordered_entities:
-        etype_val = _entity_type(entity)
+        etype_val = entity_type_name(getattr(entity, "type", None))
         offset = getattr(entity, "offset", 0)
         length = getattr(entity, "length", 0)
         if length <= 0:

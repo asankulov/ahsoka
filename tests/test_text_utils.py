@@ -1,5 +1,10 @@
-"""Tests for ahsoka.text_utils.slice_utf16."""
-from ahsoka.text_utils import slice_utf16
+"""Tests for ahsoka.text_utils.slice_utf16 and entity_type_name."""
+import enum
+from unittest.mock import MagicMock
+
+import pytest
+
+from ahsoka.text_utils import entity_type_name, slice_utf16
 
 
 def test_slice_utf16_emoji_before_url_extracts_full_url():
@@ -69,3 +74,73 @@ def test_slice_utf16_lone_surrogate_in_input_does_not_raise():
     the decode(errors='ignore') step, same as a split surrogate pair."""
     text = "a\ud800b"
     assert slice_utf16(text, 0, len(text)) == "ab"
+
+
+# ---------------------------------------------------------------------------
+# entity_type_name
+#
+# Regression coverage for: pyrogram.enums.MessageEntityType members have
+# explicit values that are raw TL *classes* (e.g. TEXT_LINK =
+# raw.types.MessageEntityTextUrl), never strings. Resolution must go through
+# `.name.lower()` first, falling back to a plain string or a string `.value`
+# for other client shapes. These doubles mirror the real Pyrogram shape with
+# a real `enum.Enum` subclass instead of a MagicMock, whose `.value` would
+# (incorrectly) already be a plain string and so could hide this bug.
+#
+# `Post.from_message`'s end-to-end use of this helper is covered separately
+# in tests/test_models.py; these are the direct unit tests.
+# ---------------------------------------------------------------------------
+
+class _RawEntityUrl:
+    """Stand-in for pyrogram.raw.types.MessageEntityUrl — a non-string sentinel."""
+
+
+class _RawEntityTextUrl:
+    """Stand-in for pyrogram.raw.types.MessageEntityTextUrl."""
+
+
+class _RawEntityMention:
+    """Stand-in for pyrogram.raw.types.MessageEntityMention."""
+
+
+class FakeMessageEntityType(enum.Enum):
+    """Mirrors pyrogram.enums.MessageEntityType's shape: `.name` is the
+    string member name, `.value` is a distinct non-string raw-TL-like class.
+    Distinct classes per member matter — identical values would alias in
+    a real Enum and silently collapse the members being tested.
+    """
+    URL = _RawEntityUrl
+    TEXT_LINK = _RawEntityTextUrl
+    MENTION = _RawEntityMention
+
+
+class _UnresolvableEntityType:
+    """Neither `.name` nor `.value` is a string (e.g. raw ints), and the
+    object itself is not a string either — must resolve to None.
+    """
+    name = 1
+    value = 2
+
+
+@pytest.mark.parametrize(
+    "etype, expected",
+    [
+        (FakeMessageEntityType.URL, "url"),
+        (FakeMessageEntityType.TEXT_LINK, "text_link"),
+        (FakeMessageEntityType.MENTION, "mention"),
+        ("url", "url"),
+        ("TEXT_LINK", "TEXT_LINK"),  # plain strings are used as-is, not lowercased
+        (_UnresolvableEntityType(), None),
+        (None, None),
+    ],
+)
+def test_entity_type_name_parametrized(etype, expected):
+    assert entity_type_name(etype) == expected
+
+
+def test_entity_type_name_magicmock_string_value_fallback():
+    etype = MagicMock()
+    etype.value = "url"
+    # MagicMock auto-generates a `.name` attribute that is itself a MagicMock,
+    # not a string, so this must fall through to the `.value` branch.
+    assert entity_type_name(etype) == "url"

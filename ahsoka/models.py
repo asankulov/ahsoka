@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from ahsoka.text_utils import entity_type_name
+
 
 @dataclass
 class Post:
@@ -34,7 +36,7 @@ class Post:
             if len(urls) >= 3:
                 break
             etype = getattr(entity, "type", None)
-            etype_val = getattr(etype, "value", etype)
+            etype_val = entity_type_name(etype)
             if etype_val == "text_link":
                 u = getattr(entity, "url", None)
             elif etype_val == "url":
