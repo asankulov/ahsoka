@@ -2,9 +2,7 @@ import enum
 from datetime import datetime
 from unittest.mock import MagicMock
 
-import pytest
-
-from ahsoka.models import Post, _entity_type_name
+from ahsoka.models import Post
 
 
 def make_entity(etype_value: str, url: str | None = None, offset: int = 0, length: int = 0) -> MagicMock:
@@ -236,7 +234,8 @@ def test_user_config_is_banned_false_survives_deepcopy():
 
 
 # ---------------------------------------------------------------------------
-# _entity_type_name / URL extraction — Pyrogram-shaped enum entity types
+# entity_type_name (ahsoka.text_utils) / URL extraction — Pyrogram-shaped
+# enum entity types, end-to-end through Post.from_message.
 #
 # Regression coverage for: pyrogram.enums.MessageEntityType members have
 # explicit values that are raw TL *classes* (e.g. TEXT_LINK =
@@ -246,6 +245,10 @@ def test_user_config_is_banned_false_survives_deepcopy():
 # `.name.lower()` first. These doubles mirror that shape with a real
 # `enum.Enum` subclass instead of a MagicMock, whose `.value` would
 # (incorrectly) already be a plain string and so could hide this bug.
+#
+# Direct unit tests of `entity_type_name` itself live in
+# tests/test_text_utils.py; only the `Post.from_message` integration stays
+# here.
 # ---------------------------------------------------------------------------
 
 class _RawEntityUrl:
@@ -371,37 +374,13 @@ def test_from_message_unresolvable_entity_type_skipped_without_exception():
 def test_from_message_magicmock_fallback_to_value_still_works():
     """Existing MagicMock-based double (its `.type` is itself a MagicMock
     whose `.value` attribute is a plain string) must keep resolving via the
-    `.value` fallback branch of `_entity_type_name`.
+    `.value` fallback branch of `entity_type_name` (ahsoka.text_utils).
+
+    Direct unit tests of `entity_type_name` itself (the parametrized table
+    and this MagicMock fallback case) live in tests/test_text_utils.py —
+    this file keeps only the `Post.from_message` end-to-end coverage.
     """
     entities = [make_entity("text_link", url="https://legacy.example.com")]
     msg = make_message(text="legacy path", entities=entities)
     post = Post.from_message(msg)
     assert post.url == "https://legacy.example.com"
-
-
-# ---------------------------------------------------------------------------
-# _entity_type_name — direct unit tests
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize(
-    "etype, expected",
-    [
-        (FakeMessageEntityType.URL, "url"),
-        (FakeMessageEntityType.TEXT_LINK, "text_link"),
-        (FakeMessageEntityType.MENTION, "mention"),
-        ("url", "url"),
-        ("TEXT_LINK", "TEXT_LINK"),  # plain strings are used as-is, not lowercased
-        (_UnresolvableEntityType(), None),
-        (None, None),
-    ],
-)
-def test_entity_type_name_parametrized(etype, expected):
-    assert _entity_type_name(etype) == expected
-
-
-def test_entity_type_name_magicmock_string_value_fallback():
-    etype = MagicMock()
-    etype.value = "url"
-    # MagicMock auto-generates a `.name` attribute that is itself a MagicMock,
-    # not a string, so this must fall through to the `.value` branch.
-    assert _entity_type_name(etype) == "url"

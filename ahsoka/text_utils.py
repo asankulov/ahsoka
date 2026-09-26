@@ -3,6 +3,31 @@
 from __future__ import annotations
 
 
+def entity_type_name(etype: object) -> str | None:
+    """Resolve a message entity's type to a lowercase string name.
+
+    Handles three shapes:
+      1. An enum member whose `.name` is a string (e.g. Pyrogram's
+         `MessageEntityType.URL`, whose `.value` is a raw TL class, not a
+         string) -> use `.name.lower()`.
+      2. A plain string already (e.g. from a lightweight test double or a
+         different client library) -> use it as-is.
+      3. An object exposing a string `.value` (e.g. a MagicMock in tests,
+         or another enum flavor with string values) -> use `.value`.
+
+    Anything else resolves to None so the caller skips the entity.
+    """
+    name = getattr(etype, "name", None)
+    if isinstance(name, str):
+        return name.lower()
+    if isinstance(etype, str):
+        return etype
+    value = getattr(etype, "value", None)
+    if isinstance(value, str):
+        return value
+    return None
+
+
 def slice_utf16(text: str, offset: int, length: int) -> str:
     """Slice ``text`` using Telegram-style UTF-16 code unit offsets.
 
