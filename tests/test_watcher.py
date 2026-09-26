@@ -264,6 +264,163 @@ async def test_handler_extracts_url_entity():
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_extracts_url_entity_with_emoji_before_it():
+    """on_raw slices MessageEntityUrl in UTF-16 space so an astral emoji before
+    the URL does not shift/truncate the extracted string.
+
+    This is the user's motivating example: '🚀 Apply https://jobs.io now' with
+    UTF-16 offset 9 / length 15 must yield the full 'https://jobs.io', not a
+    shifted/truncated substring as plain str[9:24] slicing would produce (the
+    rocket emoji occupies 2 UTF-16 units but only 1 Python str index).
+    """
+    try:
+        from pyrogram.raw import types as raw_types
+    except Exception:
+        pytest.skip("Pyrogram not importable in this environment")
+
+    from ahsoka.watcher.handler import register_watcher_handlers
+
+    queue: asyncio.Queue = asyncio.Queue()
+    channel_id_raw = 88888
+    chat_id = int(f"-100{channel_id_raw}")
+    watched_channels = {chat_id}
+
+    captured_handler = None
+
+    def fake_on_raw_update():
+        def decorator(fn):
+            nonlocal captured_handler
+            captured_handler = fn
+            return fn
+        return decorator
+
+    client = MagicMock()
+    client.on_raw_update = fake_on_raw_update
+
+    register_watcher_handlers(client, queue, watched_channels)
+
+    text = "\U0001F680 Apply https://jobs.io now"
+
+    entity = MagicMock(spec=raw_types.MessageEntityUrl)
+    entity.offset = 9
+    entity.length = 15
+
+    msg = _make_channel_message(
+        channel_id=channel_id_raw, message_id=67, text=text, entities=[entity]
+    )
+    update = _make_update(msg)
+
+    await captured_handler(client, update, users={}, chats={})
+
+    post: Post = queue.get_nowait()
+    assert post.url == "https://jobs.io"
+    assert post.urls == ["https://jobs.io"]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_extracts_mixed_text_url_and_url_entities_with_emoji():
+    """Emoji before a MessageEntityUrl, plus a MessageEntityTextUrl after it —
+    both should resolve correctly, and the plain-ASCII text_link path (which
+    doesn't slice) remains unaffected by the emoji shift."""
+    try:
+        from pyrogram.raw import types as raw_types
+    except Exception:
+        pytest.skip("Pyrogram not importable in this environment")
+
+    from ahsoka.watcher.handler import register_watcher_handlers
+
+    queue: asyncio.Queue = asyncio.Queue()
+    channel_id_raw = 88889
+    chat_id = int(f"-100{channel_id_raw}")
+    watched_channels = {chat_id}
+
+    captured_handler = None
+
+    def fake_on_raw_update():
+        def decorator(fn):
+            nonlocal captured_handler
+            captured_handler = fn
+            return fn
+        return decorator
+
+    client = MagicMock()
+    client.on_raw_update = fake_on_raw_update
+
+    register_watcher_handlers(client, queue, watched_channels)
+
+    text = "\U0001F680 Apply https://jobs.io now"
+
+    url_entity = MagicMock(spec=raw_types.MessageEntityUrl)
+    url_entity.offset = 9
+    url_entity.length = 15
+
+    text_link_entity = MagicMock(spec=raw_types.MessageEntityTextUrl)
+    text_link_entity.url = "https://example.com/apply"
+
+    msg = _make_channel_message(
+        channel_id=channel_id_raw,
+        message_id=68,
+        text=text,
+        entities=[url_entity, text_link_entity],
+    )
+    update = _make_update(msg)
+
+    await captured_handler(client, update, users={}, chats={})
+
+    post: Post = queue.get_nowait()
+    assert post.urls == ["https://jobs.io", "https://example.com/apply"]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_extracts_url_entity_ascii_only_unchanged():
+    """ASCII-only text (no astral chars) behaves exactly as before the fix —
+    a regression guard for the plain-str-equivalent path of slice_utf16."""
+    try:
+        from pyrogram.raw import types as raw_types
+    except Exception:
+        pytest.skip("Pyrogram not importable in this environment")
+
+    from ahsoka.watcher.handler import register_watcher_handlers
+
+    queue: asyncio.Queue = asyncio.Queue()
+    channel_id_raw = 88890
+    chat_id = int(f"-100{channel_id_raw}")
+    watched_channels = {chat_id}
+
+    captured_handler = None
+
+    def fake_on_raw_update():
+        def decorator(fn):
+            nonlocal captured_handler
+            captured_handler = fn
+            return fn
+        return decorator
+
+    client = MagicMock()
+    client.on_raw_update = fake_on_raw_update
+
+    register_watcher_handlers(client, queue, watched_channels)
+
+    text = "Apply at https://jobs.example.com/1 today"
+    url_in_text = "https://jobs.example.com/1"
+    offset = text.index(url_in_text)
+
+    entity = MagicMock(spec=raw_types.MessageEntityUrl)
+    entity.offset = offset
+    entity.length = len(url_in_text)
+
+    msg = _make_channel_message(
+        channel_id=channel_id_raw, message_id=69, text=text, entities=[entity]
+    )
+    update = _make_update(msg)
+
+    await captured_handler(client, update, users={}, chats={})
+
+    post: Post = queue.get_nowait()
+    assert post.urls == [url_in_text]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 async def test_handler_limits_urls_to_three():
     """on_raw caps URL collection at 3 entries."""
     try:

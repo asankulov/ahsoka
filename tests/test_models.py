@@ -24,6 +24,7 @@ def make_message(
     chat_username: str | None = "testchannel",
     message_id: int = 42,
     entities: list | None = None,
+    caption_entities: list | None = None,
     date: datetime | None = None,
 ) -> MagicMock:
     msg = MagicMock()
@@ -34,6 +35,7 @@ def make_message(
     msg.chat.id = chat_id
     msg.chat.username = chat_username
     msg.entities = entities or []
+    msg.caption_entities = caption_entities
     msg.date = date or datetime(2024, 1, 15, 12, 0, 0)
     return msg
 
@@ -157,6 +159,47 @@ def test_from_message_skips_unknown_entity_types():
     msg = make_message(text="bold text", entities=entities)
     post = Post.from_message(msg)
     assert post.urls == ["https://good.com"]
+
+
+# ---------------------------------------------------------------------------
+# URL extraction — caption_entities (Pyrogram 2.0.106 captioned media)
+# ---------------------------------------------------------------------------
+
+def test_from_message_caption_text_link_entity():
+    caption_entities = [make_entity("text_link", url="https://example.com/job")]
+    msg = make_message(text=None, caption="Apply here", caption_entities=caption_entities)
+    post = Post.from_message(msg)
+    assert post.url == "https://example.com/job"
+    assert "https://example.com/job" in post.urls
+
+
+def test_from_message_caption_url_entity_mid_string():
+    caption = "Apply at https://jobs.io now"
+    offset = len("Apply at ")
+    url_str = "https://jobs.io"
+    caption_entities = [make_entity("url", offset=offset, length=len(url_str))]
+    msg = make_message(text=None, caption=caption, caption_entities=caption_entities)
+    post = Post.from_message(msg)
+    assert post.url == "https://jobs.io"
+
+
+def test_from_message_text_truthy_ignores_caption_entities():
+    caption_entities = [make_entity("text_link", url="https://should-not-appear.com")]
+    msg = make_message(
+        text="Hello job post",
+        caption="Ignored caption",
+        caption_entities=caption_entities,
+    )
+    post = Post.from_message(msg)
+    assert post.urls == []
+    assert post.url is None
+
+
+def test_from_message_caption_with_none_caption_entities_yields_no_urls():
+    msg = make_message(text=None, caption="Job from caption", caption_entities=None)
+    post = Post.from_message(msg)
+    assert post.urls == []
+    assert post.url is None
 
 
 # ---------------------------------------------------------------------------

@@ -41,7 +41,13 @@ class Post:
 
     @classmethod
     def from_message(cls, message: object) -> Post:
-        text: str = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        message_text = getattr(message, "text", None)
+        if message_text:
+            text: str = message_text
+            entities = getattr(message, "entities", None) or []
+        else:
+            text = getattr(message, "caption", None) or ""
+            entities = getattr(message, "caption_entities", None) or []
         chat = getattr(message, "chat", None)
         channel_name: str = (
             getattr(chat, "username", None) or str(getattr(chat, "id", 0))
@@ -49,7 +55,6 @@ class Post:
 
         seen: set[str] = set()
         urls: list[str] = []
-        entities = getattr(message, "entities", None) or []
         for entity in entities:
             if len(urls) >= 3:
                 break
