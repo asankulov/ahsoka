@@ -287,8 +287,15 @@ async def mark_seen(
     seniority: str = "",
     remote: str = "",
     red_flags: str = "",
-) -> None:
-    await conn.execute(
+) -> bool:
+    """Claim (channel_id, message_id, url) as seen.
+
+    Returns True if this call actually inserted the row (i.e. won the claim),
+    False if a row already existed (another caller already claimed it). This
+    return value is the authoritative guard against concurrent
+    pipeline_worker tasks double-processing the same post.
+    """
+    cursor = await conn.execute(
         """INSERT OR IGNORE INTO seen_posts
            (channel_id, message_id, url, score, score_reason, apply_info,
             stack_tags, seniority, remote, red_flags)
@@ -297,6 +304,7 @@ async def mark_seen(
          stack_tags, seniority, remote, red_flags),
     )
     await conn.commit()
+    return cursor.rowcount > 0
 
 
 # --- User management ---

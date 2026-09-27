@@ -1,5 +1,5 @@
 """Tests for ahsoka.main — pipeline_worker, _fan_out_verdicts, _run_batch,
-batch_worker, _enqueue_single, _enqueue_fanout, _recover_pending_batches,
+batch_worker, _enqueue_single, _recover_pending_batches,
 _recover_single_batch, and cleanup_worker."""
 import asyncio
 from datetime import datetime
@@ -330,8 +330,7 @@ async def test_pipeline_worker_calls_enqueue_single_for_normal_post(conn):
 
     with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
          patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock, return_value=active_configs), \
-         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_enqueue_single, \
-         patch("ahsoka.main._enqueue_fanout", new_callable=AsyncMock):
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_enqueue_single:
         await _run_pipeline_worker_with_one_post(post, conn, batch_queue, keyword_index)
 
     mock_enqueue_single.assert_called_once()
@@ -608,7 +607,7 @@ async def test_enqueue_single_non_tg_url_scrapes_and_enqueues(conn):
 
     with patch("ahsoka.main.scrape_content", new_callable=AsyncMock, return_value="scraped text") as mock_scrape, \
          patch("ahsoka.main.is_tg_link", return_value=False), \
-         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen:
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock, return_value=True) as mock_mark_seen:
         await _enqueue_single(conn, batch_queue, post, active_configs, pyro)
 
     mock_scrape.assert_called_once()
@@ -633,7 +632,7 @@ async def test_enqueue_single_tg_url_appends_resolved_content(conn):
     with patch("ahsoka.main.scrape_content", new_callable=AsyncMock, return_value="base content"), \
          patch("ahsoka.main.is_tg_link", side_effect=fake_is_tg_link), \
          patch("ahsoka.main.resolve_tg_link", new_callable=AsyncMock, return_value="resolved linked text"), \
-         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock):
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock, return_value=True):
         await _enqueue_single(conn, batch_queue, post, active_configs, pyro)
 
     _, content_arg, _ = batch_queue.enqueue.call_args[0]
@@ -656,7 +655,7 @@ async def test_enqueue_single_tg_url_resolver_returns_none_no_append(conn):
     with patch("ahsoka.main.scrape_content", new_callable=AsyncMock, return_value="base content"), \
          patch("ahsoka.main.is_tg_link", side_effect=fake_is_tg_link), \
          patch("ahsoka.main.resolve_tg_link", new_callable=AsyncMock, return_value=None), \
-         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock):
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock, return_value=True):
         await _enqueue_single(conn, batch_queue, post, active_configs, pyro)
 
     _, content_arg, _ = batch_queue.enqueue.call_args[0]
@@ -664,80 +663,169 @@ async def test_enqueue_single_tg_url_resolver_returns_none_no_append(conn):
     assert "--- linked from" not in content_arg
 
 
-# ---------------------------------------------------------------------------
-# _enqueue_fanout
-# ---------------------------------------------------------------------------
+async def test_enqueue_single_mark_seen_false_skips_scrape_and_enqueue(conn):
+    """_enqueue_single: mark_seen returns False (lost the race to a concurrent
+    worker) -> scrape_content, resolve_tg_link, and batch_queue.enqueue must
+    never be called."""
+    from ahsoka.main import _enqueue_single
 
-
-async def test_enqueue_fanout_non_tg_urls_scrape_and_enqueue_per_url(conn):
-    """Multi-URL non-tg post: scrape_url called per url, mark_seen per url, enqueue per url."""
-    from ahsoka.main import _enqueue_fanout
-
-    post = make_post(urls=["https://example.com/job1", "https://example.com/job2"])
+    post = make_post(urls=["https://t.me/somechannel/123"])
     active_configs = [make_config(user_id=1)]
     batch_queue = AsyncMock()
     pyro = MagicMock()
 
-    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
-         patch("ahsoka.main.is_tg_link", return_value=False), \
-         patch("ahsoka.main.scrape_url", new_callable=AsyncMock, return_value="url content") as mock_scrape, \
-         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen:
-        await _enqueue_fanout(conn, batch_queue, post, active_configs, pyro)
+    with patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.scrape_content", new_callable=AsyncMock) as mock_scrape, \
+         patch("ahsoka.main.is_tg_link") as mock_is_tg_link, \
+         patch("ahsoka.main.resolve_tg_link", new_callable=AsyncMock) as mock_resolve:
+        await _enqueue_single(conn, batch_queue, post, active_configs, pyro)
 
-    assert mock_scrape.call_count == 2
-    assert mock_mark_seen.call_count == 2
-    assert batch_queue.enqueue.call_count == 2
+    mock_scrape.assert_not_called()
+    mock_is_tg_link.assert_not_called()
+    mock_resolve.assert_not_called()
+    batch_queue.enqueue.assert_not_called()
 
 
-async def test_enqueue_fanout_tg_url_uses_resolver(conn):
-    """Multi-URL with one tg url: resolve_tg_link used for tg, scrape_url for non-tg."""
-    from ahsoka.main import _enqueue_fanout
+async def test_enqueue_single_concurrent_calls_produce_exactly_one_request_in_real_queue(conn):
+    """Regression test for the production bug: two pipeline_worker tasks
+    racing on the same post must not both scrape and enqueue.
+
+    Rewritten per ig-11's review of the original version of this test: the
+    original used a fully-mocked batch_queue (AsyncMock) and asserted only
+    `enqueue.call_count == 1`. That would have passed even against the
+    PRE-FIX `_enqueue_single` — which had NO dedup guard of its own at all
+    (the only dedup check, `is_duplicate`, lives one level up in
+    `pipeline_worker`, not in `_enqueue_single`) — so the old test proved
+    nothing about the actual race being closed; it just proved a mock was
+    called once.
+
+    This version drives two concurrent `_enqueue_single` calls (the same
+    entry point two racing pipeline_worker tasks would call after their own
+    is_duplicate check passes) against the REAL in-memory aiosqlite `conn`
+    and the REAL `db.mark_seen` — not mocked — so the
+    UNIQUE(channel_id, message_id, url) constraint is what actually
+    arbitrates the race, exactly as it does in production. It also uses a
+    REAL BatchQueue (not a mock) and asserts the end result at the API
+    boundary: drain() must contain exactly one request, with the expected
+    unique custom_id. Only scrape_content is mocked (no real HTTP), with an
+    artificial await inside it to force both coroutines past the "read"
+    phase before either commits the "seen" claim if mark_seen were not
+    atomic — this is the scenario the fix closes.
+    """
+    from ahsoka.main import _enqueue_single
+    from ahsoka.pipeline.batch_queue import BatchQueue
+
+    post = make_post(channel_id=707, message_id=808, urls=[])
+    active_configs = [make_config(user_id=1)]
+    batch_queue = BatchQueue(flush_size=100, flush_seconds=600)
+    pyro = MagicMock()
+
+    async def slow_scrape(*args, **kwargs):
+        await asyncio.sleep(0)
+        return "scraped text"
+
+    with patch("ahsoka.main.scrape_content", new_callable=AsyncMock, side_effect=slow_scrape):
+        await asyncio.gather(
+            _enqueue_single(conn, batch_queue, post, active_configs, pyro),
+            _enqueue_single(conn, batch_queue, post, active_configs, pyro),
+        )
+
+    # Exactly one of the two concurrent calls won the real mark_seen claim,
+    # so exactly one request made it into the real queue — never two, and
+    # never zero.
+    requests = await batch_queue.drain()
+    assert len(requests) == 1, f"expected exactly 1 request from the real queue, got {len(requests)}"
+    assert requests[0].custom_id == "707_808_1"
+
+
+async def test_enqueue_single_mixed_tg_and_http_urls_resolves_correctly(conn):
+    """Multi-URL post.urls mixing an http(s) URL with a t.me URL: the http
+    URL's content comes from scrape_content (already combined), and the
+    tg URL is separately resolved via resolve_tg_link and appended.
+
+    This is the only path multi-URL posts take now that _enqueue_fanout is
+    gone, so this behavior — previously only exercised with a single-URL
+    tg post — must still hold when post.urls has 2+ entries of mixed kind.
+    """
+    from ahsoka.main import _enqueue_single
 
     post = make_post(urls=["https://t.me/chan/1", "https://example.com/job"])
     active_configs = [make_config(user_id=1)]
     batch_queue = AsyncMock()
     pyro = MagicMock()
 
-    def fake_is_tg(url):
+    def fake_is_tg_link(url):
         return url.startswith("https://t.me/")
 
-    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
-         patch("ahsoka.main.is_tg_link", side_effect=fake_is_tg), \
-         patch("ahsoka.main.resolve_tg_link", new_callable=AsyncMock, return_value="tg resolved") as mock_resolve, \
-         patch("ahsoka.main.scrape_url", new_callable=AsyncMock, return_value="scraped") as mock_scrape, \
-         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock):
-        await _enqueue_fanout(conn, batch_queue, post, active_configs, pyro)
+    with patch("ahsoka.main.scrape_content", new_callable=AsyncMock, return_value="base content"), \
+         patch("ahsoka.main.is_tg_link", side_effect=fake_is_tg_link), \
+         patch("ahsoka.main.resolve_tg_link", new_callable=AsyncMock, return_value="resolved linked text") as mock_resolve, \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock, return_value=True) as mock_mark_seen:
+        await _enqueue_single(conn, batch_queue, post, active_configs, pyro)
 
-    mock_resolve.assert_called_once()
-    mock_scrape.assert_called_once()
-    assert batch_queue.enqueue.call_count == 2
+    # Single atomic claim for the whole post, not one per URL.
+    mock_mark_seen.assert_called_once()
+    # Only the tg URL triggers a resolver call; the http URL is handled by
+    # scrape_content (mocked above), not by this loop.
+    mock_resolve.assert_called_once_with("https://t.me/chan/1", pyro)
+    _, content_arg, _ = batch_queue.enqueue.call_args[0]
+    assert "base content" in content_arg
+    assert "--- linked from" in content_arg
+    assert "resolved linked text" in content_arg
 
 
-async def test_enqueue_fanout_duplicate_url_skipped(conn):
-    """is_duplicate returns True for one url → that url skipped; other url still processed."""
-    from ahsoka.main import _enqueue_fanout
+async def test_enqueue_single_concurrent_calls_multi_url_produce_one_request_per_user(conn):
+    """Regression test for the 3rd-round fix: _enqueue_fanout was deleted
+    because it claimed URLs one at a time, letting two concurrent workers
+    each win a *different* URL of the same multi-URL post and both
+    independently enqueue — reproducing the duplicate-custom_id bug at a
+    different layer. Now every post (single- or multi-URL) routes through
+    _enqueue_single, which takes exactly ONE atomic mark_seen claim for the
+    whole post, so a split-claim race is structurally impossible.
 
-    post = make_post(urls=["https://example.com/dup", "https://example.com/new"])
-    active_configs = [make_config(user_id=1)]
-    batch_queue = AsyncMock()
+    Drives two concurrent _enqueue_single calls on the SAME multi-URL post
+    against the REAL in-memory conn, REAL db.mark_seen, and a REAL
+    BatchQueue (not mocks) — only scrape_content is mocked (the I/O
+    boundary), with a forced await asyncio.sleep(0) inside it to force
+    interleaving between the two coroutines before either could commit its
+    claim, exactly the window the pre-fix per-URL claiming left open.
+    """
+    from ahsoka.main import _enqueue_single
+    from ahsoka.pipeline.batch_queue import BatchQueue
+
+    post = make_post(
+        channel_id=321, message_id=654,
+        urls=[
+            "https://example.com/job1",
+            "https://example.com/job2",
+            "https://example.com/job3",
+        ],
+    )
+    active_configs = [make_config(user_id=1), make_config(user_id=2)]
+    batch_queue = BatchQueue(flush_size=100, flush_seconds=600)
     pyro = MagicMock()
 
-    async def fake_is_duplicate(c, p, url=None):
-        return url == "https://example.com/dup"
+    async def slow_scrape(*args, **kwargs):
+        await asyncio.sleep(0)
+        return "scraped text"
 
-    with patch("ahsoka.main.is_duplicate", side_effect=fake_is_duplicate), \
-         patch("ahsoka.main.is_tg_link", return_value=False), \
-         patch("ahsoka.main.scrape_url", new_callable=AsyncMock, return_value="content") as mock_scrape, \
-         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen:
-        await _enqueue_fanout(conn, batch_queue, post, active_configs, pyro)
+    with patch("ahsoka.main.scrape_content", new_callable=AsyncMock, side_effect=slow_scrape):
+        await asyncio.gather(
+            _enqueue_single(conn, batch_queue, post, active_configs, pyro),
+            _enqueue_single(conn, batch_queue, post, active_configs, pyro),
+        )
 
-    # Only the non-duplicate url should be scraped/enqueued/marked
-    assert mock_scrape.call_count == 1
-    assert mock_mark_seen.call_count == 1
-    assert batch_queue.enqueue.call_count == 1
-    # Verify the call was for the non-dup URL
-    url_arg = mock_scrape.call_args[0][0]
-    assert url_arg == "https://example.com/new"
+    requests = await batch_queue.drain()
+    custom_ids = [r.custom_id for r in requests]
+
+    # Exactly one of the two concurrent calls wins the single post-level
+    # claim, so the queue ends up with exactly one BatchRequest per active
+    # user (2 users -> 2 requests) — never doubled to 4, never zero.
+    assert len(requests) == len(active_configs), (
+        f"expected exactly {len(active_configs)} requests (1 per active user), got {len(requests)}"
+    )
+    assert len(custom_ids) == len(set(custom_ids)), f"duplicate custom_id(s) found: {custom_ids}"
+    assert set(custom_ids) == {"321_654_1", "321_654_2"}
 
 
 # ---------------------------------------------------------------------------
@@ -905,9 +993,12 @@ async def test_fan_out_verdicts_send_notification_exception_logs_and_continues(c
     assert 2 in send_calls
 
 
-async def test_pipeline_worker_calls_enqueue_fanout_for_multi_url_post(conn):
-    """Post with >= 2 URLs: _enqueue_fanout called, not _enqueue_single."""
-    post = make_post(urls=["https://a.com", "https://b.com"])
+async def test_pipeline_worker_calls_enqueue_single_for_multi_url_post(conn):
+    """Post with >= 2 URLs also routes through _enqueue_single — there is no
+    separate fanout path anymore (_enqueue_fanout was deleted because
+    claiming URLs one at a time let two concurrent workers each win a
+    different URL of the same post and both independently enqueue)."""
+    post = make_post(urls=["https://a.com", "https://b.com", "https://c.com"])
     batch_queue = AsyncMock()
     keyword_index = MagicMock()
     keyword_index.passes = MagicMock(return_value=True)
@@ -916,12 +1007,10 @@ async def test_pipeline_worker_calls_enqueue_fanout_for_multi_url_post(conn):
 
     with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
          patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock, return_value=active_configs), \
-         patch("ahsoka.main._enqueue_fanout", new_callable=AsyncMock) as mock_fanout, \
          patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_single:
         await _run_pipeline_worker_with_one_post(post, conn, batch_queue, keyword_index)
 
-    mock_fanout.assert_called_once()
-    mock_single.assert_not_called()
+    mock_single.assert_called_once()
 
 
 async def test_pipeline_worker_duplicate_post_skipped(conn):
