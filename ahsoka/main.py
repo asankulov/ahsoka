@@ -21,7 +21,7 @@ from ahsoka.watcher.poller import channel_poller
 from ahsoka.pipeline.dedup import is_duplicate
 from ahsoka.pipeline.keyword_index import KeywordIndex
 from ahsoka.pipeline.user_filter import matches_user
-from ahsoka.pipeline.scraper import scrape_content, scrape_url
+from ahsoka.pipeline.scraper import scrape_content
 from ahsoka.pipeline.batch_queue import BatchQueue
 from ahsoka.pipeline.batch_submitter import BatchSubmitter
 from ahsoka.bot.commands import register_bot_commands, BOT_COMMANDS
@@ -147,10 +147,7 @@ async def pipeline_worker(
                 await db.mark_seen(conn, post.channel_id, post.message_id)
                 continue
 
-            if len(post.urls) >= 2:
-                await _enqueue_fanout(conn, batch_queue, post, active_configs, pyro)
-            else:
-                await _enqueue_single(conn, batch_queue, post, active_configs, pyro)
+            await _enqueue_single(conn, batch_queue, post, active_configs, pyro)
         except Exception:
             logger.exception("Pipeline error for %s/%s", post.channel_id, post.message_id)
         finally:
@@ -164,38 +161,31 @@ async def _enqueue_single(
     active_configs: list,
     pyro,
 ) -> None:
-    """Scrape content for a single-URL post, mark seen, and enqueue for scoring."""
+    """Claim the post as seen, then scrape content and enqueue for scoring.
+
+    Handles both single- and multi-URL posts uniformly: scrape_content()
+    fetches every non-tg URL in post.urls concurrently and combines them
+    with post.text in one pass, and the loop below resolves any tg-links.
+
+    mark_seen is called first (before any scraping) so that concurrent
+    pipeline_worker tasks racing on the same post agree on exactly one
+    winner via the seen_posts UNIQUE constraint, instead of both scraping
+    and both enqueuing duplicate custom_ids into the same batch. Because
+    the claim is a single atomic call for the whole post (not one claim
+    per URL), there is no way for two workers to each win a different
+    URL within the same post and both independently enqueue.
+    """
+    won = await db.mark_seen(conn, post.channel_id, post.message_id)
+    if not won:
+        logger.debug("Lost race, already claimed: %s/%s", post.channel_id, post.message_id)
+        return
     content = await scrape_content(post, timeout=settings.scrape_timeout_s)
     for url in post.urls:
         if is_tg_link(url):
             resolved = await resolve_tg_link(url, pyro)
             if resolved:
                 content += f"\n\n--- linked from {url} ---\n{resolved}"
-    await db.mark_seen(conn, post.channel_id, post.message_id)
     await batch_queue.enqueue(post, content, active_configs)
-
-
-async def _enqueue_fanout(
-    conn: aiosqlite.Connection,
-    batch_queue: BatchQueue,
-    post: Post,
-    active_configs: list,
-    pyro,
-) -> None:
-    """For multi-URL posts: one enqueue per URL, mark each as seen."""
-    for url in post.urls:
-        if await is_duplicate(conn, post, url=url):
-            logger.debug("Duplicate URL: %s/%s %s", post.channel_id, post.message_id, url)
-            continue
-        if is_tg_link(url):
-            resolved = await resolve_tg_link(url, pyro)
-            content = "\n\n".join(
-                filter(None, [post.text, resolved and f"--- linked from {url} ---\n{resolved}"])
-            )
-        else:
-            content = await scrape_url(url, post.text, timeout=settings.scrape_timeout_s)
-        await db.mark_seen(conn, post.channel_id, post.message_id, url=url)
-        await batch_queue.enqueue(post, content, active_configs)
 
 
 async def cleanup_worker(conn: aiosqlite.Connection) -> None:

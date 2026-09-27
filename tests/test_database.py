@@ -65,6 +65,21 @@ async def test_mark_seen_idempotent(conn):
     assert await is_seen(conn, 1, 1) is True
 
 
+async def test_mark_seen_returns_true_on_first_claim_false_on_second(conn):
+    """mark_seen's return value is the atomic claim signal, not just is_seen idempotency.
+
+    First call for a given (channel_id, message_id, url) key wins the INSERT
+    (cursor.rowcount > 0 -> True). A second call with the same key hits the
+    UNIQUE constraint, INSERT OR IGNORE inserts nothing, and rowcount is 0 ->
+    False. This is what pipeline_worker races on to arbitrate concurrent
+    claims on the same post.
+    """
+    won = await mark_seen(conn, 5, 9, url="https://example.com/job")
+    lost = await mark_seen(conn, 5, 9, url="https://example.com/job")
+    assert won is True
+    assert lost is False
+
+
 async def test_different_messages_tracked_independently(conn):
     await mark_seen(conn, 1, 1)
     assert await is_seen(conn, 1, 2) is False
