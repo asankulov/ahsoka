@@ -1176,6 +1176,7 @@ def _build_main_patches(fake_pyro, fake_bot, fake_settings, fake_dp, recovery_co
         patch("ahsoka.main.batch_worker", new_callable=AsyncMock),
         patch("ahsoka.main.cleanup_worker", new_callable=AsyncMock),
         patch("ahsoka.main.channel_poller", new_callable=AsyncMock),
+        patch("ahsoka.main.db.load_channel_names", new_callable=AsyncMock, return_value={}),
         patch("ahsoka.main.settings", fake_settings),
         patch("ahsoka.main._recover_pending_batches", recovery_coro),
     ]
@@ -1356,10 +1357,11 @@ async def test_main_starts_warm_task_and_passes_it_as_poller_ready():
     gathered: list = []
     _real_gather = asyncio.gather
 
-    async def fake_warm(client, channels):
+    async def fake_warm(client, channels, conn=None, channel_names=None, lost_channels=None):
         await asyncio.sleep(9999)  # pragma: no cover - cancelled before start
 
-    async def fake_poller(client, queue, channels, ready=None):
+    async def fake_poller(client, queue, channels, ready=None,
+                          lost_channels=None, channel_names=None):
         await asyncio.sleep(9999)  # pragma: no cover - cancelled before start
 
     async def capturing_gather(*tasks, **kwargs):
@@ -1373,9 +1375,12 @@ async def test_main_starts_warm_task_and_passes_it_as_poller_ready():
         return await _real_gather(*tasks, return_exceptions=True)
 
     snapshot: dict = {}
+    loaded_names = {-1001: "Chan [-1001]"}
     extra = [
         patch("ahsoka.main.warm_peer_cache", fake_warm),
         patch("ahsoka.main.channel_poller", fake_poller),
+        patch("ahsoka.main.db.load_channel_names", new_callable=AsyncMock,
+              return_value=loaded_names),
     ]
     with patch("ahsoka.main.asyncio.gather", side_effect=capturing_gather):
         async with _main_env(extra_patches=extra):
@@ -1386,3 +1391,10 @@ async def test_main_starts_warm_task_and_passes_it_as_poller_ready():
     assert "fake_warm" in by_name, "warm task missing from all_tasks"
     warm_task = by_name["fake_warm"]
     assert snapshot[by_name["fake_poller"]]["ready"] is warm_task
+    warm_locals = snapshot[warm_task]
+    poller_locals = snapshot[by_name["fake_poller"]]
+    assert warm_locals["lost_channels"] is poller_locals["lost_channels"]
+    assert warm_locals["channel_names"] is poller_locals["channel_names"]
+    assert warm_locals["channel_names"] is loaded_names
+    assert warm_locals["lost_channels"] == set()
+    assert warm_locals["conn"] is not None

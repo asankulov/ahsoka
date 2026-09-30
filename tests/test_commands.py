@@ -567,6 +567,34 @@ async def test_input_watch_adds_channel(conn, settings):
     assert -100999 in await load_watched_channels(conn)
 
 
+async def test_input_watch_persists_username_and_title(conn, settings):
+    from ahsoka.database import load_channel_names
+
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("")
+    chat = MagicMock()
+    chat.id = -100999
+    chat.title = "Job Channel"
+    chat.username = "jobchan"
+    msg.forward_from_chat = chat
+    await h["input_watch_channel"](msg, make_ctx())
+    assert (await load_channel_names(conn))[-100999] == "Job Channel (@jobchan) [-100999]"
+
+
+async def test_input_watch_private_channel_without_username_stores_title(conn, settings):
+    from ahsoka.database import load_channel_names
+
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("")
+    chat = MagicMock()
+    chat.id = -100998
+    chat.title = "Private Jobs"
+    chat.username = None
+    msg.forward_from_chat = chat
+    await h["input_watch_channel"](msg, make_ctx())
+    assert (await load_channel_names(conn))[-100998] == "Private Jobs [-100998]"
+
+
 async def test_input_watch_no_forward_replies_error(conn, settings):
     _, h, _ = setup_dp(conn, settings)
     msg = make_msg("not a forward")

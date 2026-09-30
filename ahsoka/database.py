@@ -50,7 +50,9 @@ CREATE TABLE IF NOT EXISTS user_config (
 CREATE TABLE IF NOT EXISTS watched_channels (
     channel_id  INTEGER PRIMARY KEY,
     added_by    INTEGER REFERENCES users(user_id),
-    added_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    added_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    username    TEXT,
+    title       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS user_notified (
@@ -210,6 +212,14 @@ async def init_db(conn: aiosqlite.Connection, owner_chat_id: int = 0) -> None:
     except aiosqlite.OperationalError:
         pass
 
+    # Add username/title columns to watched_channels if upgrading
+    for col in ("username", "title"):
+        try:
+            await conn.execute(f"ALTER TABLE watched_channels ADD COLUMN {col} TEXT")
+            await conn.commit()
+        except aiosqlite.OperationalError:
+            pass  # column already exists
+
     # Ensure owner exists as admin
     if owner_chat_id:
         await conn.execute(
@@ -241,14 +251,61 @@ async def load_watched_channels(conn: aiosqlite.Connection) -> set[int]:
     return {row[0] for row in rows}
 
 
+def format_channel_label(
+    channel_id: int, username: str | None = None, title: str | None = None
+) -> str:
+    """Return "Title (@username) [id]", dropping missing parts; id is always present."""
+    parts = []
+    if title:
+        parts.append(title)
+    if username:
+        parts.append(f"(@{username.lstrip('@')})")
+    if not parts:
+        return str(channel_id)
+    parts.append(f"[{channel_id}]")
+    return " ".join(parts)
+
+
 async def add_channel(
-    conn: aiosqlite.Connection, channel_id: int, added_by: int | None = None
+    conn: aiosqlite.Connection,
+    channel_id: int,
+    added_by: int | None = None,
+    username: str | None = None,
+    title: str | None = None,
 ) -> None:
     await conn.execute(
-        "INSERT OR IGNORE INTO watched_channels (channel_id, added_by) VALUES (?, ?)",
-        (channel_id, added_by),
+        "INSERT OR IGNORE INTO watched_channels (channel_id, added_by, username, title) "
+        "VALUES (?, ?, ?, ?)",
+        (channel_id, added_by, username, title),
     )
     await conn.commit()
+
+
+async def update_channel_names(
+    conn: aiosqlite.Connection,
+    names: dict[int, tuple[str | None, str | None]],
+) -> None:
+    """Persist (username, title) for watched channels. Rows with both None are skipped."""
+    rows = [
+        (username, title, channel_id)
+        for channel_id, (username, title) in names.items()
+        if username or title
+    ]
+    if rows:
+        await conn.executemany(
+            "UPDATE watched_channels SET username = ?, title = ? WHERE channel_id = ?",
+            rows,
+        )
+        await conn.commit()
+
+
+async def load_channel_names(conn: aiosqlite.Connection) -> dict[int, str]:
+    """Map channel_id -> display label for every watched channel."""
+    async with conn.execute(
+        "SELECT channel_id, username, title FROM watched_channels"
+    ) as cur:
+        rows = await cur.fetchall()
+    return {cid: format_channel_label(cid, username, title) for cid, username, title in rows}
 
 
 async def remove_channel(conn: aiosqlite.Connection, channel_id: int) -> None:
