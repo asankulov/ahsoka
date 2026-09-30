@@ -319,11 +319,22 @@ async def main() -> None:
 
     async with pyro:
         # Warm the peer cache in the background; the poller waits for it.
-        warm_task = asyncio.create_task(warm_peer_cache(pyro, watched_channels))
+        channel_names = await db.load_channel_names(conn)
+        lost_channels: set[int] = set()
+        warm_task = asyncio.create_task(
+            warm_peer_cache(pyro, watched_channels, conn, channel_names, lost_channels)
+        )
 
         polling = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
         poller = asyncio.create_task(
-            channel_poller(pyro, queue, watched_channels, ready=warm_task)
+            channel_poller(
+                pyro,
+                queue,
+                watched_channels,
+                ready=warm_task,
+                lost_channels=lost_channels,
+                channel_names=channel_names,
+            )
         )
         all_tasks = [polling, poller, warm_task, cleanup, batch_task, recovery_task, *workers]
         try:

@@ -5,6 +5,9 @@ import aiosqlite
 
 from ahsoka.database import (
     add_channel,
+    format_channel_label,
+    load_channel_names,
+    update_channel_names,
     ban_user,
     delete_old_posts,
     get_all_active_configs,
@@ -652,3 +655,85 @@ async def test_get_notified_posts_with_verdict_maps_score_reason_apply(conn):
     assert posts[0].score == 9
     assert posts[0].reason == "Solid match"
     assert posts[0].apply == "apply@co.com"
+
+
+# --- Channel names ---
+
+
+@pytest.mark.parametrize(
+    "username,title,expected",
+    [
+        ("jobs", "Jobs", "Jobs (@jobs) [-1001]"),
+        (None, "Jobs", "Jobs [-1001]"),
+        ("jobs", None, "(@jobs) [-1001]"),
+        (None, None, "-1001"),
+        ("@jobs", "Jobs", "Jobs (@jobs) [-1001]"),
+        ("", "", "-1001"),
+    ],
+)
+def test_format_channel_label(username, title, expected):
+    assert format_channel_label(-1001, username, title) == expected
+
+
+async def test_init_db_twice_is_idempotent_for_channel_columns(conn):
+    await init_db(conn, owner_chat_id=OWNER_ID)
+    await init_db(conn, owner_chat_id=OWNER_ID)
+    async with conn.execute("PRAGMA table_info(watched_channels)") as cur:
+        cols = [r[1] for r in await cur.fetchall()]
+    assert cols.count("username") == 1 and cols.count("title") == 1
+
+
+async def test_init_db_adds_name_columns_to_old_watched_channels_table():
+    async with aiosqlite.connect(":memory:") as c:
+        await c.execute(
+            "CREATE TABLE watched_channels ("
+            "channel_id INTEGER PRIMARY KEY, added_by INTEGER, "
+            "added_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        await c.execute("INSERT INTO watched_channels (channel_id) VALUES (-1001)")
+        await c.commit()
+
+        await init_db(c, owner_chat_id=OWNER_ID)
+
+        async with c.execute("PRAGMA table_info(watched_channels)") as cur:
+            cols = [r[1] for r in await cur.fetchall()]
+        assert "username" in cols and "title" in cols
+        assert await load_watched_channels(c) == {-1001}  # existing rows preserved
+        assert await load_channel_names(c) == {-1001: "-1001"}
+
+
+async def test_add_channel_stores_names(conn):
+    await add_channel(conn, -1001, added_by=OWNER_ID, username="jobs", title="Jobs")
+    assert await load_channel_names(conn) == {-1001: "Jobs (@jobs) [-1001]"}
+
+
+async def test_add_channel_without_names_loads_bare_id(conn):
+    await add_channel(conn, -1001)
+    assert await load_channel_names(conn) == {-1001: "-1001"}
+
+
+async def test_update_and_load_channel_names_round_trip(conn):
+    await add_channel(conn, -1001)
+    await add_channel(conn, -1002)
+    await update_channel_names(conn, {-1001: ("jobs", "Jobs"), -1002: (None, "Only Title")})
+    assert await load_channel_names(conn) == {
+        -1001: "Jobs (@jobs) [-1001]",
+        -1002: "Only Title [-1002]",
+    }
+
+
+async def test_update_channel_names_skips_entries_with_no_names(conn):
+    await add_channel(conn, -1001, username="jobs", title="Jobs")
+    await update_channel_names(conn, {-1001: (None, None)})
+    assert await load_channel_names(conn) == {-1001: "Jobs (@jobs) [-1001]"}
+
+
+async def test_update_channel_names_empty_is_noop(conn):
+    await add_channel(conn, -1001)
+    await update_channel_names(conn, {})
+    assert await load_channel_names(conn) == {-1001: "-1001"}
+
+
+async def test_update_channel_names_ignores_unwatched_channel(conn):
+    await update_channel_names(conn, {-9999: ("x", "X")})
+    assert await load_channel_names(conn) == {}

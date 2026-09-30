@@ -513,7 +513,13 @@ def register_bot_commands(
                 await pyro.join_chat(chat.username)
             except Exception:
                 pass  # may already be joined or private
-        await db.add_channel(conn, channel_id, added_by=_uid(message))
+        await db.add_channel(
+            conn,
+            channel_id,
+            added_by=_uid(message),
+            username=getattr(chat, "username", None),
+            title=getattr(chat, "title", None),
+        )
         watched_channels.add(channel_id)
         await message.reply(f"Now watching: {chat.title or channel_id}")
 

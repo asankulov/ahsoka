@@ -900,9 +900,10 @@ async def test_warm_peer_cache_logs_member_and_not_member(caplog):
         await warm_peer_cache(client, {-1001, -1002})
 
     info = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
-    warn = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    err = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
     assert any("Confirmed member of" in m and "-1001" in m for m in info)
-    assert any("NOT a member" in m and "-1002" in m and "-1001" not in m for m in warn)
+    assert len(err) == 1
+    assert "NOT a member" in err[0] and "-1002" in err[0] and "-1001" not in err[0]
 
 
 async def test_warm_peer_cache_all_joined_logs_no_warning(caplog):
@@ -958,7 +959,9 @@ class _PollerHarness:
     outcomes consumed per fetch; the last outcome repeats.
     """
 
-    def __init__(self, script, sweeps):
+    def __init__(self, script, sweeps, lost_channels=None, channel_names=None):
+        self.lost_channels = lost_channels
+        self.channel_names = channel_names
         self.script = {c: list(s) for c, s in script.items()}
         self.sweeps = sweeps
         self.offset = 0.0
@@ -974,6 +977,8 @@ class _PollerHarness:
         outcome = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
         if outcome == "fail":
             raise RuntimeError("Peer id invalid")
+        if isinstance(outcome, Exception):
+            raise outcome
         yield f"msg-{channel_id}"
 
     async def _sleep(self, seconds):
@@ -997,7 +1002,9 @@ class _PollerHarness:
                  patch("ahsoka.watcher.poller.logger") as mock_logger:
                 try:
                     await channel_poller(
-                        self.client, self.queue, set(self.script), ready=ready
+                        self.client, self.queue, set(self.script), ready=ready,
+                        lost_channels=self.lost_channels,
+                        channel_names=self.channel_names,
                     )
                 except asyncio.CancelledError:
                     pass
@@ -1211,3 +1218,282 @@ async def test_channel_poller_success_resets_failure_count_and_traceback_logging
     # failures #1 (before reset) and the first failure after reset both carry tracebacks
     assert len(with_tb) == 2
     assert h.queue.qsize() == 1
+
+
+# ---------------------------------------------------------------------------
+# warm_peer_cache: names, lost-channel seeding, aggregated alert
+# ---------------------------------------------------------------------------
+
+
+def _named_dialogs_client(chats):
+    """chats: list of (id, username, title)."""
+    async def get_dialogs():
+        for cid, username, title in chats:
+            yield MagicMock(chat=MagicMock(id=cid, username=username, title=title))
+
+    client = MagicMock()
+    client.get_dialogs = get_dialogs
+    return client
+
+
+async def test_warm_peer_cache_persists_names_and_refreshes_channel_names():
+    from ahsoka.watcher.client import warm_peer_cache
+
+    client = _named_dialogs_client([(-1001, "jobs", "Jobs"), (-1009, "x", "Unwatched")])
+    conn = MagicMock()
+    channel_names = {-1001: "-1001-old"}
+    with patch("ahsoka.watcher.client.db.update_channel_names", new_callable=AsyncMock) as upd:
+        await warm_peer_cache(client, {-1001}, conn, channel_names, set())
+
+    upd.assert_awaited_once_with(conn, {-1001: ("jobs", "Jobs")})
+    assert channel_names == {-1001: "Jobs (@jobs) [-1001]"}
+
+
+async def test_warm_peer_cache_names_end_to_end_real_db():
+    import aiosqlite
+    from ahsoka import database as db
+    from ahsoka.watcher.client import warm_peer_cache
+
+    async with aiosqlite.connect(":memory:") as conn:
+        await db.init_db(conn)
+        await db.add_channel(conn, -1001)
+        names = await db.load_channel_names(conn)
+        assert names == {-1001: "-1001"}
+        await warm_peer_cache(_named_dialogs_client([(-1001, "jobs", "Jobs")]),
+                              {-1001}, conn, names, set())
+        assert await db.load_channel_names(conn) == {-1001: "Jobs (@jobs) [-1001]"}
+
+
+async def test_warm_peer_cache_not_joined_seeds_lost_and_one_aggregated_error(caplog):
+    from ahsoka.watcher.client import warm_peer_cache
+
+    client = _named_dialogs_client([(-1001, "jobs", "Jobs")])
+    lost: set[int] = set()
+    names = {-1002: "Gone (@gone) [-1002]"}
+    with caplog.at_level("INFO", logger="ahsoka.watcher.client"):
+        await warm_peer_cache(client, {-1001, -1002, -1003}, None, names, lost)
+
+    assert lost == {-1002, -1003}
+    errs = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errs) == 1
+    msg = errs[0].getMessage()
+    assert "NOT a member of 2 watched channel(s)" in msg
+    assert "Gone (@gone) [-1002]" in msg  # pre-loaded label used
+    assert "-1003" in msg  # no stored name -> bare id
+    assert "-1001" not in msg
+
+
+async def test_warm_peer_cache_persist_failure_warns_and_continues(caplog):
+    from ahsoka.watcher.client import warm_peer_cache
+
+    client = _named_dialogs_client([(-1001, "jobs", "Jobs")])
+    names: dict[int, str] = {}
+    with patch("ahsoka.watcher.client.db.update_channel_names",
+               new_callable=AsyncMock, side_effect=RuntimeError("db locked")):
+        with caplog.at_level("INFO", logger="ahsoka.watcher.client"):
+            await warm_peer_cache(client, {-1001, -1002}, MagicMock(), names, set())
+
+    warns = [r for r in caplog.records if "persist channel names" in r.getMessage()]
+    assert len(warns) == 1 and warns[0].levelname == "WARNING"
+    assert names[-1001] == "Jobs (@jobs) [-1001]"  # refresh still happened
+    assert [r for r in caplog.records if r.levelname == "ERROR"]  # alert still fired
+
+
+async def test_warm_peer_cache_get_dialogs_failure_seeds_nothing(caplog):
+    from ahsoka.watcher.client import warm_peer_cache
+
+    async def boom():
+        raise RuntimeError("FLOOD_WAIT")
+        yield  # pragma: no cover
+
+    client = MagicMock()
+    client.get_dialogs = boom
+    lost: set[int] = set()
+    with caplog.at_level("INFO", logger="ahsoka.watcher.client"):
+        await warm_peer_cache(client, {-1001}, MagicMock(), {}, lost)
+
+    assert lost == set()
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    assert [r for r in caplog.records if r.levelname == "WARNING" and r.exc_info]
+
+
+async def test_warm_peer_cache_old_call_form_still_works(caplog):
+    from ahsoka.watcher.client import warm_peer_cache
+
+    with caplog.at_level("INFO", logger="ahsoka.watcher.client"):
+        await warm_peer_cache(_named_dialogs_client([(-1001, "a", "A")]), {-1001, -1002})
+
+    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# channel_poller: access-loss alerting
+# ---------------------------------------------------------------------------
+
+
+def _access_errors():
+    from pyrogram.errors import ChannelBanned, ChannelInvalid, ChannelPrivate
+
+    return [ChannelPrivate(), ChannelBanned(), ChannelInvalid()]
+
+
+def _errors(logger_mock):
+    return logger_mock.error.call_args_list
+
+
+async def test_channel_poller_three_access_lost_errors_alert_once_with_label():
+    errs = _access_errors()
+    lost: set[int] = set()
+    h = _PollerHarness({-1001: errs + [errs[0]]}, sweeps=8, lost_channels=lost,
+                       channel_names={-1001: "Jobs (@jobs) [-1001]"})
+    # ensure enough sweeps for retries with backoff (60, 120, 240, ...)
+    h.sweeps = 12
+    logger_mock = await h.run()
+
+    calls = _errors(logger_mock)
+    assert len(calls) == 1
+    assert calls[0].args[1] == "Jobs (@jobs) [-1001]"
+    assert calls[0].args[2] == type(errs[2]).__name__  # the 3rd (threshold) error
+    assert lost == {-1001}
+
+
+@pytest.mark.parametrize("idx", [0, 1, 2])
+async def test_channel_poller_each_access_error_type_counts(idx):
+    err = _access_errors()[idx]
+    lost: set[int] = set()
+    h = _PollerHarness({-1001: [err]}, sweeps=6, lost_channels=lost)
+    logger_mock = await h.run()
+
+    assert lost == {-1001}
+    assert len(_errors(logger_mock)) == 1
+
+
+async def test_channel_poller_two_access_failures_do_not_alert():
+    lost: set[int] = set()
+    h = _PollerHarness({-1001: _access_errors()[:2] + ["ok"]}, sweeps=4, lost_channels=lost)
+    logger_mock = await h.run()
+
+    assert _errors(logger_mock) == []
+    assert lost == set()
+    assert len(h.fetches) == 3
+
+
+async def test_channel_poller_non_access_errors_never_mark_lost():
+    lost: set[int] = set()
+    h = _PollerHarness({-1001: [RuntimeError("net")]}, sweeps=8, lost_channels=lost)
+    logger_mock = await h.run()
+
+    assert len(h.fetches) >= 4
+    assert _errors(logger_mock) == []
+    assert lost == set()
+
+
+async def test_channel_poller_success_between_resets_streak():
+    from pyrogram.errors import ChannelPrivate
+
+    lost: set[int] = set()
+    script = [ChannelPrivate(), ChannelPrivate(), "ok", ChannelPrivate(), ChannelPrivate(), "ok"]
+    h = _PollerHarness({-1001: script}, sweeps=10, lost_channels=lost)
+    logger_mock = await h.run()
+
+    assert len(h.fetches) >= 6
+    assert _errors(logger_mock) == []
+    assert lost == set()
+
+
+async def test_channel_poller_non_access_error_neither_counts_nor_resets():
+    from pyrogram.errors import ChannelPrivate
+
+    lost: set[int] = set()
+    script = [ChannelPrivate(), ChannelPrivate(), RuntimeError("net"), ChannelPrivate()]
+    h = _PollerHarness({-1001: script}, sweeps=10, lost_channels=lost)
+    logger_mock = await h.run()
+
+    # 2 access + (non-access ignored) + 1 access = 3 -> alert; if the RuntimeError
+    # had reset the streak, no alert; if it counted, it would have alerted earlier.
+    assert len(_errors(logger_mock)) == 1
+    assert lost == {-1001}
+    assert h.fetches[3][1] == -1001 and len(h.fetches) >= 4
+
+
+async def test_channel_poller_non_access_error_does_not_trigger_alert_early():
+    from pyrogram.errors import ChannelPrivate
+
+    lost: set[int] = set()
+    script = [ChannelPrivate(), RuntimeError("net"), RuntimeError("net"), "ok"]
+    h = _PollerHarness({-1001: script}, sweeps=6, lost_channels=lost)
+    logger_mock = await h.run()
+
+    assert _errors(logger_mock) == []
+    assert lost == set()
+
+
+async def test_channel_poller_already_lost_no_repeat_error_no_exc_info():
+    from pyrogram.errors import ChannelPrivate
+
+    lost: set[int] = set()
+    h = _PollerHarness({-1001: [ChannelPrivate()]}, sweeps=10, lost_channels=lost,
+                       channel_names={-1001: "Jobs [-1001]"})
+    logger_mock = await h.run()
+
+    assert len(h.fetches) >= 4
+    assert len(_errors(logger_mock)) == 1  # only the threshold alert
+    probes = [c for c in logger_mock.info.call_args_list
+              if "Poll probe failed for lost channel" in c.args[0]]
+    assert probes, "expected INFO probe lines after the alert"
+    assert probes[0].args[1] == "Jobs [-1001]"
+    for c in probes:
+        assert not c.kwargs.get("exc_info")
+    # only the two pre-threshold failures warn; nothing after the alert does
+    assert len(logger_mock.warning.call_args_list) == 2
+
+
+async def test_channel_poller_startup_seeded_lost_first_failure_no_traceback():
+    lost = {-1001}
+    h = _PollerHarness({-1001: [RuntimeError("Peer id invalid")]}, sweeps=1,
+                       lost_channels=lost, channel_names={-1001: "Jobs [-1001]"})
+    logger_mock = await h.run()
+
+    assert _errors(logger_mock) == []
+    assert logger_mock.warning.call_args_list == []
+    probes = [c for c in logger_mock.info.call_args_list
+              if "Poll probe failed for lost channel" in c.args[0]]
+    assert len(probes) == 1
+    assert not probes[0].kwargs.get("exc_info")
+
+
+async def test_channel_poller_non_lost_first_failure_still_warns_with_traceback():
+    h = _PollerHarness({-1001: ["fail"]}, sweeps=1, lost_channels=set())
+    logger_mock = await h.run()
+
+    warns = logger_mock.warning.call_args_list
+    assert len(warns) == 1 and warns[0].kwargs.get("exc_info") is True
+
+
+async def test_channel_poller_success_on_lost_clears_logs_info_and_realerts_later():
+    from pyrogram.errors import ChannelPrivate
+
+    lost: set[int] = set()
+    script = [ChannelPrivate()] * 3 + ["ok"] + [ChannelPrivate()] * 3
+    h = _PollerHarness({-1001: script}, sweeps=14, lost_channels=lost,
+                       channel_names={-1001: "Jobs [-1001]"})
+    logger_mock = await h.run()
+
+    restored = [c for c in logger_mock.info.call_args_list
+                if "Access restored" in c.args[0]]
+    assert len(restored) == 1
+    assert restored[0].args[1] == "Jobs [-1001]"
+    assert len(_errors(logger_mock)) == 2  # loss, then loss again after recovery
+    assert lost == {-1001}
+
+
+async def test_channel_poller_success_on_seeded_lost_channel_restores():
+    lost = {-1001}
+    h = _PollerHarness({-1001: ["ok"]}, sweeps=1, lost_channels=lost)
+    logger_mock = await h.run()
+
+    assert lost == set()
+    assert any("Access restored" in c.args[0] for c in logger_mock.info.call_args_list)
+    # no names given -> bare id label
+    restored = [c for c in logger_mock.info.call_args_list if "Access restored" in c.args[0]]
+    assert restored[0].args[1] == "-1001"
