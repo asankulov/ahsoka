@@ -15,7 +15,7 @@ ahsoka/
 ├── uv.lock
 ├── .github/
 │   └── workflows/
-│       └── deploy.yml        # CI/CD: test on PR, deploy to Hetzner on main
+│       └── deploy.yml        # CI/CD: test on PR, deploy to Hetzner on main push or manual dispatch
 ├── ahsoka/
 │   ├── main.py               # entry point: both clients + workers on one event loop
 │   ├── config.py             # pydantic-settings Settings singleton
@@ -334,12 +334,25 @@ If you see `batch exceeded max_wait_seconds` warnings, the Anthropic batch queue
 
 ## CI/CD (.github/workflows/deploy.yml)
 
-Triggers on every push to `main`:
+Triggers: push to `main` (only when `ahsoka/**`, `pyproject.toml`, `uv.lock` or `deploy.yml` change), PRs, and manual `workflow_dispatch`:
 1. **Test job**: `uv sync --locked` → `pytest`
-2. **Deploy job** (only on `main` push, after tests pass):
+2. **Deploy job** (after tests pass; on `main` push, or on `workflow_dispatch` from a branch whose own `deploy.yml` has the new condition):
    - rsync source to server (excludes `.env`, `*.session`, `ahsoka.db`, `.venv`)
    - `uv sync --locked` on server
    - `systemctl restart ahsoka`
+
+**Deploying a branch for live testing** (manual only; pushes to non-main branches never deploy):
+1. Merge the `deploy.yml` change to `main`.
+2. Merge/rebase `main` into the target branch (e.g. `fix/pyrogram-large-channel-ids`, whose `deploy.yml` still has the old `if:`) and push.
+3. `gh workflow run deploy.yml --ref <branch>`
+
+A branch can only be deployed if its own copy of `deploy.yml` contains the new condition: dispatch runs the workflow file from the ref, otherwise tests run and deploy is skipped.
+
+Caveats:
+- There is a single production server and no staging; a branch deploy replaces the live bot.
+- **Rollback**: `gh workflow run deploy.yml --ref main` (rsync `--delete` + `uv sync --locked`) restores code and venv only. `ahsoka.db` is excluded from rsync, so migrations/data applied by the branch's `init_db()` persist.
+- A later push to `main` that touches the trigger paths overwrites a branch deploy; a docs-only push does not.
+- Before deploying dependency changes (e.g. a Pyrogram/Kurigram swap), back up the `*.session` file **and `ahsoka.db`** on the server. Sessions are excluded from rsync, but the new library could alter the session format.
 
 **Required GitHub secrets**:
 | Secret | Value |
