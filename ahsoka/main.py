@@ -15,7 +15,7 @@ from aiogram import Bot, Dispatcher
 from ahsoka import database as db
 from ahsoka.config import settings
 from ahsoka.models import Post, PersonalizedVerdict
-from ahsoka.watcher.client import build_pyrogram_client
+from ahsoka.watcher.client import build_pyrogram_client, warm_peer_cache
 from ahsoka.watcher.handler import register_watcher_handlers
 from ahsoka.watcher.poller import channel_poller
 from ahsoka.pipeline.dedup import is_duplicate
@@ -318,20 +318,14 @@ async def main() -> None:
     cleanup = asyncio.create_task(cleanup_worker(conn))
 
     async with pyro:
-        # Log which of the watched channels the user account is actually joined to
-        joined: list[int] = []
-        async for dialog in pyro.get_dialogs():
-            if dialog.chat.id in watched_channels:
-                joined.append(dialog.chat.id)
-        not_joined = watched_channels - set(joined)
-        if joined:
-            logger.info("Confirmed member of: %s", joined)
-        if not_joined:
-            logger.warning("NOT a member of (won't receive updates): %s", not_joined)
+        # Warm the peer cache in the background; the poller waits for it.
+        warm_task = asyncio.create_task(warm_peer_cache(pyro, watched_channels))
 
         polling = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
-        poller = asyncio.create_task(channel_poller(pyro, queue, watched_channels))
-        all_tasks = [polling, poller, cleanup, batch_task, recovery_task, *workers]
+        poller = asyncio.create_task(
+            channel_poller(pyro, queue, watched_channels, ready=warm_task)
+        )
+        all_tasks = [polling, poller, warm_task, cleanup, batch_task, recovery_task, *workers]
         try:
             await asyncio.gather(*all_tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):
