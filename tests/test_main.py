@@ -1344,3 +1344,45 @@ async def test_main_start_polling_not_blocked_by_recovery():
         "recovery_finished=True before dp.start_polling fired — "
         "_recover_pending_batches appears to have been awaited directly, blocking polling."
     )
+
+
+async def test_main_starts_warm_task_and_passes_it_as_poller_ready():
+    """main() runs warm_peer_cache as a task, adds it to gather, and hands it to
+    channel_poller as `ready` so the first sweep waits for the peer cache.
+
+    gather cancels the tasks before they start, so we inspect the unstarted
+    coroutines' bound arguments (cr_frame.f_locals) instead of call records.
+    """
+    gathered: list = []
+    _real_gather = asyncio.gather
+
+    async def fake_warm(client, channels):
+        await asyncio.sleep(9999)  # pragma: no cover - cancelled before start
+
+    async def fake_poller(client, queue, channels, ready=None):
+        await asyncio.sleep(9999)  # pragma: no cover - cancelled before start
+
+    async def capturing_gather(*tasks, **kwargs):
+        gathered.extend(tasks)
+        coros = {t: t.get_coro() for t in tasks if hasattr(t, "get_coro")}
+        snapshot.update({t: dict(c.cr_frame.f_locals) for t, c in coros.items()
+                         if getattr(c, "cr_frame", None)})
+        for t in tasks:
+            if hasattr(t, "cancel"):
+                t.cancel()
+        return await _real_gather(*tasks, return_exceptions=True)
+
+    snapshot: dict = {}
+    extra = [
+        patch("ahsoka.main.warm_peer_cache", fake_warm),
+        patch("ahsoka.main.channel_poller", fake_poller),
+    ]
+    with patch("ahsoka.main.asyncio.gather", side_effect=capturing_gather):
+        async with _main_env(extra_patches=extra):
+            for _ in range(10):
+                await asyncio.sleep(0)
+
+    by_name = {t.get_coro().__name__: t for t in gathered if hasattr(t, "get_coro")}
+    assert "fake_warm" in by_name, "warm task missing from all_tasks"
+    warm_task = by_name["fake_warm"]
+    assert snapshot[by_name["fake_poller"]]["ready"] is warm_task

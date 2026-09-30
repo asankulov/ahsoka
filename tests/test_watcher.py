@@ -824,3 +824,390 @@ def test_build_pyrogram_client_passes_settings_to_client():
         api_hash="abc123",
     )
     assert result is mock_client_class.return_value
+
+
+# ---------------------------------------------------------------------------
+# patch_pyrogram_channel_id_limit
+# ---------------------------------------------------------------------------
+# pyrogram is imported inside each (async) test: its import calls
+# asyncio.get_event_loop(), which needs a running loop on Python 3.12+.
+# monkeypatch restores MIN_CHANNEL_ID so other tests are unaffected.
+
+LARGE_CHANNEL_ID = -1002341925485
+OLD_CHANNEL_ID = -1001904490423
+PATCHED_MIN = -1007852516352
+
+
+async def test_patch_channel_id_limit_fixes_large_channel_peer_type(monkeypatch):
+    import pyrogram.utils as pu
+    from ahsoka.watcher.client import patch_pyrogram_channel_id_limit
+
+    # Ensure a known pre-patch state (the 32-bit cap) and restore afterwards.
+    monkeypatch.setattr(pu, "MIN_CHANNEL_ID", -1002147483647)
+    with pytest.raises(ValueError):
+        pu.get_peer_type(LARGE_CHANNEL_ID)
+
+    patch_pyrogram_channel_id_limit()
+
+    assert pu.get_peer_type(LARGE_CHANNEL_ID) == "channel"
+    assert pu.get_peer_type(OLD_CHANNEL_ID) == "channel"
+
+
+async def test_patch_channel_id_limit_is_idempotent(monkeypatch):
+    import pyrogram.utils as pu
+    from ahsoka.watcher.client import patch_pyrogram_channel_id_limit
+
+    monkeypatch.setattr(pu, "MIN_CHANNEL_ID", pu.MIN_CHANNEL_ID)
+    patch_pyrogram_channel_id_limit()
+    patch_pyrogram_channel_id_limit()
+
+    assert pu.MIN_CHANNEL_ID == PATCHED_MIN
+
+
+async def test_build_pyrogram_client_applies_channel_id_patch(monkeypatch):
+    import pyrogram.utils as pu
+    from ahsoka.watcher.client import build_pyrogram_client
+
+    monkeypatch.setattr(pu, "MIN_CHANNEL_ID", -1002147483647)
+    settings = MagicMock(session_name="s", telegram_api_id=1, telegram_api_hash="h")
+
+    with patch("ahsoka.watcher.client.Client"):
+        build_pyrogram_client(settings)
+
+    assert pu.MIN_CHANNEL_ID == PATCHED_MIN
+
+
+# ---------------------------------------------------------------------------
+# warm_peer_cache
+# ---------------------------------------------------------------------------
+
+
+def _dialogs_client(chat_ids):
+    async def get_dialogs():
+        for cid in chat_ids:
+            yield MagicMock(chat=MagicMock(id=cid))
+
+    client = MagicMock()
+    client.get_dialogs = get_dialogs
+    return client
+
+
+async def test_warm_peer_cache_logs_member_and_not_member(caplog):
+    from ahsoka.watcher.client import warm_peer_cache
+
+    client = _dialogs_client([-1001, -1009])  # -1009 is not watched
+    with caplog.at_level("INFO", logger="ahsoka.watcher.client"):
+        await warm_peer_cache(client, {-1001, -1002})
+
+    info = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    warn = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("Confirmed member of" in m and "-1001" in m for m in info)
+    assert any("NOT a member" in m and "-1002" in m and "-1001" not in m for m in warn)
+
+
+async def test_warm_peer_cache_all_joined_logs_no_warning(caplog):
+    from ahsoka.watcher.client import warm_peer_cache
+
+    with caplog.at_level("INFO", logger="ahsoka.watcher.client"):
+        await warm_peer_cache(_dialogs_client([-1001]), {-1001})
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+async def test_warm_peer_cache_none_joined_logs_no_confirmation(caplog):
+    from ahsoka.watcher.client import warm_peer_cache
+
+    with caplog.at_level("INFO", logger="ahsoka.watcher.client"):
+        await warm_peer_cache(_dialogs_client([]), {-1001})
+
+    assert not [r for r in caplog.records if "Confirmed" in r.getMessage()]
+    assert [r for r in caplog.records if "NOT a member" in r.getMessage()]
+
+
+async def test_warm_peer_cache_swallows_error_and_logs_warning_with_exc_info(caplog):
+    from ahsoka.watcher.client import warm_peer_cache
+
+    async def boom():
+        raise RuntimeError("FLOOD_WAIT")
+        yield  # pragma: no cover - makes this an async generator
+
+    client = MagicMock()
+    client.get_dialogs = boom
+
+    with caplog.at_level("INFO", logger="ahsoka.watcher.client"):
+        await warm_peer_cache(client, {-1001})  # must not raise
+
+    recs = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(recs) == 1
+    assert "warm-up failed" in recs[0].getMessage()
+    assert recs[0].exc_info is not None
+
+
+# ---------------------------------------------------------------------------
+# channel_poller: ready gate + per-channel backoff
+# ---------------------------------------------------------------------------
+
+_real_sleep = asyncio.sleep
+
+
+class _PollerHarness:
+    """
+    Drives channel_poller on a virtual clock. Patched sleep advances `offset`,
+    loop.time() is shifted by `offset`, and fetch attempts are recorded as
+    (virtual_time, channel_id). `script[channel_id]` is a list of "ok"/"fail"
+    outcomes consumed per fetch; the last outcome repeats.
+    """
+
+    def __init__(self, script, sweeps):
+        self.script = {c: list(s) for c, s in script.items()}
+        self.sweeps = sweeps
+        self.offset = 0.0
+        self.fetches: list[tuple[float, int]] = []
+        self.sleeps: list[float] = []
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.client = MagicMock()
+        self.client.get_chat_history = self._history
+
+    async def _history(self, channel_id, limit):
+        self.fetches.append((self.offset, channel_id))
+        outcomes = self.script[channel_id]
+        outcome = outcomes.pop(0) if len(outcomes) > 1 else outcomes[0]
+        if outcome == "fail":
+            raise RuntimeError("Peer id invalid")
+        yield f"msg-{channel_id}"
+
+    async def _sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.offset += seconds
+        if len(self.sleeps) > self.sweeps:  # sleeps[0] is the startup delay
+            raise asyncio.CancelledError
+
+    def times_for(self, channel_id):
+        return [t for t, c in self.fetches if c == channel_id]
+
+    async def run(self, ready=None):
+        from ahsoka.watcher.poller import channel_poller
+
+        loop = asyncio.get_running_loop()
+        real_time = loop.time
+        loop.time = lambda: real_time() + self.offset  # type: ignore[method-assign]
+        try:
+            with patch("ahsoka.watcher.poller.asyncio.sleep", side_effect=self._sleep), \
+                 patch("ahsoka.watcher.poller.Post.from_message", side_effect=lambda m: m), \
+                 patch("ahsoka.watcher.poller.logger") as mock_logger:
+                try:
+                    await channel_poller(
+                        self.client, self.queue, set(self.script), ready=ready
+                    )
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            del loop.time  # drop instance override, restore the bound method
+        return mock_logger
+
+
+async def test_channel_poller_waits_for_ready_before_first_sweep():
+    from ahsoka.watcher.poller import channel_poller
+
+    h = _PollerHarness({-1001: ["ok"]}, sweeps=1)
+    ready = asyncio.get_running_loop().create_future()
+
+    with patch("ahsoka.watcher.poller.asyncio.sleep", side_effect=h._sleep), \
+         patch("ahsoka.watcher.poller.Post.from_message", side_effect=lambda m: m):
+        task = asyncio.create_task(channel_poller(h.client, h.queue, {-1001}, ready=ready))
+        for _ in range(10):
+            await _real_sleep(0)
+        assert h.fetches == []  # still gated on ready
+        assert not task.done()
+
+        ready.set_result(None)
+        try:
+            await asyncio.wait_for(task, 1)
+        except asyncio.CancelledError:
+            pass
+
+    assert len(h.fetches) == 1
+    assert h.queue.qsize() == 1
+
+
+async def test_channel_poller_sweeps_even_if_ready_failed():
+    h = _PollerHarness({-1001: ["ok"]}, sweeps=1)
+    ready = asyncio.get_running_loop().create_future()
+    ready.set_exception(RuntimeError("warm-up blew up"))
+
+    await h.run(ready=ready)
+
+    assert len(h.fetches) == 1
+    assert h.queue.qsize() == 1
+    ready.exception()  # mark retrieved
+
+
+def _timeout_warnings(logger_mock):
+    return [
+        c for c in logger_mock.warning.call_args_list
+        if "warm-up still running" in c.args[0]
+    ]
+
+
+async def test_channel_poller_ready_timeout_warns_once_and_still_sweeps():
+    h = _PollerHarness({-1001: ["ok"]}, sweeps=2)
+    ready = asyncio.get_running_loop().create_future()  # never completes
+
+    with patch("ahsoka.watcher.poller.READY_TIMEOUT", 0.05):
+        logger_mock = await h.run(ready=ready)
+
+    warnings = _timeout_warnings(logger_mock)
+    assert len(warnings) == 1
+    assert warnings[0].args[1] == 0  # int(0.05) formatted into the message
+    assert len(h.fetches) == 2  # sweeps continued after the timeout
+    assert h.queue.qsize() == 2
+
+
+async def test_channel_poller_ready_timeout_does_not_cancel_ready():
+    h = _PollerHarness({-1001: ["ok"]}, sweeps=1)
+    ready = asyncio.get_running_loop().create_future()
+
+    with patch("ahsoka.watcher.poller.READY_TIMEOUT", 0.05):
+        await h.run(ready=ready)
+
+    assert len(h.fetches) == 1
+    assert not ready.done()
+    assert not ready.cancelled()
+    ready.cancel()  # cleanup
+
+
+async def test_channel_poller_ready_timeout_leaves_real_task_running():
+    h = _PollerHarness({-1001: ["ok"]}, sweeps=1)
+    release = asyncio.Event()
+    warm = asyncio.create_task(release.wait())
+
+    with patch("ahsoka.watcher.poller.READY_TIMEOUT", 0.05):
+        await h.run(ready=warm)
+
+    assert len(h.fetches) == 1
+    assert not warm.done()
+    release.set()
+    await warm
+
+
+async def test_channel_poller_ready_completes_before_timeout_no_warning():
+    h = _PollerHarness({-1001: ["ok"]}, sweeps=1)
+    ready = asyncio.get_running_loop().create_future()
+    ready.set_result(None)
+
+    with patch("ahsoka.watcher.poller.READY_TIMEOUT", 5.0):
+        logger_mock = await h.run(ready=ready)
+
+    assert _timeout_warnings(logger_mock) == []
+    assert len(h.fetches) == 1
+
+
+async def test_channel_poller_ready_failed_before_timeout_no_warning():
+    h = _PollerHarness({-1001: ["ok"]}, sweeps=1)
+    ready = asyncio.get_running_loop().create_future()
+    ready.set_exception(RuntimeError("warm-up blew up"))
+
+    with patch("ahsoka.watcher.poller.READY_TIMEOUT", 5.0):
+        logger_mock = await h.run(ready=ready)
+
+    assert _timeout_warnings(logger_mock) == []
+    assert len(h.fetches) == 1
+    ready.exception()  # mark retrieved
+
+
+async def test_channel_poller_ready_none_skips_wait_and_warning():
+    h = _PollerHarness({-1001: ["ok"]}, sweeps=1)
+
+    with patch("ahsoka.watcher.poller.asyncio.wait") as mock_wait:
+        logger_mock = await h.run(ready=None)
+
+    mock_wait.assert_not_called()
+    assert _timeout_warnings(logger_mock) == []
+    assert len(h.fetches) == 1
+
+
+async def test_channel_poller_ready_wait_uses_ready_timeout_value():
+    h = _PollerHarness({-1001: ["ok"]}, sweeps=1)
+    ready = asyncio.get_running_loop().create_future()
+    ready.set_result(None)
+
+    real_wait = asyncio.wait
+    seen = {}
+
+    async def spy(fs, timeout=None):
+        seen["timeout"] = timeout
+        return await real_wait(fs, timeout=timeout)
+
+    with patch("ahsoka.watcher.poller.READY_TIMEOUT", 7.5), \
+         patch("ahsoka.watcher.poller.asyncio.wait", side_effect=spy):
+        await h.run(ready=ready)
+
+    assert seen["timeout"] == 7.5
+
+
+async def test_channel_poller_first_failure_logs_exc_info_and_uses_base_delay():
+    h = _PollerHarness({-1001: ["fail"]}, sweeps=3)
+
+    logger_mock = await h.run()
+
+    first = logger_mock.warning.call_args_list[0]
+    assert first.kwargs.get("exc_info") is True
+    # sweep 1 fails at t=10, retried at t=70 (POLL_INTERVAL == 60), not earlier
+    assert h.times_for(-1001)[:2] == [10.0, 70.0]
+
+
+async def test_channel_poller_backoff_doubles_and_caps_at_max():
+    from ahsoka.watcher.poller import MAX_BACKOFF, POLL_INTERVAL
+
+    h = _PollerHarness({-1001: ["fail"]}, sweeps=60)
+
+    logger_mock = await h.run()
+
+    times = h.times_for(-1001)
+    deltas = [b - a for a, b in zip(times, times[1:])]
+    assert deltas[:4] == [POLL_INTERVAL, 120.0, 240.0, 480.0]
+    assert deltas[4:] and all(d == MAX_BACKOFF for d in deltas[4:])
+    # later failures: one-line warning without traceback
+    later = logger_mock.warning.call_args_list[1:]
+    assert later
+    assert all("exc_info" not in c.kwargs for c in later)
+
+
+async def test_channel_poller_channel_in_backoff_is_skipped():
+    h = _PollerHarness({-1001: ["fail"]}, sweeps=3)
+
+    await h.run()
+
+    # Sweeps ran at t=10, 70, 130; the second failure sets a 120s backoff, so
+    # the third sweep at t=130 must NOT fetch.
+    assert h.times_for(-1001) == [10.0, 70.0]
+
+
+async def test_channel_poller_failing_channel_does_not_block_others():
+    h = _PollerHarness({-1001: ["fail"], -1002: ["ok"]}, sweeps=3)
+
+    await h.run()
+
+    assert len(h.times_for(-1002)) == 3  # polled every sweep
+    assert len(h.times_for(-1001)) == 2  # failed, backed off
+    assert h.queue.qsize() == 3
+    items = []
+    while not h.queue.empty():
+        items.append(h.queue.get_nowait())
+    assert set(items) == {"msg--1002"}
+
+
+async def test_channel_poller_success_resets_failure_count_and_traceback_logging():
+    # fail, fail, ok, fail: after the success the next failure is "first" again.
+    h = _PollerHarness({-1001: ["fail", "fail", "ok", "fail"]}, sweeps=12)
+
+    logger_mock = await h.run()
+
+    times = h.times_for(-1001)
+    # t=10 fail(b60), t=70 fail(b120), t=190 ok, t=250 fail(b60 again), t=310
+    assert times[:5] == [10.0, 70.0, 190.0, 250.0, 310.0]
+    calls = logger_mock.warning.call_args_list
+    with_tb = [c for c in calls if c.kwargs.get("exc_info") is True]
+    # failures #1 (before reset) and the first failure after reset both carry tracebacks
+    assert len(with_tb) == 2
+    assert h.queue.qsize() == 1
