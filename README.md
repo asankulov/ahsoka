@@ -146,3 +146,5 @@ uv run --extra dev pytest
 ## Deployment
 
 See [`PLAN.md`](PLAN.md) for the full Hetzner + systemd deployment guide.
+
+To test a branch on the live server: merge the `deploy.yml` change to `main`, merge `main` into the branch and push (the branch's own `deploy.yml` must contain the new condition, or deploy is skipped), then `gh workflow run deploy.yml --ref <branch>`. Roll back with `--ref main` (restores code only; `ahsoka.db` is not rolled back). Caveats (single server, no staging; back up session and DB first) are in the PLAN.md CI/CD section.
