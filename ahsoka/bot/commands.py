@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
 _BATCH_PRICING: dict[str, tuple[float, float, float, float]] = {
     # prefix → (input, output, cache_write, cache_read) per token
     "claude-haiku-3-5":  (0.40e-6, 2.00e-6, 0.50e-6, 0.04e-6),
-    "claude-haiku-4-5":  (0.40e-6, 2.00e-6, 0.50e-6, 0.04e-6),
+    "claude-haiku-4-5":  (0.50e-6, 2.50e-6, 0.625e-6, 0.05e-6),
+    # haiku-5-5: cache rates derived from 1.25x (write) / 0.1x (read) of input price
+    "claude-haiku-5-5":  (0.05e-6, 0.25e-6, 0.0625e-6, 0.005e-6),
     "claude-sonnet-3-5": (1.50e-6, 7.50e-6, 1.875e-6, 0.15e-6),
     "claude-sonnet-4":   (1.50e-6, 7.50e-6, 1.875e-6, 0.15e-6),
     "claude-sonnet-4-6": (1.50e-6, 7.50e-6, 1.875e-6, 0.15e-6),
@@ -154,6 +156,8 @@ def register_bot_commands(
                 max_tokens=params["max_tokens"],
                 system=params["system"],
                 messages=params["messages"],
+                thinking=params["thinking"],
+                output_config=params["output_config"],
             )
             response_dict = {
                 "result": {
