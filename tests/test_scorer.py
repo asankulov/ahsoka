@@ -5,7 +5,7 @@ from datetime import datetime
 import pytest
 
 from ahsoka.models import PersonalizedVerdict, Post, UserConfig
-from ahsoka.pipeline.scorer import build_personalized_prompt, parse_verdict
+from ahsoka.pipeline.scorer import _VERDICT_SCHEMA, build_personalized_prompt, parse_verdict
 
 
 # ---------------------------------------------------------------------------
@@ -53,9 +53,14 @@ def make_config(
     )
 
 
-def _make_succeeded_response(payload: dict) -> dict:
-    """Build a succeeded batch result dict with JSON-encoded payload."""
-    text = json.dumps(payload)[1:]  # strip leading "{" (prompt prefill adds it)
+def _make_succeeded_response(payload: dict, legacy: bool = False) -> dict:
+    """Build a succeeded batch result dict with JSON-encoded payload.
+
+    legacy=True strips the leading "{" as old prefilled batch outputs did.
+    """
+    text = json.dumps(payload)
+    if legacy:
+        text = text[1:]
     return {
         "result": {
             "type": "succeeded",
@@ -98,10 +103,39 @@ def test_system_prompt_present():
 def test_messages_structure():
     result = build_personalized_prompt(make_post(), "content", make_config())
     messages = result["params"]["messages"]
+    assert len(messages) == 1
     assert messages[0]["role"] == "user"
-    assert messages[1]["role"] == "assistant"
-    # assistant prefill starts with "{"
-    assert messages[1]["content"] == "{"
+
+
+def test_thinking_disabled():
+    params = build_personalized_prompt(make_post(), "c", make_config())["params"]
+    assert params["thinking"] == {"type": "disabled"}
+
+
+def test_output_config_low_effort_json_schema():
+    params = build_personalized_prompt(make_post(), "c", make_config())["params"]
+    oc = params["output_config"]
+    assert oc["effort"] == "low"
+    assert oc["format"]["type"] == "json_schema"
+    assert oc["format"]["schema"] is _VERDICT_SCHEMA
+
+
+def test_verdict_schema_shape():
+    assert _VERDICT_SCHEMA["additionalProperties"] is False
+    assert set(_VERDICT_SCHEMA["required"]) == {
+        "score", "reason", "matched", "apply",
+        "red_flags", "stack", "seniority", "remote",
+    }
+    assert set(_VERDICT_SCHEMA["properties"]) == set(_VERDICT_SCHEMA["required"])
+    props = _VERDICT_SCHEMA["properties"]
+    assert props["seniority"]["enum"] == ["junior", "middle", "senior", "lead", "any"]
+    assert props["remote"]["enum"] == ["remote", "hybrid", "onsite", "unknown"]
+
+
+def test_no_sampling_params():
+    params = build_personalized_prompt(make_post(), "c", make_config())["params"]
+    for key in ("temperature", "top_p", "top_k"):
+        assert key not in params
 
 
 def test_user_config_fields_woven_into_prompt():
@@ -210,6 +244,25 @@ def test_parse_verdict_apply_defaults_empty():
     response = _make_succeeded_response({"score": 6, "reason": "ok", "matched": False})
     verdict = parse_verdict(response, user_id=1)
     assert verdict.apply == ""
+
+
+def test_parse_verdict_full_json_starting_with_brace():
+    response = _make_succeeded_response({"score": 8, "reason": "r", "matched": True})
+    assert response["result"]["message"]["content"][0]["text"].startswith("{")
+    verdict = parse_verdict(response, user_id=1)
+    assert verdict.score == 8
+    assert verdict.reason == "r"
+    assert verdict.matched is True
+
+
+def test_parse_verdict_legacy_prefill_stripped_form():
+    response = _make_succeeded_response(
+        {"score": 6, "reason": "legacy", "matched": False}, legacy=True
+    )
+    assert not response["result"]["message"]["content"][0]["text"].startswith("{")
+    verdict = parse_verdict(response, user_id=1)
+    assert verdict.score == 6
+    assert verdict.reason == "legacy"
 
 
 # ---------------------------------------------------------------------------

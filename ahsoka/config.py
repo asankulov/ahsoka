@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     owner_chat_id: int
     channel_ids: list[int] = []
     anthropic_api_key: str
-    claude_model: str = "claude-haiku-4-5-20251001"
+    claude_model: str = "claude-haiku-5-5"
     default_score_threshold: int = 7
     scrape_timeout_s: float = 5.0
     db_path: str = "ahsoka.db"

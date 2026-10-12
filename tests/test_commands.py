@@ -915,6 +915,14 @@ def test_pricing_for_known_model():
     assert len(prices) == 4
 
 
+def test_pricing_for_haiku_5_5():
+    assert _pricing_for("claude-haiku-5-5") == (0.05e-6, 0.25e-6, 0.0625e-6, 0.005e-6)
+
+
+def test_pricing_for_haiku_4_5_corrected_rates():
+    assert _pricing_for("claude-haiku-4-5-20251001") == (0.50e-6, 2.50e-6, 0.625e-6, 0.05e-6)
+
+
 def test_pricing_for_unknown_model():
     assert _pricing_for("gpt-99") is None
 
@@ -1001,6 +1009,30 @@ async def test_forwarded_post_scores_when_debug_on(conn, settings):
 
     mock_anthropic.messages.create.assert_awaited_once()
     assert msg.reply.await_count >= 2  # "Scoring…" + results
+
+
+async def test_debug_score_passes_structured_output_params_no_prefill(conn, settings):
+    from unittest.mock import patch
+
+    mock_anthropic = _make_mock_anthropic()
+    settings.scrape_timeout_s = 5.0
+    settings.claude_model = "claude-haiku-5-5"
+
+    _, h, _ = setup_dp(conn, settings, anthropic=mock_anthropic)
+    await h["cmd_debug"](make_msg("/debug on"), make_ctx())
+
+    with patch("ahsoka.pipeline.scraper.scrape_content", new=AsyncMock(return_value="job text")):
+        await h["debug_forwarded_post"](make_forwarded_msg())
+
+    mock_anthropic.messages.create.assert_awaited_once()
+    kwargs = mock_anthropic.messages.create.call_args.kwargs
+    assert kwargs["model"] == "claude-haiku-5-5"
+    assert kwargs["thinking"] == {"type": "disabled"}
+    assert kwargs["output_config"]["effort"] == "low"
+    assert kwargs["output_config"]["format"]["type"] == "json_schema"
+    assert [m["role"] for m in kwargs["messages"]] == ["user"]
+    for banned in ("temperature", "top_p", "top_k"):
+        assert banned not in kwargs
 
 
 async def test_forwarded_post_no_anthropic_replies_unavailable(conn, settings):

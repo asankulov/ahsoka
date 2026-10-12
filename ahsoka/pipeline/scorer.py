@@ -51,6 +51,31 @@ Rules:
 - When a candidate field is empty/unspecified, treat that dimension as "no constraint".\
 """
 
+_VERDICT_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "integer"},
+        "reason": {"type": "string"},
+        "matched": {"type": "boolean"},
+        "apply": {"type": "string"},
+        "red_flags": {"type": "array", "items": {"type": "string"}},
+        "stack": {"type": "array", "items": {"type": "string"}},
+        "seniority": {
+            "type": "string",
+            "enum": ["junior", "middle", "senior", "lead", "any"],
+        },
+        "remote": {
+            "type": "string",
+            "enum": ["remote", "hybrid", "onsite", "unknown"],
+        },
+    },
+    "required": [
+        "score", "reason", "matched", "apply",
+        "red_flags", "stack", "seniority", "remote",
+    ],
+    "additionalProperties": False,
+}
+
 _USER_TEMPLATE = """\
 === CANDIDATE PROFILE ===
 Stack: {stack}
@@ -81,6 +106,8 @@ def build_personalized_prompt(
                 "max_tokens": int,
                 "system": str,
                 "messages": [...],
+                "thinking": {"type": "disabled"},
+                "output_config": {"effort": "low", "format": {json_schema}},
             }
         }
 
@@ -105,8 +132,14 @@ def build_personalized_prompt(
             "system": _SYSTEM_PROMPT,
             "messages": [
                 {"role": "user", "content": user_message},
-                {"role": "assistant", "content": "{"},
             ],
+            # Haiku 5.5 rejects assistant prefill; use structured output instead.
+            # Thinking off + low effort keep the 512-token budget for the JSON.
+            "thinking": {"type": "disabled"},
+            "output_config": {
+                "effort": "low",
+                "format": {"type": "json_schema", "schema": _VERDICT_SCHEMA},
+            },
         },
     }
 
@@ -158,8 +191,9 @@ def parse_verdict(response_json: dict, user_id: int) -> PersonalizedVerdict:
                 text = block.text.strip()
                 break
 
-        # The prompt primes the assistant with "{" so the model continues from there
-        raw = "{" + text if not text.startswith("{") else text
+        # Structured output returns complete JSON; tolerate a legacy prefill-stripped
+        # response (missing leading "{") for in-flight batches from older runs.
+        raw = text if text.startswith("{") else "{" + text
         data = json.loads(raw)
 
         flags_raw = data.get("red_flags", [])
