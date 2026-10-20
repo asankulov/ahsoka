@@ -701,6 +701,174 @@ async def test_input_removechannel_invalid_stays_in_state(conn, settings):
 
 
 # ---------------------------------------------------------------------------
+# Admin: /addchannel
+# ---------------------------------------------------------------------------
+
+def make_pyro(username="jobchan", title="Job Channel", get_exc=None, join_exc=None):
+    pyro = MagicMock()
+    if get_exc:
+        pyro.get_chat = AsyncMock(side_effect=get_exc)
+    else:
+        chat = MagicMock()
+        chat.username = username
+        chat.title = title
+        pyro.get_chat = AsyncMock(return_value=chat)
+    pyro.join_chat = AsyncMock(side_effect=join_exc)
+    return pyro
+
+
+async def _channel_row(conn, channel_id):
+    async with conn.execute(
+        "SELECT added_by, username, title FROM watched_channels WHERE channel_id = ?",
+        (channel_id,),
+    ) as cur:
+        return await cur.fetchone()
+
+
+async def test_addchannel_with_arg_adds_and_clears_state(conn, settings):
+    _, h, watched = setup_dp(conn, settings)
+    ctx = make_ctx()
+    msg = make_msg("/addchannel -100123")
+    await h["cmd_addchannel"](msg, ctx)
+    assert -100123 in watched
+    assert -100123 in await load_watched_channels(conn)
+    assert "Now watching: -100123" in msg.reply.call_args[0][0]
+    ctx.clear.assert_awaited()
+    ctx.set_state.assert_not_called()
+
+
+async def test_addchannel_no_arg_prompts_and_sets_state(conn, settings):
+    _, h, watched = setup_dp(conn, settings)
+    ctx = make_ctx()
+    msg = make_msg("/addchannel")
+    await h["cmd_addchannel"](msg, ctx)
+    ctx.set_state.assert_awaited_once_with(WaitingForInput.addchannel)
+    msg.reply.assert_awaited_once_with("Enter channel ID to add:")
+    assert watched == set()
+
+
+async def test_addchannel_non_integer_arg_replies_error(conn, settings):
+    _, h, watched = setup_dp(conn, settings)
+    msg = make_msg("/addchannel abc")
+    await h["cmd_addchannel"](msg, make_ctx())
+    assert msg.reply.call_args[0][0] == "Channel ID must be an integer."
+    assert watched == set()
+    assert await load_watched_channels(conn) == set()
+
+
+async def test_input_addchannel_valid_adds_and_clears(conn, settings):
+    _, h, watched = setup_dp(conn, settings)
+    ctx = make_ctx()
+    msg = make_msg(" -100456 ")
+    await h["input_addchannel"](msg, ctx)
+    assert -100456 in watched
+    assert -100456 in await load_watched_channels(conn)
+    ctx.clear.assert_awaited_once()
+
+
+async def test_input_addchannel_invalid_keeps_state(conn, settings):
+    _, h, watched = setup_dp(conn, settings)
+    ctx = make_ctx()
+    msg = make_msg("abc")
+    await h["input_addchannel"](msg, ctx)
+    ctx.clear.assert_not_called()
+    assert msg.reply.call_args[0][0] == "Channel ID must be an integer."
+    assert watched == set()
+
+
+async def test_addchannel_already_watched_via_arg(conn, settings, monkeypatch):
+    _, h, watched = setup_dp(conn, settings, watched={-100123})
+    add = AsyncMock()
+    monkeypatch.setattr("ahsoka.bot.commands.db.add_channel", add)
+    ctx = make_ctx()
+    msg = make_msg("/addchannel -100123")
+    await h["cmd_addchannel"](msg, ctx)
+    assert msg.reply.call_args[0][0] == "Already watching: -100123"
+    add.assert_not_called()
+    ctx.clear.assert_awaited()
+
+
+async def test_input_addchannel_already_watched_clears_state(conn, settings, monkeypatch):
+    _, h, _ = setup_dp(conn, settings, watched={-100123})
+    add = AsyncMock()
+    monkeypatch.setattr("ahsoka.bot.commands.db.add_channel", add)
+    ctx = make_ctx()
+    msg = make_msg("-100123")
+    await h["input_addchannel"](msg, ctx)
+    assert msg.reply.call_args[0][0] == "Already watching: -100123"
+    add.assert_not_called()
+    ctx.clear.assert_awaited_once()
+
+
+async def test_addchannel_resolves_metadata_and_joins(conn, settings):
+    pyro = make_pyro()
+    _, h, _ = setup_dp(conn, settings, pyro=pyro)
+    msg = make_msg("/addchannel -100123")
+    await h["cmd_addchannel"](msg, make_ctx())
+    pyro.get_chat.assert_awaited_once_with(-100123)
+    pyro.join_chat.assert_awaited_once_with("jobchan")
+    assert await _channel_row(conn, -100123) == (OWNER_ID, "jobchan", "Job Channel")
+    reply = msg.reply.call_args[0][0]
+    assert "Now watching: Job Channel" in reply
+    assert "Could not resolve" not in reply
+
+
+async def test_addchannel_get_chat_failure_still_adds(conn, settings):
+    pyro = make_pyro(get_exc=RuntimeError("boom"))
+    _, h, watched = setup_dp(conn, settings, pyro=pyro)
+    msg = make_msg("/addchannel -100123")
+    await h["cmd_addchannel"](msg, make_ctx())
+    assert -100123 in watched
+    assert await _channel_row(conn, -100123) == (OWNER_ID, None, None)
+    assert "Could not resolve" in msg.reply.call_args[0][0]
+    pyro.join_chat.assert_not_called()
+
+
+async def test_addchannel_join_failure_is_swallowed(conn, settings):
+    pyro = make_pyro(join_exc=RuntimeError("already joined"))
+    _, h, watched = setup_dp(conn, settings, pyro=pyro)
+    msg = make_msg("/addchannel -100123")
+    await h["cmd_addchannel"](msg, make_ctx())
+    assert -100123 in watched
+    assert await _channel_row(conn, -100123) == (OWNER_ID, "jobchan", "Job Channel")
+    assert "Now watching: Job Channel" in msg.reply.call_args[0][0]
+
+
+async def test_addchannel_without_pyro_adds_without_metadata(conn, settings):
+    _, h, watched = setup_dp(conn, settings, pyro=None)
+    await h["cmd_addchannel"](make_msg("/addchannel -100123"), make_ctx())
+    assert -100123 in watched
+    assert await _channel_row(conn, -100123) == (OWNER_ID, None, None)
+
+
+async def test_addchannel_added_by_is_caller_id(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    await h["cmd_addchannel"](make_msg("/addchannel -100321", user_id=777), make_ctx())
+    assert (await _channel_row(conn, -100321))[0] == 777
+
+
+def test_addchannel_registered_on_admin_router_only(conn, settings):
+    dp = Dispatcher()
+    register_bot_commands(dp, conn, settings, set())
+    user_names = {h.callback.__name__ for h in dp.sub_routers[0].message.handlers}
+    admin_names = {h.callback.__name__ for h in dp.sub_routers[1].message.handlers}
+    assert {"cmd_addchannel", "input_addchannel"} <= admin_names
+    assert not {"cmd_addchannel", "input_addchannel"} & user_names
+
+
+def test_addchannel_not_in_bot_commands():
+    from ahsoka.bot.commands import BOT_COMMANDS
+    assert "addchannel" not in {c.command for c in BOT_COMMANDS}
+
+
+async def test_admin_help_mentions_addchannel(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/admin")
+    await h["cmd_admin"](msg, make_ctx())
+    assert "/addchannel" in msg.reply.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
 # State cancellation
 # ---------------------------------------------------------------------------
 

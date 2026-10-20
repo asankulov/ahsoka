@@ -62,6 +62,7 @@ class WaitingForInput(StatesGroup):
     watch_channel = State()
     notify_channel = State()
     removechannel = State()
+    addchannel    = State()
 
 
 # User-visible commands (shown in Telegram "/" menu)
@@ -126,6 +127,47 @@ def register_bot_commands(
 
     def _uid(message: Message) -> int:
         return message.from_user.id  # type: ignore[union-attr]
+
+    async def _add_channel_by_id(message: Message, raw: str) -> bool:
+        """Add a channel to the watchlist by ID. Returns True when the flow is finished,
+        False when the input was invalid and the FSM state should be kept."""
+        try:
+            channel_id = int(raw.strip())
+        except ValueError:
+            await message.reply("Channel ID must be an integer.")
+            return False
+        if channel_id in watched_channels:
+            await message.reply(f"Already watching: {channel_id}")
+            return True
+        username: str | None = None
+        title: str | None = None
+        resolved = False
+        if pyro:
+            try:
+                chat = await pyro.get_chat(channel_id)  # type: ignore[attr-defined]
+                username = getattr(chat, "username", None)
+                title = getattr(chat, "title", None)
+                resolved = True
+            except Exception:
+                pass
+            if username:
+                try:
+                    await pyro.join_chat(username)  # type: ignore[attr-defined]
+                except Exception:
+                    pass  # may already be joined or private
+        await db.add_channel(
+            conn,
+            channel_id,
+            added_by=_uid(message),
+            username=username,
+            title=title,
+        )
+        watched_channels.add(channel_id)
+        reply = f"Now watching: {title or channel_id}"
+        if not resolved:
+            reply += "\n(Could not resolve channel metadata.)"
+        await message.reply(reply)
+        return True
 
     async def _rebuild_keywords() -> None:
         if keyword_index is not None:
@@ -558,6 +600,7 @@ def register_bot_commands(
         lines = [
             "Admin commands:",
             "",
+            "  /addchannel -100123 - Add a channel to watchlist by ID",
             "  /removechannel -100123 - Remove a channel from watchlist",
             "  /users - List all registered users",
             "  /ban 123456 - Ban a user (stops notifications)",
@@ -582,6 +625,21 @@ def register_bot_commands(
         else:
             status = "ON" if debug_mode[0] else "OFF"
             await message.reply(f"Debug mode is {status}. Use /debug on or /debug off.")
+
+    @admin_router.message(Command("addchannel"))
+    async def cmd_addchannel(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        arg = _arg(message.text)
+        if arg:
+            await _add_channel_by_id(message, arg)
+            return
+        await state.set_state(WaitingForInput.addchannel)
+        await message.reply("Enter channel ID to add:")
+
+    @admin_router.message(StateFilter(WaitingForInput.addchannel))
+    async def input_addchannel(message: Message, state: FSMContext) -> None:
+        if await _add_channel_by_id(message, message.text or ""):
+            await state.clear()
 
     @admin_router.message(Command("removechannel"))
     async def cmd_removechannel(message: Message, state: FSMContext) -> None:
