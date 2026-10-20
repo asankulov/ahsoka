@@ -10,7 +10,10 @@ import pytest
 import aiosqlite
 from unittest.mock import AsyncMock, MagicMock
 
-from aiogram import Dispatcher
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.types import Chat, Message, Update, User
+import datetime as _dt
 
 from ahsoka.bot.commands import register_bot_commands, WaitingForInput, _fmt_tokens, _pricing_for
 from ahsoka.config import Settings
@@ -866,6 +869,157 @@ async def test_admin_help_mentions_addchannel(conn, settings):
     msg = make_msg("/admin")
     await h["cmd_admin"](msg, make_ctx())
     assert "/addchannel" in msg.reply.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Admin: addchannel / removechannel state vs. command routing (real Dispatcher)
+# ---------------------------------------------------------------------------
+
+async def _feed(dp, bot, text, state_to_set):
+    """Feed a real Update through the Dispatcher with the FSM pre-set; return
+    (replies, final_state). Message.reply is stubbed so no network is used."""
+    replies: list[str] = []
+
+    async def fake_reply(self, text, *a, **kw):
+        replies.append(text)
+
+    ctx = dp.fsm.get_context(bot, chat_id=OWNER_ID, user_id=OWNER_ID)
+    if state_to_set is not None:
+        await ctx.set_state(state_to_set)
+    msg = Message(
+        message_id=1,
+        date=_dt.datetime(2026, 1, 1),
+        chat=Chat(id=OWNER_ID, type="private"),
+        from_user=User(id=OWNER_ID, is_bot=False, first_name="Admin"),
+        text=text,
+    )
+    orig = Message.reply
+    Message.reply = fake_reply
+    try:
+        await dp.feed_update(bot, Update(update_id=1, message=msg))
+    finally:
+        Message.reply = orig
+    return replies, await ctx.get_state()
+
+
+@pytest.mark.parametrize("state_name", ["addchannel", "removechannel"])
+@pytest.mark.parametrize("text", ["/removechannel 123", "/users", "/ban 1", "/stats"])
+async def test_commands_in_channel_input_state_reach_own_handler(conn, settings, state_name, text):
+    dp, _, _ = setup_dp(conn, settings)
+    bot = Bot("123:ABC")
+    replies, state = await _feed(dp, bot, text, getattr(WaitingForInput, state_name))
+    assert replies, "command handler should have replied"
+    assert not any("Channel ID must be an integer" in r for r in replies)
+    assert state is None  # the command's own handler cleared the FSM state
+
+
+@pytest.mark.parametrize("state_name,err", [
+    ("addchannel", "Channel ID must be an integer."),
+    ("removechannel", "Please enter a valid integer channel ID."),
+])
+async def test_non_command_text_in_channel_input_state_reaches_input_handler(conn, settings, state_name, err):
+    dp, _, _ = setup_dp(conn, settings)
+    bot = Bot("123:ABC")
+    st = getattr(WaitingForInput, state_name)
+    replies, state = await _feed(dp, bot, "abc", st)
+    assert replies == [err]
+    assert state == st.state
+
+
+@pytest.mark.parametrize("state_name,expected", [
+    ("addchannel", "Now watching: -100555"),
+    ("removechannel", "Stopped watching channel -100555."),
+])
+async def test_numeric_id_in_channel_input_state_completes_and_clears(conn, settings, state_name, expected):
+    dp, _, _ = setup_dp(conn, settings)
+    bot = Bot("123:ABC")
+    replies, state = await _feed(dp, bot, "-100555", getattr(WaitingForInput, state_name))
+    assert any(expected in r for r in replies)
+    assert state is None
+
+
+@pytest.mark.parametrize("state_name,err", [
+    ("addchannel", "Channel ID must be an integer."),
+    ("removechannel", "Please enter a valid integer channel ID."),
+])
+async def test_text_none_in_channel_input_state_does_not_crash(conn, settings, state_name, err):
+    dp, _, _ = setup_dp(conn, settings)
+    bot = Bot("123:ABC")
+    st = getattr(WaitingForInput, state_name)
+    replies, state = await _feed(dp, bot, None, st)
+    assert replies in ([], [err])  # no crash; either filtered out or handled as invalid
+    assert state == st.state
+
+
+@pytest.mark.parametrize("name", ["input_addchannel", "input_removechannel"])
+def test_channel_input_handlers_exclude_commands_via_filters(conn, settings, name):
+    dp = Dispatcher()
+    register_bot_commands(dp, conn, settings, set())
+    h = next(h for h in dp.sub_routers[1].message.handlers if h.callback.__name__ == name)
+    assert len(h.filters) == 2  # StateFilter + ~F.text.startswith("/")
+
+
+# ---------------------------------------------------------------------------
+# Admin: /addchannel userbot-membership hint and failure logging
+# ---------------------------------------------------------------------------
+
+HINT = "the userbot account may not be a member of this channel"
+
+
+async def test_addchannel_hint_present_when_pyro_none(conn, settings):
+    _, h, _ = setup_dp(conn, settings, pyro=None)
+    msg = make_msg("/addchannel -100123")
+    await h["cmd_addchannel"](msg, make_ctx())
+    reply = msg.reply.call_args[0][0]
+    assert HINT in reply
+    assert "Could not resolve" in reply
+
+
+async def test_addchannel_hint_present_when_get_chat_raises(conn, settings):
+    _, h, _ = setup_dp(conn, settings, pyro=make_pyro(get_exc=RuntimeError("boom")))
+    msg = make_msg("/addchannel -100123")
+    await h["cmd_addchannel"](msg, make_ctx())
+    reply = msg.reply.call_args[0][0]
+    assert HINT in reply
+    assert "Could not resolve" in reply
+
+
+async def test_addchannel_hint_present_when_chat_has_no_username(conn, settings):
+    pyro = make_pyro(username=None)
+    _, h, _ = setup_dp(conn, settings, pyro=pyro)
+    msg = make_msg("/addchannel -100123")
+    await h["cmd_addchannel"](msg, make_ctx())
+    reply = msg.reply.call_args[0][0]
+    assert HINT in reply
+    assert "Could not resolve" not in reply
+    pyro.join_chat.assert_not_called()
+
+
+async def test_addchannel_hint_absent_when_username_present(conn, settings):
+    _, h, _ = setup_dp(conn, settings, pyro=make_pyro())
+    msg = make_msg("/addchannel -100123")
+    await h["cmd_addchannel"](msg, make_ctx())
+    assert HINT not in msg.reply.call_args[0][0]
+
+
+async def test_addchannel_get_chat_failure_logs_warning(conn, settings, caplog):
+    _, h, _ = setup_dp(conn, settings, pyro=make_pyro(get_exc=RuntimeError("boom")))
+    with caplog.at_level(logging.DEBUG, logger="ahsoka.bot.commands"):
+        await h["cmd_addchannel"](make_msg("/addchannel -100123"), make_ctx())
+    recs = [r for r in caplog.records if "addchannel: get_chat failed" in r.getMessage()]
+    assert len(recs) == 1
+    assert recs[0].levelno == logging.WARNING
+    assert "-100123" in recs[0].getMessage()
+
+
+async def test_addchannel_join_failure_logs_debug(conn, settings, caplog):
+    _, h, _ = setup_dp(conn, settings, pyro=make_pyro(join_exc=RuntimeError("already")))
+    with caplog.at_level(logging.DEBUG, logger="ahsoka.bot.commands"):
+        await h["cmd_addchannel"](make_msg("/addchannel -100123"), make_ctx())
+    recs = [r for r in caplog.records if "addchannel: join_chat failed" in r.getMessage()]
+    assert len(recs) == 1
+    assert recs[0].levelno == logging.DEBUG
+    assert "jobchan" in recs[0].getMessage()
 
 
 # ---------------------------------------------------------------------------

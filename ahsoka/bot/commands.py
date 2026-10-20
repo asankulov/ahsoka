@@ -149,12 +149,13 @@ def register_bot_commands(
                 title = getattr(chat, "title", None)
                 resolved = True
             except Exception:
-                pass
+                logger.warning("addchannel: get_chat failed for %d", channel_id, exc_info=True)
             if username:
                 try:
                     await pyro.join_chat(username)  # type: ignore[attr-defined]
                 except Exception:
-                    pass  # may already be joined or private
+                    # may already be joined or private
+                    logger.debug("addchannel: join_chat failed for %s", username, exc_info=True)
         await db.add_channel(
             conn,
             channel_id,
@@ -166,6 +167,11 @@ def register_bot_commands(
         reply = f"Now watching: {title or channel_id}"
         if not resolved:
             reply += "\n(Could not resolve channel metadata.)"
+        if not username:
+            reply += (
+                "\nNote: the userbot account may not be a member of this channel. "
+                "Add or join it with that account, or no updates will be received."
+            )
         await message.reply(reply)
         return True
 
@@ -636,7 +642,7 @@ def register_bot_commands(
         await state.set_state(WaitingForInput.addchannel)
         await message.reply("Enter channel ID to add:")
 
-    @admin_router.message(StateFilter(WaitingForInput.addchannel))
+    @admin_router.message(StateFilter(WaitingForInput.addchannel), ~F.text.startswith("/"))
     async def input_addchannel(message: Message, state: FSMContext) -> None:
         if await _add_channel_by_id(message, message.text or ""):
             await state.clear()
@@ -658,7 +664,7 @@ def register_bot_commands(
         await state.set_state(WaitingForInput.removechannel)
         await message.reply("Enter channel ID to remove:")
 
-    @admin_router.message(StateFilter(WaitingForInput.removechannel))
+    @admin_router.message(StateFilter(WaitingForInput.removechannel), ~F.text.startswith("/"))
     async def input_removechannel(message: Message, state: FSMContext) -> None:
         try:
             channel_id = int((message.text or "").strip())
