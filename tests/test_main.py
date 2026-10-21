@@ -352,6 +352,54 @@ async def test_pipeline_worker_skips_keyword_drop(conn):
     mock_enqueue.assert_not_called()
 
 
+async def test_pipeline_worker_drops_resume_post_before_keyword_filter(conn):
+    """Resume post: mark_seen called; keyword_index, configs, enqueue never touched."""
+    post = make_post(text="#резюме #backend #nodejs\n\nПозиция: Senior Backend Developer")
+    batch_queue = AsyncMock()
+    keyword_index = MagicMock()
+    keyword_index.passes = MagicMock(return_value=True)
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock) as mock_configs, \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen, \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_enqueue:
+        await _run_pipeline_worker_with_one_post(post, conn, batch_queue, keyword_index)
+
+    mock_mark_seen.assert_called_once_with(conn, post.channel_id, post.message_id)
+    keyword_index.passes.assert_not_called()
+    mock_configs.assert_not_called()
+    mock_enqueue.assert_not_called()
+
+
+async def test_pipeline_worker_non_resume_post_reaches_keyword_filter(conn):
+    """Normal vacancy is not dropped by the resume check."""
+    post = make_post(text="#vacancy Senior Python Developer")
+    batch_queue = AsyncMock()
+    keyword_index = MagicMock()
+    keyword_index.passes = MagicMock(return_value=False)
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock):
+        await _run_pipeline_worker_with_one_post(post, conn, batch_queue, keyword_index)
+
+    keyword_index.passes.assert_called_once_with(post)
+
+
+async def test_pipeline_worker_duplicate_resume_dropped_before_resume_check(conn):
+    """Duplicate resume post: dropped at dedup, no mark_seen from the resume branch."""
+    post = make_post(text="#резюме #python")
+    batch_queue = AsyncMock()
+    keyword_index = MagicMock()
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=True), \
+         patch("ahsoka.main.is_resume") as mock_is_resume, \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen:
+        await _run_pipeline_worker_with_one_post(post, conn, batch_queue, keyword_index)
+
+    mock_is_resume.assert_not_called()
+    mock_mark_seen.assert_not_called()
+
+
 async def test_pipeline_worker_skips_when_no_active_configs(conn):
     """No active users: mark_seen called, enqueue NOT called."""
     post = make_post()
