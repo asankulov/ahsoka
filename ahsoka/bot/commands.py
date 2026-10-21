@@ -469,35 +469,35 @@ def register_bot_commands(
     # State-input handlers
     # -------------------------------------------------------------------------
 
-    @user_router.message(StateFilter(WaitingForInput.setstack))
+    @user_router.message(StateFilter(WaitingForInput.setstack), ~F.text.startswith("/"))
     async def input_setstack(message: Message, state: FSMContext) -> None:
         value = (message.text or "").strip()
         await state.clear()
         await db.set_user_config(conn, _uid(message), "stack", value)
         await message.reply(f"Stack set to: {value or '(cleared)'}")
 
-    @user_router.message(StateFilter(WaitingForInput.setseniority))
+    @user_router.message(StateFilter(WaitingForInput.setseniority), ~F.text.startswith("/"))
     async def input_setseniority(message: Message, state: FSMContext) -> None:
         value = (message.text or "").strip()
         await state.clear()
         await db.set_user_config(conn, _uid(message), "seniority", value)
         await message.reply(f"Seniority set to: {value or '(cleared)'}")
 
-    @user_router.message(StateFilter(WaitingForInput.setremote))
+    @user_router.message(StateFilter(WaitingForInput.setremote), ~F.text.startswith("/"))
     async def input_setremote(message: Message, state: FSMContext) -> None:
         value = (message.text or "").strip()
         await state.clear()
         await db.set_user_config(conn, _uid(message), "remote", value)
         await message.reply(f"Work mode set to: {value or '(cleared)'}")
 
-    @user_router.message(StateFilter(WaitingForInput.setlocation))
+    @user_router.message(StateFilter(WaitingForInput.setlocation), ~F.text.startswith("/"))
     async def input_setlocation(message: Message, state: FSMContext) -> None:
         value = (message.text or "").strip()
         await state.clear()
         await db.set_user_config(conn, _uid(message), "location", value)
         await message.reply(f"Location set to: {value or '(cleared)'}")
 
-    @user_router.message(StateFilter(WaitingForInput.setsalary))
+    @user_router.message(StateFilter(WaitingForInput.setsalary), ~F.text.startswith("/"))
     async def input_setsalary(message: Message, state: FSMContext) -> None:
         parts = (message.text or "").split()
         if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
@@ -508,7 +508,7 @@ def register_bot_commands(
         else:
             await message.reply("Please enter two integers: <min> <max>  (e.g. 3000 6000)")
 
-    @user_router.message(StateFilter(WaitingForInput.setthreshold))
+    @user_router.message(StateFilter(WaitingForInput.setthreshold), ~F.text.startswith("/"))
     async def input_setthreshold(message: Message, state: FSMContext) -> None:
         text = (message.text or "").strip()
         if text.isdigit() and 0 <= int(text) <= 10:
@@ -518,7 +518,7 @@ def register_bot_commands(
         else:
             await message.reply("Please enter a whole number between 0 and 10.")
 
-    @user_router.message(StateFilter(WaitingForInput.setkeywords))
+    @user_router.message(StateFilter(WaitingForInput.setkeywords), ~F.text.startswith("/"))
     async def input_setkeywords(message: Message, state: FSMContext) -> None:
         value = (message.text or "").strip()
         await state.clear()
@@ -526,7 +526,7 @@ def register_bot_commands(
         await _rebuild_keywords()
         await message.reply(f"Keywords set: {', '.join(value.split())}" if value else "Keywords cleared - all posts will pass the filter.")
 
-    @user_router.message(StateFilter(WaitingForInput.addkeyword))
+    @user_router.message(StateFilter(WaitingForInput.addkeyword), ~F.text.startswith("/"))
     async def input_addkeyword(message: Message, state: FSMContext) -> None:
         value = (message.text or "").strip()
         await state.clear()
