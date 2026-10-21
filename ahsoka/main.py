@@ -20,6 +20,7 @@ from ahsoka.watcher.handler import register_watcher_handlers
 from ahsoka.watcher.poller import channel_poller
 from ahsoka.pipeline.dedup import is_duplicate
 from ahsoka.pipeline.keyword_index import KeywordIndex
+from ahsoka.pipeline.resume_filter import is_resume
 from ahsoka.pipeline.user_filter import matches_user
 from ahsoka.pipeline.scraper import scrape_content
 from ahsoka.pipeline.batch_queue import BatchQueue
@@ -133,6 +134,11 @@ async def pipeline_worker(
         try:
             if await is_duplicate(conn, post):
                 logger.debug("Duplicate: %s/%s", post.channel_id, post.message_id)
+                continue
+
+            if is_resume(post):
+                logger.debug("Resume drop: %s/%s", post.channel_id, post.message_id)
+                await db.mark_seen(conn, post.channel_id, post.message_id)
                 continue
 
             if not keyword_index.passes(post):
