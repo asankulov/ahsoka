@@ -1,6 +1,6 @@
 # ahsoka
 
-A multi-user Telegram job-filter bot. A Pyrogram user client monitors public job-posting channels, scores each post **once** via Claude, and fans out matching notifications to each user based on their personal filters. API cost scales with post volume, not user count.
+A multi-user Telegram job-filter bot. A Pyrogram user client monitors public job-posting channels, scores each relevant post **per user** via the Anthropic Message Batches API, and notifies each user whose personal filters match. API cost scales with relevant posts × users.
 
 ## How it works
 
@@ -116,13 +116,19 @@ Any user can `/start` the bot and configure their own filters:
 
 | Command | Example | Effect |
 |---|---|---|
-| `/removechannel` | `/removechannel -100123` | Remove a channel from watchlist |
+| `/addchannel` | `/addchannel -100123` | Add a channel to the watchlist by ID (bare `/addchannel` prompts for the ID) |
+| `/removechannel` | `/removechannel -100123` | Remove a channel from the watchlist (bare form prompts for the ID) |
 | `/users` | `/users` | List registered users |
 | `/ban` | `/ban 123456` | Ban a user |
 | `/unban` | `/unban 123456` | Unban a user |
 | `/stats` | `/stats` | Usage statistics + API cost estimate |
 | `/debug` | `/debug on` | Toggle debug scoring mode (forward a post to score it live) |
+| `/export` | `/export 123456 7d` | Export notified posts for a user (or `all`) as a Markdown file |
 | `/admin` | `/admin` | Show admin command help |
+
+`/export <user_id|all> <offset>` takes UTC times in one of three forms: relative (`30m`, `24h`, `7d`, `2w`), since (`2026-09-01` or `2026-09-01T14:00`), or range (`2026-09-01 2026-09-15`, end day inclusive). Notification history is kept for 30 days.
+
+If a command is waiting for input (e.g. `/setstack`, `/addchannel`) and you send another `/command`, the pending prompt is cancelled rather than the command text being saved as the value.
 
 ## Storage
 
@@ -131,7 +137,7 @@ SQLite (`ahsoka.db`). Eight tables:
 - `users` — registered users with admin/ban status and notification target
 - `user_config` — per-user filter settings (stack, seniority, location, salary, keywords, threshold, etc.)
 - `seen_posts` — dedup log; rows older than 30 days are pruned automatically
-- `watched_channels` — shared watchlist, seeded from `CHANNEL_IDS` on first run
+- `watched_channels` — shared watchlist with channel names, seeded from `CHANNEL_IDS` on first run; an ERROR alert goes to the log bot if a watched channel becomes inaccessible
 - `user_notified` — tracks which posts were sent to which users (prevents duplicate notifications)
 - `post_verdicts` — per-(post, user) `PersonalizedVerdict` for auditability
 - `pending_batches` — in-flight Anthropic batch state for crash recovery
