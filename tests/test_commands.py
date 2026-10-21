@@ -11,7 +11,6 @@ import aiosqlite
 from unittest.mock import AsyncMock, MagicMock
 
 from aiogram import Bot, Dispatcher
-from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import Chat, Message, Update, User
 import datetime as _dt
 
@@ -875,7 +874,7 @@ async def test_admin_help_mentions_addchannel(conn, settings):
 # Admin: addchannel / removechannel state vs. command routing (real Dispatcher)
 # ---------------------------------------------------------------------------
 
-async def _feed(dp, bot, text, state_to_set):
+async def _feed(dp, bot, text, state_to_set, **msg_kwargs):
     """Feed a real Update through the Dispatcher with the FSM pre-set; return
     (replies, final_state). Message.reply is stubbed so no network is used."""
     replies: list[str] = []
@@ -892,6 +891,7 @@ async def _feed(dp, bot, text, state_to_set):
         chat=Chat(id=OWNER_ID, type="private"),
         from_user=User(id=OWNER_ID, is_bot=False, first_name="Admin"),
         text=text,
+        **msg_kwargs,
     )
     orig = Message.reply
     Message.reply = fake_reply
@@ -2510,3 +2510,137 @@ async def test_export_all_dedupes_message_ids_across_users_before_fetching(conn,
     await h["cmd_export"](msg, make_ctx())
 
     mock_pyro.get_messages.assert_awaited_once_with(CHAN_A, [5])
+
+
+# ---------------------------------------------------------------------------
+# User setters: state vs. command routing (real Dispatcher)
+# ---------------------------------------------------------------------------
+
+# state name -> (plain input, config attr, expected value, reply fragment)
+SETTERS = {
+    "setstack": ("python go", "stack", "python go", "Stack set to"),
+    "setseniority": ("senior", "seniority", "senior", "Seniority set to"),
+    "setremote": ("hybrid", "remote", "hybrid", "Work mode set to"),
+    "setlocation": ("Berlin", "location", "Berlin", "Location set to"),
+    "setsalary": ("2000 5000", "salary_min", "2000", "Salary"),
+    "setthreshold": ("9", "threshold", 9, "threshold set"),
+    "setkeywords": ("rust", "keywords", "rust", "Keywords set"),
+    "addkeyword": ("rust", "keywords", "rust", "Added"),
+}
+SETTER_STATES = list(SETTERS)
+
+
+def _st(name):
+    return getattr(WaitingForInput, name)
+
+
+@pytest.mark.parametrize("state_name", SETTER_STATES)
+async def test_setter_slash_text_does_not_fire_input_handler(conn, settings, state_name):
+    dp, _, _ = setup_dp(conn, settings)
+    before = await get_user_config(conn, USER_ID)
+    replies, state = await _feed(dp, Bot("123:ABC"), "/foo bar", _st(state_name))
+    assert replies == []
+    assert state == _st(state_name).state  # unknown command leaves state set
+    assert await get_user_config(conn, USER_ID) == before
+
+
+@pytest.mark.parametrize("state_name", SETTER_STATES)
+async def test_setter_plain_text_saves_and_clears_state(conn, settings, state_name):
+    text, attr, expected, fragment = SETTERS[state_name]
+    dp, _, _ = setup_dp(conn, settings)
+    replies, state = await _feed(dp, Bot("123:ABC"), text, _st(state_name))
+    assert len(replies) == 1 and fragment in replies[0]
+    assert state is None
+    assert getattr(await get_user_config(conn, USER_ID), attr) == expected
+
+
+@pytest.mark.parametrize("state_name", SETTER_STATES)
+@pytest.mark.parametrize("text,marker", [("/help", "Available commands:"), ("/status", "Threshold:")])
+async def test_setter_state_commands_reach_cmd_handler_and_clear(conn, settings, state_name, text, marker):
+    dp, _, _ = setup_dp(conn, settings)
+    replies, state = await _feed(dp, Bot("123:ABC"), text, _st(state_name))
+    assert len(replies) == 1
+    assert marker in replies[0]
+    assert state is None
+
+
+@pytest.mark.parametrize("state_name", SETTER_STATES)
+async def test_setstack_command_with_value_in_setter_state_sets_stack_and_clears(conn, settings, state_name):
+    dp, _, _ = setup_dp(conn, settings)
+    replies, state = await _feed(dp, Bot("123:ABC"), "/setstack elixir", _st(state_name))
+    assert replies == ["Stack set to: elixir"]
+    assert state is None
+    cfg = await get_user_config(conn, USER_ID)
+    assert cfg.stack == "elixir"
+    assert cfg.keywords == "" and cfg.location == "" and cfg.seniority == ""
+
+
+@pytest.mark.parametrize("state_name,err", [
+    ("setsalary", "Please enter two integers"),
+    ("setthreshold", "Please enter a whole number between 0 and 10."),
+])
+async def test_numeric_setter_non_numeric_plain_text_reprompts_and_keeps_state(conn, settings, state_name, err):
+    dp, _, _ = setup_dp(conn, settings)
+    replies, state = await _feed(dp, Bot("123:ABC"), "abc", _st(state_name))
+    assert len(replies) == 1 and err in replies[0]
+    assert state == _st(state_name).state
+
+
+@pytest.mark.parametrize("state_name,attr", [
+    ("setstack", "stack"),
+    ("setkeywords", "keywords"),
+    ("addkeyword", "keywords"),
+])
+async def test_text_with_inner_slash_is_accepted(conn, settings, state_name, attr):
+    dp, _, _ = setup_dp(conn, settings)
+    replies, state = await _feed(dp, Bot("123:ABC"), "python/go", _st(state_name))
+    assert replies and state is None
+    assert getattr(await get_user_config(conn, USER_ID), attr) == "python/go"
+
+
+@pytest.mark.parametrize("state_name", SETTER_STATES)
+async def test_textless_message_in_setter_state_behavior(conn, settings, state_name):
+    """Photo-like message (text=None): ~F.text.startswith('/') -> input handler still fires."""
+    dp, _, _ = setup_dp(conn, settings)
+    before = await get_user_config(conn, USER_ID)
+    replies, state = await _feed(dp, Bot("123:ABC"), None, _st(state_name))
+    assert len(replies) == 1  # handler ran (not filtered out, no crash)
+    if state_name in ("setsalary", "setthreshold"):
+        assert state == _st(state_name).state  # reprompt, state kept
+        assert await get_user_config(conn, USER_ID) == before
+    else:
+        assert state is None  # empty value accepted, state cleared
+
+
+@pytest.mark.parametrize("state_name,expected", [
+    ("watch_channel", "Now watching: Job Channel"),
+])
+@pytest.mark.parametrize("text", ["Some job post", "/looks like a command"])
+async def test_watch_channel_state_still_accepts_forward_unfiltered(conn, settings, state_name, expected, text):
+    dp, _, watched = setup_dp(conn, settings)
+    fwd = Chat(id=-100999, type="channel", title="Job Channel")
+    replies, state = await _feed(dp, Bot("123:ABC"), text, _st(state_name), forward_from_chat=fwd)
+    assert replies == [expected]
+    assert state is None
+    assert -100999 in watched
+
+
+async def test_notify_channel_state_still_receives_forward_unfiltered(conn, settings):
+    dp, _, _ = setup_dp(conn, settings)
+    fwd = Chat(id=-100888, type="channel", title="Alerts")
+    replies, state = await _feed(dp, Bot("123:ABC"), "/forwarded slash text", WaitingForInput.notify_channel,
+                                 forward_from_chat=fwd)
+    # Reached input_notify_channel (state cleared); bot.get_chat_member is unreachable offline.
+    assert state is None
+    assert len(replies) == 1 and "Notifications will be sent" not in replies[0]
+
+
+@pytest.mark.parametrize("name", [
+    "input_setstack", "input_setseniority", "input_setremote", "input_setlocation",
+    "input_setsalary", "input_setthreshold", "input_setkeywords", "input_addkeyword",
+])
+def test_user_input_handlers_have_slash_filter(conn, settings, name):
+    dp = Dispatcher()
+    register_bot_commands(dp, conn, settings, set())
+    h = next(h for h in dp.sub_routers[0].message.handlers if h.callback.__name__ == name)
+    assert len(h.filters) == 2  # StateFilter + ~F.text.startswith("/")
