@@ -65,3 +65,61 @@ def build_message_link(
         return None  # basic group: ids are small negatives, no permalinks
     cid = str(abs(channel_id))[3:]  # strip leading "100" from e.g. 1001234567890
     return f"https://t.me/c/{cid}/{message_id}"
+
+
+MAX_POST_URLS = 3
+
+
+def merge_urls(*groups: object, limit: int = MAX_POST_URLS) -> list[str]:
+    """Merge URL iterables in priority order: dedupe (keeping first), drop empties, cap."""
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in groups:
+        for u in group or ():  # type: ignore[attr-defined]
+            if isinstance(u, str) and u and u not in seen:
+                seen.add(u)
+                merged.append(u)
+                if len(merged) >= limit:
+                    return merged
+    return merged
+
+
+def button_urls_from_pyrogram(reply_markup: object) -> list[str]:
+    """URLs of inline URL buttons from a Pyrogram ``InlineKeyboardMarkup``.
+
+    Reads ``reply_markup.inline_keyboard`` (rows of buttons with ``.url``).
+    Tolerates None / unexpected shapes / buttons without a string ``url``.
+    """
+    rows = getattr(reply_markup, "inline_keyboard", None)
+    if not isinstance(rows, (list, tuple)):
+        return []
+    urls: list[str] = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)):
+            continue
+        for button in row:
+            u = getattr(button, "url", None)
+            if isinstance(u, str) and u:
+                urls.append(u)
+    return urls
+
+
+def button_urls_from_raw(reply_markup: object, url_button_type: type) -> list[str]:
+    """URLs of ``KeyboardButtonUrl`` buttons from a raw TL ``ReplyInlineMarkup``.
+
+    Reads ``reply_markup.rows[*].buttons``; non-URL buttons are ignored.
+    """
+    rows = getattr(reply_markup, "rows", None)
+    if not isinstance(rows, (list, tuple)):
+        return []
+    urls: list[str] = []
+    for row in rows:
+        buttons = getattr(row, "buttons", None)
+        if not isinstance(buttons, (list, tuple)):
+            continue
+        for button in buttons:
+            if isinstance(button, url_button_type):
+                u = getattr(button, "url", None)
+                if isinstance(u, str) and u:
+                    urls.append(u)
+    return urls

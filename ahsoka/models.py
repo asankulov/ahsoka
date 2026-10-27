@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from ahsoka.text_utils import build_message_link, entity_type_name
+from ahsoka.text_utils import (
+    build_message_link,
+    button_urls_from_pyrogram,
+    entity_type_name,
+    merge_urls,
+)
 
 
 @dataclass
@@ -30,11 +35,8 @@ class Post:
             getattr(chat, "username", None) or str(getattr(chat, "id", 0))
         )
 
-        seen: set[str] = set()
-        urls: list[str] = []
+        entity_urls: list[str] = []
         for entity in entities:
-            if len(urls) >= 3:
-                break
             etype = getattr(entity, "type", None)
             etype_val = entity_type_name(etype)
             if etype_val == "text_link":
@@ -45,9 +47,14 @@ class Post:
                 u = text[offset : offset + length]
             else:
                 continue
-            if u and u not in seen:
-                seen.add(u)
-                urls.append(u)
+            if u:
+                entity_urls.append(u)
+
+        # Button URLs first so they survive the cap (they often hold the real description).
+        urls = merge_urls(
+            button_urls_from_pyrogram(getattr(message, "reply_markup", None)),
+            entity_urls,
+        )
 
         return cls(
             channel_id=getattr(chat, "id", 0),

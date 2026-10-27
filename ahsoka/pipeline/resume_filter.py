@@ -12,4 +12,9 @@ _RESUME_RE = re.compile(
 
 def is_resume(post: Post) -> bool:
     """Return True if the post carries a resume hashtag (candidate CV, not a vacancy)."""
-    return bool(_RESUME_RE.search(post.text))
+    return has_resume_marker(post.text)
+
+
+def has_resume_marker(text: str) -> bool:
+    """Return True if arbitrary text (e.g. fetched linked content) carries a resume hashtag."""
+    return bool(_RESUME_RE.search(text))
