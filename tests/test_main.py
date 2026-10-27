@@ -1067,10 +1067,12 @@ async def test_pipeline_worker_calls_enqueue_single_for_multi_url_post(conn):
 
     with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
          patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock, return_value=active_configs), \
+         patch("ahsoka.main._fetch_content", new_callable=AsyncMock, return_value="fetched body"), \
          patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_single:
         await _run_pipeline_worker_with_one_post(post, conn, batch_queue, keyword_index)
 
     mock_single.assert_called_once()
+    assert mock_single.call_args.kwargs["content"] == "fetched body"
 
 
 async def test_pipeline_worker_duplicate_post_skipped(conn):
@@ -1630,3 +1632,223 @@ async def test_pipeline_worker_notify_target_check_runs_before_empty_text_check(
 
     no_notify_targets.assert_awaited_once()  # consulted even though the text is empty
     mock_mark_seen.assert_called_once_with(conn, -100777, post.message_id)
+
+# Short-post prefetch (button-link posts) and _fetch_content
+# ---------------------------------------------------------------------------
+
+LONG_TEXT = "x" * 400  # well above Settings.short_post_chars (300)
+
+
+def _kw_index(passes_result=True):
+    idx = MagicMock()
+    idx.passes = MagicMock(return_value=passes_result)
+    return idx
+
+
+async def test_pipeline_worker_short_post_with_urls_prefetches_and_passes_extra_text(conn):
+    post = make_post(text="Vacancy, details in button", urls=["https://jobs.example/1"])
+    keyword_index = _kw_index()
+    order = []
+
+    async def fake_fetch(p, pyro):
+        order.append("fetch")
+        return "full description golang"
+
+    keyword_index.passes.side_effect = lambda *a, **k: order.append("passes") or True
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock, return_value=[make_config()]), \
+         patch("ahsoka.main._fetch_content", side_effect=fake_fetch) as mock_fetch, \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_single:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), keyword_index)
+
+    mock_fetch.assert_called_once()
+    assert order == ["fetch", "passes"]
+    keyword_index.passes.assert_called_once_with(post, extra_text="full description golang")
+    mock_single.assert_called_once()
+    assert mock_single.call_args.kwargs["content"] == "full description golang"
+
+
+async def test_pipeline_worker_short_post_keyword_only_in_fetched_content_is_enqueued(conn):
+    """Real KeywordIndex: keyword absent from the stub text but present in the fetched page."""
+    from ahsoka.pipeline.keyword_index import KeywordIndex
+
+    idx = KeywordIndex()
+    idx._union = {"golang"}
+    idx._any_empty = False
+    post = make_post(text="Hiring, see button", urls=["https://jobs.example/1"])
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock, return_value=[make_config()]), \
+         patch("ahsoka.main._fetch_content", new_callable=AsyncMock, return_value="Senior Golang dev"), \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_single:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), idx)
+
+    mock_single.assert_called_once()
+    assert mock_single.call_args.kwargs["content"] == "Senior Golang dev"
+
+
+async def test_pipeline_worker_short_post_keyword_absent_everywhere_is_dropped(conn):
+    post = make_post(text="Hiring, see button", urls=["https://jobs.example/1"])
+    keyword_index = _kw_index(passes_result=False)
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main._fetch_content", new_callable=AsyncMock, return_value="nothing relevant"), \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen, \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_single:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), keyword_index)
+
+    mock_mark_seen.assert_called_once()
+    mock_single.assert_not_called()
+
+
+async def test_pipeline_worker_long_post_does_not_prefetch(conn):
+    post = make_post(text=LONG_TEXT, urls=["https://jobs.example/1"])
+    keyword_index = _kw_index()
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock, return_value=[make_config()]), \
+         patch("ahsoka.main._fetch_content", new_callable=AsyncMock) as mock_fetch, \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_single:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), keyword_index)
+
+    mock_fetch.assert_not_called()
+    keyword_index.passes.assert_called_once_with(post)
+    assert mock_single.call_args.kwargs["content"] is None
+
+
+async def test_pipeline_worker_short_post_without_urls_does_not_prefetch(conn):
+    post = make_post(text="Python job", urls=[])
+    keyword_index = _kw_index()
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock, return_value=[make_config()]), \
+         patch("ahsoka.main._fetch_content", new_callable=AsyncMock) as mock_fetch, \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock):
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), keyword_index)
+
+    mock_fetch.assert_not_called()
+    keyword_index.passes.assert_called_once_with(post)
+
+
+async def test_pipeline_worker_empty_text_with_url_not_dropped_as_empty(conn):
+    post = make_post(text="", urls=["https://jobs.example/1"])
+    keyword_index = _kw_index()
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock, return_value=[make_config()]), \
+         patch("ahsoka.main._fetch_content", new_callable=AsyncMock, return_value="body") as mock_fetch, \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_single:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), keyword_index)
+
+    mock_fetch.assert_called_once()
+    mock_single.assert_called_once()
+
+
+async def test_pipeline_worker_empty_text_without_urls_dropped(conn):
+    post = make_post(text="   ", urls=[])
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main._fetch_content", new_callable=AsyncMock) as mock_fetch, \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen, \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_single:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), _kw_index())
+
+    mock_mark_seen.assert_called_once()
+    mock_fetch.assert_not_called()
+    mock_single.assert_not_called()
+
+
+async def test_pipeline_worker_short_post_resume_in_fetched_content_dropped(conn):
+    post = make_post(text="See details", urls=["https://jobs.example/1"])
+    keyword_index = _kw_index()
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main._fetch_content", new_callable=AsyncMock, return_value="#резюме backend dev"), \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen, \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_single:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), keyword_index)
+
+    mock_mark_seen.assert_called_once()
+    keyword_index.passes.assert_not_called()
+    mock_single.assert_not_called()
+
+
+async def test_enqueue_single_with_content_skips_fetch(conn):
+    from ahsoka.main import _enqueue_single
+
+    post = make_post(urls=["https://example.com/job"])
+    batch_queue = AsyncMock()
+
+    with patch("ahsoka.main._fetch_content", new_callable=AsyncMock) as mock_fetch, \
+         patch("ahsoka.main.scrape_content", new_callable=AsyncMock) as mock_scrape, \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock, return_value=True):
+        await _enqueue_single(conn, batch_queue, post, [make_config()], MagicMock(), content="prefetched")
+
+    mock_fetch.assert_not_called()
+    mock_scrape.assert_not_called()
+    assert batch_queue.enqueue.call_args[0][1] == "prefetched"
+
+
+async def test_enqueue_single_without_content_fetches_once_after_mark_seen(conn):
+    from ahsoka.main import _enqueue_single
+
+    post = make_post(urls=["https://example.com/job"])
+    batch_queue = AsyncMock()
+    order = []
+
+    async def fake_mark(*a, **k):
+        order.append("mark")
+        return True
+
+    async def fake_fetch(*a, **k):
+        order.append("fetch")
+        return "fetched"
+
+    with patch("ahsoka.main._fetch_content", side_effect=fake_fetch) as mock_fetch, \
+         patch("ahsoka.main.db.mark_seen", side_effect=fake_mark):
+        await _enqueue_single(conn, batch_queue, post, [make_config()], MagicMock())
+
+    assert order == ["mark", "fetch"]
+    mock_fetch.assert_called_once()
+    assert batch_queue.enqueue.call_args[0][1] == "fetched"
+
+
+async def test_enqueue_single_lost_race_with_content_does_not_enqueue(conn):
+    from ahsoka.main import _enqueue_single
+
+    batch_queue = AsyncMock()
+    with patch("ahsoka.main._fetch_content", new_callable=AsyncMock) as mock_fetch, \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock, return_value=False):
+        await _enqueue_single(
+            conn, batch_queue, make_post(urls=["https://a.com"]), [make_config()], MagicMock(), content="prefetched"
+        )
+
+    mock_fetch.assert_not_called()
+    batch_queue.enqueue.assert_not_called()
+
+
+async def test_fetch_content_tg_url_resolves_and_http_url_scraped():
+    from ahsoka.main import _fetch_content
+
+    post = make_post(urls=["https://example.com/job", "https://t.me/chan/5"])
+    pyro = MagicMock()
+
+    with patch("ahsoka.main.scrape_content", new_callable=AsyncMock, return_value="scraped") as mock_scrape, \
+         patch("ahsoka.main.resolve_tg_link", new_callable=AsyncMock, return_value="resolved text") as mock_resolve:
+        result = await _fetch_content(post, pyro)
+
+    mock_scrape.assert_called_once()
+    mock_resolve.assert_called_once_with("https://t.me/chan/5", pyro)
+    assert result.startswith("scraped")
+    assert "--- linked from https://t.me/chan/5 ---\nresolved text" in result
+
+
+async def test_fetch_content_http_only_never_calls_resolver():
+    from ahsoka.main import _fetch_content
+
+    post = make_post(urls=["https://example.com/job"])
+    with patch("ahsoka.main.scrape_content", new_callable=AsyncMock, return_value="scraped"), \
+         patch("ahsoka.main.resolve_tg_link", new_callable=AsyncMock) as mock_resolve:
+        assert await _fetch_content(post, MagicMock()) == "scraped"
+    mock_resolve.assert_not_called()

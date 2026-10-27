@@ -2163,3 +2163,116 @@ async def test_poller_keeps_message_whose_forward_origin_is_its_own_chat():
 
     posts = await _poll_sweeps(history, {GROUP_ID_P}, max_sleeps=2)
     assert [p.message_id for p in posts] == [1]
+
+# Inline-button URLs (raw reply_markup)
+# ---------------------------------------------------------------------------
+
+
+def _capture_handler(queue, chat_id):
+    from ahsoka.watcher.handler import register_watcher_handlers
+
+    holder = {}
+
+    def fake_on_raw_update():
+        def decorator(fn):
+            holder["fn"] = fn
+            return fn
+        return decorator
+
+    client = MagicMock()
+    client.on_raw_update = fake_on_raw_update
+    register_watcher_handlers(client, queue, {chat_id})
+    return client, holder
+
+
+def _markup(rows_buttons):
+    from pyrogram.raw import types as raw_types
+
+    markup = MagicMock()
+    rows = []
+    for buttons in rows_buttons:
+        row = MagicMock()
+        row.buttons = buttons
+        rows.append(row)
+    markup.rows = rows
+    return markup
+
+
+def _url_button(url):
+    from pyrogram.raw import types as raw_types
+
+    b = MagicMock(spec=raw_types.KeyboardButtonUrl)
+    b.url = url
+    return b
+
+
+async def _run_with_markup(reply_markup, entities=None, set_markup=True):
+    queue: asyncio.Queue = asyncio.Queue()
+    raw_id = 31337
+    chat_id = int(f"-100{raw_id}")
+    client, holder = _capture_handler(queue, chat_id)
+    msg = _make_channel_message(channel_id=raw_id, entities=entities)
+    if set_markup:
+        msg.reply_markup = reply_markup
+    await holder["fn"](client, _make_update(msg), users={}, chats={})
+    return queue.get_nowait()
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_extracts_keyboard_button_url():
+    try:
+        from pyrogram.raw import types as raw_types  # noqa: F401
+    except Exception:
+        pytest.skip("Pyrogram not importable in this environment")
+    post = await _run_with_markup(_markup([[_url_button("https://jobs.io/1")]]))
+    assert post.urls == ["https://jobs.io/1"]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_ignores_callback_buttons():
+    try:
+        from pyrogram.raw import types as raw_types
+    except Exception:
+        pytest.skip("Pyrogram not importable in this environment")
+    cb = MagicMock(spec=raw_types.KeyboardButtonCallback)
+    cb.url = "https://should-not-appear"
+    post = await _run_with_markup(_markup([[cb, _url_button("https://ok.io")]]))
+    assert post.urls == ["https://ok.io"]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_buttons_first_deduped_and_capped_with_entities():
+    try:
+        from pyrogram.raw import types as raw_types
+    except Exception:
+        pytest.skip("Pyrogram not importable in this environment")
+    ents = []
+    for u in ("https://btn.io", "https://e1.io", "https://e2.io"):
+        e = MagicMock(spec=raw_types.MessageEntityTextUrl)
+        e.url = u
+        ents.append(e)
+    post = await _run_with_markup(
+        _markup([[_url_button("https://btn.io"), _url_button("https://btn2.io")]]), entities=ents
+    )
+    # buttons first; "https://btn.io" duplicate removed; cap 3
+    assert post.urls == ["https://btn.io", "https://btn2.io", "https://e1.io"]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_reply_markup_none_no_crash():
+    try:
+        from pyrogram.raw import types as raw_types  # noqa: F401
+    except Exception:
+        pytest.skip("Pyrogram not importable in this environment")
+    post = await _run_with_markup(None)
+    assert post.urls == []
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_reply_markup_without_rows_no_crash():
+    try:
+        from pyrogram.raw import types as raw_types  # noqa: F401
+    except Exception:
+        pytest.skip("Pyrogram not importable in this environment")
+    post = await _run_with_markup(MagicMock(spec=[]))
+    assert post.urls == []

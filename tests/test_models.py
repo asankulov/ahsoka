@@ -422,3 +422,73 @@ def test_link_just_above_boundary_is_basic_group():
 
 def test_link_username_wins_for_basic_group_id():
     assert _post(-4567, "mygroup").link == "https://t.me/mygroup/77"
+
+
+# ---------------------------------------------------------------------------
+# Inline-button URLs (reply_markup)
+# ---------------------------------------------------------------------------
+
+
+def _button(url):
+    b = MagicMock()
+    b.url = url
+    return b
+
+
+def _with_buttons(msg, rows):
+    msg.reply_markup = MagicMock()
+    msg.reply_markup.inline_keyboard = rows
+    return msg
+
+
+def test_from_message_extracts_button_urls():
+    msg = _with_buttons(make_message(text="Details in button"), [[_button("https://jobs.io/1")]])
+    assert Post.from_message(msg).urls == ["https://jobs.io/1"]
+
+
+def test_from_message_button_urls_come_before_entity_urls():
+    text = "see https://ent.io"
+    msg = _with_buttons(
+        make_message(text=text, entities=[make_entity("url", offset=4, length=14)]),
+        [[_button("https://btn.io")]],
+    )
+    assert Post.from_message(msg).urls == ["https://btn.io", "https://ent.io"]
+
+
+def test_from_message_button_and_entity_duplicate_deduped():
+    msg = _with_buttons(
+        make_message(text="x", entities=[make_entity("text_link", url="https://same.io")]),
+        [[_button("https://same.io")]],
+    )
+    assert Post.from_message(msg).urls == ["https://same.io"]
+
+
+def test_from_message_cap_three_keeps_buttons_first():
+    ents = [make_entity("text_link", url=f"https://e{i}.io") for i in range(3)]
+    msg = _with_buttons(
+        make_message(text="x", entities=ents),
+        [[_button("https://b0.io"), _button("https://b1.io")]],
+    )
+    assert Post.from_message(msg).urls == ["https://b0.io", "https://b1.io", "https://e0.io"]
+
+
+def test_from_message_buttons_without_url_ignored():
+    msg = _with_buttons(make_message(text="x"), [[_button(None), _button("https://ok.io")]])
+    assert Post.from_message(msg).urls == ["https://ok.io"]
+
+
+def test_from_message_reply_markup_none_no_crash():
+    msg = make_message(text="x")
+    msg.reply_markup = None
+    assert Post.from_message(msg).urls == []
+
+
+def test_from_message_reply_markup_attribute_missing_no_crash():
+    msg = make_message(text="x")
+    del msg.reply_markup
+    assert Post.from_message(msg).urls == []
+
+
+def test_from_message_reply_markup_non_list_keyboard_no_crash():
+    # MagicMock default: inline_keyboard is a MagicMock, not a list
+    assert Post.from_message(make_message(text="x")).urls == []

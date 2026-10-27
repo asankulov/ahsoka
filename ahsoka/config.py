@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     claude_model: str = "claude-haiku-5-5"
     default_score_threshold: int = 7
     scrape_timeout_s: float = 5.0
+    short_post_chars: int = 300  # posts shorter than this get linked content prefetched pre-filter
     db_path: str = "ahsoka.db"
     batch_flush_size: int = 50
     batch_flush_seconds: int = 600

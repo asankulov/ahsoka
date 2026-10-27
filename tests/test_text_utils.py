@@ -4,7 +4,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from ahsoka.text_utils import build_message_link, entity_type_name, slice_utf16
+from ahsoka.text_utils import (
+    MAX_POST_URLS,
+    build_message_link,
+    button_urls_from_pyrogram,
+    button_urls_from_raw,
+    entity_type_name,
+    merge_urls,
+    slice_utf16,
+)
 
 
 def test_slice_utf16_emoji_before_url_extracts_full_url():
@@ -169,3 +177,91 @@ def test_build_message_link_basic_group_without_username_is_none():
 def test_build_message_link_boundary_is_c_form_and_just_above_is_none():
     assert build_message_link(-(10**12), 7) == "https://t.me/c/0000000000/7"
     assert build_message_link(-(10**12 - 1), 7) is None
+
+
+# ---------------------------------------------------------------------------
+# merge_urls / button URL extraction
+# ---------------------------------------------------------------------------
+
+
+def test_merge_urls_priority_order_and_dedupe():
+    assert merge_urls(["a", "b"], ["b", "c"]) == ["a", "b", "c"]
+
+
+def test_merge_urls_caps_at_default_limit_keeping_first_group():
+    assert MAX_POST_URLS == 3
+    assert merge_urls(["a", "b"], ["c", "d", "e"]) == ["a", "b", "c"]
+
+
+def test_merge_urls_custom_limit():
+    assert merge_urls(["a", "b", "c"], limit=1) == ["a"]
+
+
+def test_merge_urls_drops_empty_and_non_str_and_none_groups():
+    assert merge_urls(None, ["", None, 5, "a"], []) == ["a"]
+
+
+def test_merge_urls_no_groups_empty():
+    assert merge_urls() == []
+
+
+def _btn(url):
+    b = MagicMock()
+    b.url = url
+    return b
+
+
+def test_button_urls_from_pyrogram_extracts_in_row_order():
+    markup = MagicMock()
+    markup.inline_keyboard = [[_btn("https://a"), _btn("https://b")], [_btn("https://c")]]
+    assert button_urls_from_pyrogram(markup) == ["https://a", "https://b", "https://c"]
+
+
+def test_button_urls_from_pyrogram_ignores_buttons_without_str_url():
+    markup = MagicMock()
+    markup.inline_keyboard = [[_btn(None), _btn(""), _btn(123), _btn("https://ok")]]
+    assert button_urls_from_pyrogram(markup) == ["https://ok"]
+
+
+def test_button_urls_from_pyrogram_none_and_bad_shapes():
+    assert button_urls_from_pyrogram(None) == []
+    assert button_urls_from_pyrogram(MagicMock()) == []  # inline_keyboard is a MagicMock
+    bad = MagicMock()
+    bad.inline_keyboard = ["not-a-row", [_btn("https://ok")]]
+    assert button_urls_from_pyrogram(bad) == ["https://ok"]
+
+
+class _UrlBtn:
+    def __init__(self, url):
+        self.url = url
+
+
+class _CbBtn:
+    url = "https://should-not-appear"
+
+
+class _Row:
+    def __init__(self, buttons):
+        self.buttons = buttons
+
+
+class _Markup:
+    def __init__(self, rows):
+        self.rows = rows
+
+
+def test_button_urls_from_raw_only_url_type_buttons():
+    markup = _Markup([_Row([_UrlBtn("https://a"), _CbBtn()]), _Row([_UrlBtn("https://b")])])
+    assert button_urls_from_raw(markup, _UrlBtn) == ["https://a", "https://b"]
+
+
+def test_button_urls_from_raw_empty_and_non_str_urls_skipped():
+    markup = _Markup([_Row([_UrlBtn(""), _UrlBtn(None), _UrlBtn(7), _UrlBtn("https://ok")])])
+    assert button_urls_from_raw(markup, _UrlBtn) == ["https://ok"]
+
+
+def test_button_urls_from_raw_missing_or_bad_shapes():
+    assert button_urls_from_raw(None, _UrlBtn) == []
+    assert button_urls_from_raw(MagicMock(), _UrlBtn) == []  # rows not a list
+    markup = _Markup([_Row(MagicMock()), _Row([_UrlBtn("https://ok")])])  # buttons not a list
+    assert button_urls_from_raw(markup, _UrlBtn) == ["https://ok"]

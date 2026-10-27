@@ -20,7 +20,7 @@ from ahsoka.watcher.handler import register_watcher_handlers
 from ahsoka.watcher.poller import channel_poller
 from ahsoka.pipeline.dedup import is_duplicate
 from ahsoka.pipeline.keyword_index import KeywordIndex
-from ahsoka.pipeline.resume_filter import is_resume
+from ahsoka.pipeline.resume_filter import is_resume, has_resume_marker
 from ahsoka.pipeline.user_filter import matches_user
 from ahsoka.pipeline.scraper import scrape_content
 from ahsoka.pipeline.batch_queue import BatchQueue
@@ -144,7 +144,7 @@ async def pipeline_worker(
                 await db.mark_seen(conn, post.channel_id, post.message_id)
                 continue
 
-            if not post.text.strip():
+            if not post.text.strip() and not post.urls:
                 logger.debug("Empty-text drop: %s/%s", post.channel_id, post.message_id)
                 await db.mark_seen(conn, post.channel_id, post.message_id)
                 continue
@@ -154,7 +154,23 @@ async def pipeline_worker(
                 await db.mark_seen(conn, post.channel_id, post.message_id)
                 continue
 
-            if not keyword_index.passes(post):
+            # Short posts with links (e.g. a "Details" button): the real description lives
+            # behind the link, so prefetch it (read-only; the seen-claim still happens in
+            # _enqueue_single) and let the keyword/resume filters see it.
+            prefetched: str | None = None
+            if post.urls and len(post.text.strip()) < settings.short_post_chars:
+                prefetched = await _fetch_content(post, pyro)
+                if has_resume_marker(prefetched):
+                    logger.debug("Resume drop (linked content): %s/%s", post.channel_id, post.message_id)
+                    await db.mark_seen(conn, post.channel_id, post.message_id)
+                    continue
+
+            passed = (
+                keyword_index.passes(post, extra_text=prefetched)
+                if prefetched
+                else keyword_index.passes(post)
+            )
+            if not passed:
                 logger.debug("Keyword drop: %s/%s", post.channel_id, post.message_id)
                 await db.mark_seen(conn, post.channel_id, post.message_id)
                 continue
@@ -166,7 +182,9 @@ async def pipeline_worker(
                 await db.mark_seen(conn, post.channel_id, post.message_id)
                 continue
 
-            await _enqueue_single(conn, batch_queue, post, active_configs, pyro)
+            await _enqueue_single(
+                conn, batch_queue, post, active_configs, pyro, content=prefetched
+            )
         except Exception:
             logger.exception("Pipeline error for %s/%s", post.channel_id, post.message_id)
         finally:
@@ -179,6 +197,7 @@ async def _enqueue_single(
     post: Post,
     active_configs: list,
     pyro,
+    content: str | None = None,
 ) -> None:
     """Claim the post as seen, then scrape content and enqueue for scoring.
 
@@ -193,18 +212,28 @@ async def _enqueue_single(
     the claim is a single atomic call for the whole post (not one claim
     per URL), there is no way for two workers to each win a different
     URL within the same post and both independently enqueue.
+
+    ``content`` is the already-fetched scrape+resolve result (short-post prefetch);
+    when given, no second fetch happens.
     """
     won = await db.mark_seen(conn, post.channel_id, post.message_id)
     if not won:
         logger.debug("Lost race, already claimed: %s/%s", post.channel_id, post.message_id)
         return
+    if content is None:
+        content = await _fetch_content(post, pyro)
+    await batch_queue.enqueue(post, content, active_configs)
+
+
+async def _fetch_content(post: Post, pyro) -> str:
+    """Scrape http(s) links and resolve t.me links; returns text + linked content (read-only)."""
     content = await scrape_content(post, timeout=settings.scrape_timeout_s)
     for url in post.urls:
         if is_tg_link(url):
             resolved = await resolve_tg_link(url, pyro)
             if resolved:
                 content += f"\n\n--- linked from {url} ---\n{resolved}"
-    await batch_queue.enqueue(post, content, active_configs)
+    return content
 
 
 async def cleanup_worker(conn: aiosqlite.Connection) -> None:

@@ -20,9 +20,12 @@ class KeywordIndex:
         for c in configs:
             self._union.update(kw.lower() for kw in c.keywords.split() if kw.strip())
 
-    def passes(self, post: Post) -> bool:
-        """Return True if any user's keywords match or any user has empty keywords."""
+    def passes(self, post: Post, extra_text: str = "") -> bool:
+        """Return True if any user's keywords match or any user has empty keywords.
+
+        ``extra_text`` (e.g. prefetched linked content) is matched in addition to the post text.
+        """
         if self._any_empty or not self._union:
             return True
-        text_lower = post.text.lower()
+        text_lower = f"{post.text}\n{extra_text}".lower() if extra_text else post.text.lower()
         return any(kw in text_lower for kw in self._union)

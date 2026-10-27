@@ -7,7 +7,7 @@ from pyrogram.raw import types as raw_types
 
 from ahsoka.models import Post
 from ahsoka.watcher.migration import migrate_watched_chat, supergroup_chat_id
-from ahsoka.text_utils import slice_utf16
+from ahsoka.text_utils import button_urls_from_raw, merge_urls, slice_utf16
 
 logger = logging.getLogger(__name__)
 
@@ -88,20 +88,24 @@ def register_watcher_handlers(
             ch = chats[raw_id]
             channel_name = getattr(ch, "username", None) or str(chat_id)
 
-        seen: set[str] = set()
-        urls: list[str] = []
+        entity_urls: list[str] = []
         for entity in (msg.entities or []):
-            if len(urls) >= 3:
-                break
             if isinstance(entity, raw_types.MessageEntityTextUrl):
                 u = entity.url
             elif isinstance(entity, raw_types.MessageEntityUrl):
                 u = slice_utf16(text, entity.offset, entity.length)
             else:
                 continue
-            if u and u not in seen:
-                seen.add(u)
-                urls.append(u)
+            if u:
+                entity_urls.append(u)
+
+        # Button URLs first so they survive the cap (they often hold the real description).
+        urls = merge_urls(
+            button_urls_from_raw(
+                getattr(msg, "reply_markup", None), raw_types.KeyboardButtonUrl
+            ),
+            entity_urls,
+        )
 
         post = Post(
             channel_id=chat_id,

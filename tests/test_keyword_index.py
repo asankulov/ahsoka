@@ -167,3 +167,38 @@ async def test_passes_keyword_from_any_user_is_enough(conn):
 
     assert idx.passes(make_post("Senior Java backend role")) is True
     assert idx.passes(make_post("Frontend only role")) is False
+
+
+async def test_passes_extra_text_matches_keyword_absent_from_post_text(conn):
+    configs = [make_config(user_id=1, keywords="golang")]
+    idx = KeywordIndex()
+    with patch("ahsoka.pipeline.keyword_index.db.get_all_active_configs", new_callable=AsyncMock, return_value=configs):
+        await idx.rebuild(conn)
+
+    post = make_post("Hiring, see the button")
+    assert idx.passes(post) is False
+    assert idx.passes(post, extra_text="We need a GOLANG engineer") is True
+
+
+async def test_passes_extra_text_without_match_still_false(conn):
+    configs = [make_config(user_id=1, keywords="golang")]
+    idx = KeywordIndex()
+    with patch("ahsoka.pipeline.keyword_index.db.get_all_active_configs", new_callable=AsyncMock, return_value=configs):
+        await idx.rebuild(conn)
+
+    assert idx.passes(make_post("Hiring"), extra_text="Java role") is False
+
+
+async def test_passes_empty_union_true_regardless_of_extra_text(conn):
+    idx = KeywordIndex()
+    with patch("ahsoka.pipeline.keyword_index.db.get_all_active_configs", new_callable=AsyncMock, return_value=[]):
+        await idx.rebuild(conn)
+    assert idx.passes(make_post("anything"), extra_text="more") is True
+
+
+async def test_passes_any_empty_keywords_true_regardless_of_extra_text(conn):
+    configs = [make_config(user_id=1, keywords=""), make_config(user_id=2, keywords="rust")]
+    idx = KeywordIndex()
+    with patch("ahsoka.pipeline.keyword_index.db.get_all_active_configs", new_callable=AsyncMock, return_value=configs):
+        await idx.rebuild(conn)
+    assert idx.passes(make_post("nothing"), extra_text="zip") is True

@@ -4,7 +4,7 @@ from datetime import datetime
 import pytest
 
 from ahsoka.models import Post
-from ahsoka.pipeline.resume_filter import is_resume
+from ahsoka.pipeline.resume_filter import has_resume_marker, is_resume
 
 
 def make_post(text: str) -> Post:
@@ -65,3 +65,18 @@ def test_is_resume_normal_vacancy_false():
 
 def test_is_resume_empty_text_false():
     assert is_resume(make_post("")) is False
+
+
+@pytest.mark.parametrize("text", ["#резюме dev", "see #CV below", "x\n#resume"])
+def test_has_resume_marker_match_true(text):
+    assert has_resume_marker(text) is True
+
+
+@pytest.mark.parametrize("text", ["", "Senior Python vacancy", "#cvs", "#резюмера"])
+def test_has_resume_marker_no_match_false(text):
+    assert has_resume_marker(text) is False
+
+
+def test_is_resume_delegates_to_post_text_marker():
+    assert is_resume(make_post("#resume")) is True
+    assert is_resume(make_post("vacancy")) is False
