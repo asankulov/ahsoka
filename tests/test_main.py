@@ -61,6 +61,18 @@ async def conn():
         yield c
 
 
+@pytest.fixture(autouse=True)
+def no_notify_targets():
+    """pipeline_worker consults db.get_notify_chat_ids; default to no targets.
+
+    A real aiosqlite round-trip needs more loop ticks than the worker helper waits,
+    so patch it. Tests that care override via their own nested patch.
+    """
+    with patch("ahsoka.main.db.get_notify_chat_ids", new_callable=AsyncMock,
+               return_value=set()) as m:
+        yield m
+
+
 # ---------------------------------------------------------------------------
 # _fan_out_verdicts
 # ---------------------------------------------------------------------------
@@ -1409,7 +1421,8 @@ async def test_main_starts_warm_task_and_passes_it_as_poller_ready():
         await asyncio.sleep(9999)  # pragma: no cover - cancelled before start
 
     async def fake_poller(client, queue, channels, ready=None,
-                          lost_channels=None, channel_names=None, own_bot_id=None):
+                          lost_channels=None, channel_names=None, own_bot_id=None,
+                          conn=None):
         await asyncio.sleep(9999)  # pragma: no cover - cancelled before start
 
     async def capturing_gather(*tasks, **kwargs):
@@ -1424,7 +1437,9 @@ async def test_main_starts_warm_task_and_passes_it_as_poller_ready():
 
     snapshot: dict = {}
     loaded_names = {-1001: "Chan [-1001]"}
+    register = MagicMock()
     extra = [
+        patch("ahsoka.main.register_watcher_handlers", register),
         patch("ahsoka.main.warm_peer_cache", fake_warm),
         patch("ahsoka.main.channel_poller", fake_poller),
         patch("ahsoka.main.db.load_channel_names", new_callable=AsyncMock,
@@ -1446,6 +1461,13 @@ async def test_main_starts_warm_task_and_passes_it_as_poller_ready():
     assert warm_locals["channel_names"] is loaded_names
     assert warm_locals["lost_channels"] == set()
     assert warm_locals["conn"] is not None
+    # conn + shared name/lost state flow to the poller and the raw-update handler
+    assert poller_locals["conn"] is warm_locals["conn"]
+    reg_kwargs = register.call_args.kwargs
+    assert reg_kwargs["conn"] is warm_locals["conn"]
+    assert reg_kwargs["channel_names"] is loaded_names
+    assert reg_kwargs["lost_channels"] is warm_locals["lost_channels"]
+    assert reg_kwargs["lost_channels"] is poller_locals["lost_channels"]
 
 
 async def test_fan_out_passes_conn_and_user_id_to_send_notification(conn):
@@ -1544,3 +1566,67 @@ async def test_main_unparsable_bot_token_passes_none_own_bot_id():
 
     assert register.call_args.kwargs["own_bot_id"] is None
     assert poller.call_args.kwargs["own_bot_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Notify-target drop (loop prevention)
+# ---------------------------------------------------------------------------
+
+
+async def test_pipeline_worker_drops_post_from_notify_target_chat(conn, no_notify_targets):
+    post = make_post(channel_id=-100777)
+    no_notify_targets.return_value = {42, -100777}
+    keyword_index = MagicMock()
+    keyword_index.passes = MagicMock(return_value=True)
+    batch_queue = AsyncMock()
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock) as mock_configs, \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen, \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_enqueue:
+        await _run_pipeline_worker_with_one_post(post, conn, batch_queue, keyword_index)
+
+    mock_mark_seen.assert_called_once_with(conn, -100777, post.message_id)
+    keyword_index.passes.assert_not_called()
+    mock_configs.assert_not_called()
+    mock_enqueue.assert_not_called()
+    batch_queue.enqueue.assert_not_called()
+
+
+async def test_pipeline_worker_non_target_chat_not_dropped_by_notify_check(conn, no_notify_targets):
+    post = make_post(channel_id=-100777)
+    no_notify_targets.return_value = {42}  # a different chat is the target
+    keyword_index = MagicMock()
+    keyword_index.passes = MagicMock(return_value=True)
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock,
+               return_value=[make_config()]), \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock), \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_enqueue:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), keyword_index)
+
+    keyword_index.passes.assert_called_once()
+    mock_enqueue.assert_called_once()
+
+
+async def test_pipeline_worker_notify_target_check_runs_after_dedup(conn, no_notify_targets):
+    post = make_post(channel_id=-100777)
+    no_notify_targets.return_value = {-100777}
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=True), \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), MagicMock())
+
+    no_notify_targets.assert_not_awaited()
+    mock_mark_seen.assert_not_called()
+
+
+async def test_pipeline_worker_notify_target_check_runs_before_empty_text_check(conn, no_notify_targets):
+    post = make_post(channel_id=-100777, text="   ")
+    no_notify_targets.return_value = {-100777}
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), MagicMock())
+
+    no_notify_targets.assert_awaited_once()  # consulted even though the text is empty
+    mock_mark_seen.assert_called_once_with(conn, -100777, post.message_id)

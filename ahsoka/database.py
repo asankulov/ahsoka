@@ -308,6 +308,27 @@ async def load_channel_names(conn: aiosqlite.Connection) -> dict[int, str]:
     return {cid: format_channel_label(cid, username, title) for cid, username, title in rows}
 
 
+async def migrate_channel(conn: aiosqlite.Connection, old_id: int, new_id: int) -> bool:
+    """Re-key a watched chat (basic group -> supergroup), keeping its metadata.
+
+    Idempotent: returns False (no changes) if `old_id` is not in the table;
+    `INSERT OR IGNORE` keeps an already-present `new_id` row untouched.
+    """
+    async with conn.execute(
+        "SELECT 1 FROM watched_channels WHERE channel_id = ?", (old_id,)
+    ) as cur:
+        if await cur.fetchone() is None:
+            return False
+    await conn.execute(
+        "INSERT OR IGNORE INTO watched_channels (channel_id, added_by, added_at, username, title) "
+        "SELECT ?, added_by, added_at, username, title FROM watched_channels WHERE channel_id = ?",
+        (new_id, old_id),
+    )
+    await conn.execute("DELETE FROM watched_channels WHERE channel_id = ?", (old_id,))
+    await conn.commit()
+    return True
+
+
 async def remove_channel(conn: aiosqlite.Connection, channel_id: int) -> None:
     await conn.execute(
         "DELETE FROM watched_channels WHERE channel_id = ?",
@@ -429,6 +450,13 @@ async def ban_user(conn: aiosqlite.Connection, user_id: int) -> None:
 async def unban_user(conn: aiosqlite.Connection, user_id: int) -> None:
     await conn.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (user_id,))
     await conn.commit()
+
+
+async def get_notify_chat_ids(conn: aiosqlite.Connection) -> set[int]:
+    """Distinct notification target chat ids across all users (DMs included)."""
+    async with conn.execute("SELECT DISTINCT notify_chat_id FROM users") as cur:
+        rows = await cur.fetchall()
+    return {r[0] for r in rows}
 
 
 async def set_notify_target(conn: aiosqlite.Connection, user_id: int, chat_id: int) -> None:

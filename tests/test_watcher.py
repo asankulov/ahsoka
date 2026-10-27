@@ -1780,3 +1780,386 @@ async def test_poller_own_bot_id_skips_own_messages_keeps_humans():
 async def test_poller_default_own_bot_id_none_enqueues_everyone_non_bot():
     posts = await _poll_once([_real_msg(1, user_id=OWN_BOT), _real_msg(2, user_id=9)])
     assert [p.message_id for p in posts] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Group migration: supergroup_chat_id / migrate_watched_chat
+# ---------------------------------------------------------------------------
+
+OLD_GID = -4242
+NEW_GID = -1001000004242
+
+
+def test_supergroup_chat_id_prefixes_raw_channel_id():
+    from ahsoka.watcher.migration import supergroup_chat_id
+
+    assert supergroup_chat_id(1000004242) == -1001000004242
+
+
+async def test_migrate_watched_chat_updates_watchlist_lost_names_and_db(caplog):
+    import logging
+
+    import aiosqlite
+
+    from ahsoka import database as db
+    from ahsoka.watcher.migration import migrate_watched_chat
+
+    async with aiosqlite.connect(":memory:") as conn:
+        await db.init_db(conn, owner_chat_id=1)
+        await db.add_channel(conn, OLD_GID, added_by=1, title="Grp")
+        watched = {OLD_GID, -1001}
+        lost = {OLD_GID}
+        names = {OLD_GID: f"Grp [{OLD_GID}]", -1001: "Other [-1001]"}
+
+        with caplog.at_level(logging.WARNING, logger="ahsoka.watcher.migration"):
+            assert await migrate_watched_chat(conn, watched, OLD_GID, NEW_GID, names, lost) is True
+
+        assert await db.load_watched_channels(conn) == {NEW_GID}
+    assert watched == {NEW_GID, -1001}
+    assert lost == set()
+    assert names == {NEW_GID: f"Grp [{NEW_GID}]", -1001: "Other [-1001]"}
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert str(OLD_GID) in warnings[0].getMessage() and str(NEW_GID) in warnings[0].getMessage()
+
+
+async def test_migrate_watched_chat_noop_when_old_id_not_watched(caplog):
+    import logging
+    from unittest.mock import AsyncMock
+
+    from ahsoka.watcher.migration import migrate_watched_chat
+
+    conn = MagicMock()
+    watched = {-1001}
+    names = {-1001: "x"}
+    lost = {-1001}
+    with patch("ahsoka.watcher.migration.db.migrate_channel", new_callable=AsyncMock) as mig, \
+            caplog.at_level(logging.WARNING, logger="ahsoka.watcher.migration"):
+        assert await migrate_watched_chat(conn, watched, OLD_GID, NEW_GID, names, lost) is False
+    mig.assert_not_awaited()
+    assert watched == {-1001} and names == {-1001: "x"} and lost == {-1001}
+    assert not caplog.records
+
+
+async def test_migrate_watched_chat_without_conn_or_optional_state_still_rekeys_watchlist():
+    from ahsoka.watcher.migration import migrate_watched_chat
+
+    watched = {OLD_GID}
+    assert await migrate_watched_chat(None, watched, OLD_GID, NEW_GID) is True
+    assert watched == {NEW_GID}
+
+
+async def test_migrate_watched_chat_without_label_leaves_names_untouched():
+    from ahsoka.watcher.migration import migrate_watched_chat
+
+    names = {-1001: "x"}
+    await migrate_watched_chat(None, {OLD_GID}, OLD_GID, NEW_GID, names, set())
+    assert names == {-1001: "x"}
+
+
+# ---------------------------------------------------------------------------
+# Group migration + auto-forward dedup: handler
+# ---------------------------------------------------------------------------
+
+
+def _migrate_service_update(old_chat_id=4242, new_channel_id=1000004242, peer_kind="chat"):
+    from pyrogram.raw import types as raw_types
+
+    action = MagicMock(spec=raw_types.MessageActionChatMigrateTo)
+    action.channel_id = new_channel_id
+    msg = MagicMock(spec=raw_types.MessageService)
+    msg.action = action
+    if peer_kind == "chat":
+        peer = MagicMock(spec=raw_types.PeerChat)
+        peer.chat_id = old_chat_id
+    else:
+        peer = _peer_channel(old_chat_id)
+    msg.peer_id = peer
+    return _make_update(msg, "private")
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_migrate_service_message_rekeys_watched_group_and_queues_nothing():
+    queue: asyncio.Queue = asyncio.Queue()
+    watched = {OLD_GID}
+    names = {OLD_GID: f"G [{OLD_GID}]"}
+    lost = {OLD_GID}
+    client, fn = _register_and_capture(
+        queue, watched, conn=None, channel_names=names, lost_channels=lost
+    )
+    await fn(client, _migrate_service_update(), users={}, chats={})
+    assert watched == {NEW_GID}
+    assert lost == set()
+    assert names == {NEW_GID: f"G [{NEW_GID}]"}
+    assert queue.empty()
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_migrate_service_message_persists_to_db():
+    import aiosqlite
+
+    from ahsoka import database as db
+
+    async with aiosqlite.connect(":memory:") as conn:
+        await db.init_db(conn, owner_chat_id=1)
+        await db.add_channel(conn, OLD_GID, added_by=1, title="G")
+        watched = {OLD_GID}
+        client, fn = _register_and_capture(asyncio.Queue(), watched, conn=conn)
+        await fn(client, _migrate_service_update(), users={}, chats={})
+        assert await db.load_watched_channels(conn) == {NEW_GID}
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_migrate_service_message_for_unwatched_group_ignored():
+    queue: asyncio.Queue = asyncio.Queue()
+    watched = {-1001}
+    client, fn = _register_and_capture(queue, watched)
+    await fn(client, _migrate_service_update(), users={}, chats={})
+    assert watched == {-1001}
+    assert queue.empty()
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_service_message_on_channel_peer_does_not_migrate():
+    watched = {OLD_GID}
+    client, fn = _register_and_capture(asyncio.Queue(), watched)
+    await fn(client, _migrate_service_update(peer_kind="channel"), users={}, chats={})
+    assert watched == {OLD_GID}
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_other_service_action_ignored():
+    from pyrogram.raw import types as raw_types
+
+    msg = MagicMock(spec=raw_types.MessageService)
+    msg.action = MagicMock()  # not a ChatMigrateTo
+    peer = MagicMock(spec=raw_types.PeerChat)
+    peer.chat_id = 4242
+    msg.peer_id = peer
+    watched = {OLD_GID}
+    queue: asyncio.Queue = asyncio.Queue()
+    client, fn = _register_and_capture(queue, watched)
+    await fn(client, _make_update(msg, "private"), users={}, chats={})
+    assert watched == {OLD_GID} and queue.empty()
+
+
+def _fwd_from(origin_channel_id=1000000555, saved_from_peer=True, channel_post=77):
+    from pyrogram.raw import types as raw_types
+
+    fwd = MagicMock(spec=raw_types.MessageFwdHeader)
+    fwd.saved_from_peer = _peer_channel(origin_channel_id) if saved_from_peer else None
+    fwd.channel_post = channel_post
+    fwd.from_id = _peer_channel(origin_channel_id)
+    return fwd
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_drops_auto_forward_when_origin_channel_watched():
+    group = -1001000000123
+    origin = -1001000000555
+    queue: asyncio.Queue = asyncio.Queue()
+    client, fn = _register_and_capture(queue, {group, origin})
+    msg = _group_msg(_peer_channel(1000000123), from_id=None)
+    msg.fwd_from = _fwd_from(1000000555)
+    await fn(client, _make_update(msg), users={}, chats={})
+    assert queue.empty()
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_keeps_auto_forward_when_origin_channel_unwatched():
+    group = -1001000000123
+    queue: asyncio.Queue = asyncio.Queue()
+    client, fn = _register_and_capture(queue, {group})
+    msg = _group_msg(_peer_channel(1000000123), from_id=None)
+    msg.fwd_from = _fwd_from(1000000555)
+    await fn(client, _make_update(msg), users={}, chats={})
+    assert queue.qsize() == 1
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_keeps_forward_without_saved_from_peer_even_if_origin_watched():
+    """A manual forward (no saved_from_peer) is user content, not the discussion mirror."""
+    group = -1001000000123
+    queue: asyncio.Queue = asyncio.Queue()
+    client, fn = _register_and_capture(queue, {group, -1001000000555})
+    msg = _group_msg(_peer_channel(1000000123), from_id=_peer_user(5))
+    msg.fwd_from = _fwd_from(1000000555, saved_from_peer=False)
+    human = MagicMock()
+    human.bot = False
+    await fn(client, _make_update(msg), users={5: human}, chats={})
+    assert queue.qsize() == 1
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_processes_normal_message_without_fwd_from():
+    group = -1001000000123
+    queue: asyncio.Queue = asyncio.Queue()
+    client, fn = _register_and_capture(queue, {group, -1001000000555})
+    msg = _group_msg(_peer_channel(1000000123), from_id=None)
+    msg.fwd_from = None
+    await fn(client, _make_update(msg), users={}, chats={})
+    assert queue.qsize() == 1
+
+
+# ---------------------------------------------------------------------------
+# Group migration + auto-forward dedup: poller
+# ---------------------------------------------------------------------------
+
+
+async def _poll_sweeps(history, watched, max_sleeps, **kwargs):
+    """Run the real poller until the `max_sleeps`-th sleep (1st is the startup sleep)."""
+    from ahsoka.watcher.poller import channel_poller
+
+    queue: asyncio.Queue = asyncio.Queue()
+    client = MagicMock()
+    client.get_chat_history = history
+    sleeps: list = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= max_sleeps:
+            raise asyncio.CancelledError
+
+    with patch("ahsoka.watcher.poller.asyncio.sleep", side_effect=fake_sleep):
+        try:
+            await channel_poller(client, queue, watched, **kwargs)
+        except asyncio.CancelledError:
+            pass
+    return [queue.get_nowait() for _ in range(queue.qsize())]
+
+
+def _migrating_msg(msg_id, target):
+    m = _real_msg(msg_id)
+    m.migrate_to_chat_id = target
+    return m
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_migration_message_rekeys_group_and_polls_new_id_next_sweep():
+    from pyrogram.errors import ChannelPrivate
+
+    calls: list[int] = []
+
+    async def history(cid, limit):
+        calls.append(cid)
+        if cid == OLD_GID:
+            if calls.count(OLD_GID) <= 2:  # two access failures build a streak first
+                raise ChannelPrivate()
+            yield _migrating_msg(1, NEW_GID)
+            yield _real_msg(2)  # after the break: must never be queued
+        else:
+            m = _real_msg(10)
+            m.chat.id = NEW_GID
+            yield m
+
+    watched = {OLD_GID}
+    lost: set[int] = set()
+    names = {OLD_GID: f"G [{OLD_GID}]"}
+    with patch("ahsoka.watcher.poller.POLL_INTERVAL", 0.0), \
+            patch("ahsoka.watcher.poller.logger") as log:
+        posts = await _poll_sweeps(history, watched, max_sleeps=5,
+                                   lost_channels=lost, channel_names=names)
+
+    assert watched == {NEW_GID}
+    assert names == {NEW_GID: f"G [{NEW_GID}]"}
+    assert lost == set()
+    assert log.error.call_count == 0  # no "Lost access" alert for the old id
+    # sweep 1-2 fail, sweep 3 migrates (queues nothing), sweeps 4+ poll the new id
+    assert calls[:3] == [OLD_GID] * 3
+    assert all(c == NEW_GID for c in calls[3:]) and len(calls) > 3
+    assert [p.message_id for p in posts] and {p.message_id for p in posts} == {10}
+    assert 2 not in {p.message_id for p in posts} and 1 not in {p.message_id for p in posts}
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_migration_persists_to_db_via_conn():
+    import aiosqlite
+
+    from ahsoka import database as db
+
+    async def history(cid, limit):
+        yield _migrating_msg(1, NEW_GID)
+
+    async with aiosqlite.connect(":memory:") as conn:
+        await db.init_db(conn, owner_chat_id=1)
+        await db.add_channel(conn, OLD_GID, added_by=1, title="G")
+        await _poll_sweeps(history, {OLD_GID}, max_sleeps=2, conn=conn)
+        assert await db.load_watched_channels(conn) == {NEW_GID}
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_magicmock_migrate_attr_is_not_a_migration():
+    """An auto-attribute MagicMock (non-int migrate_to_chat_id) must not trigger migration."""
+    posts = await _poll_once([_real_msg(5)], channel_id=OLD_GID)
+    assert [p.message_id for p in posts] == [5]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_bool_migrate_attr_is_not_a_migration():
+    m = _real_msg(5)
+    m.migrate_to_chat_id = True
+    watched = {OLD_GID}
+    posts = await _poll_sweeps(lambda cid, limit: _agen([m]), watched, max_sleeps=2)
+    assert watched == {OLD_GID}
+    assert [p.message_id for p in posts] == [5]
+
+
+async def _agen(items):
+    for i in items:
+        yield i
+
+
+def _fwd_msg(msg_id, origin_id, sender_id=None):
+    m = _real_msg(msg_id)
+    m.forward_from_chat.id = origin_id
+    if sender_id is None:
+        m.from_user = None
+    else:
+        m.from_user.id = sender_id
+        m.from_user.is_bot = False
+    return m
+
+
+GROUP_ID_P = -1001000000123
+ORIGIN_ID_P = -1001000000555
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.parametrize("sender_id", [None, 777000])
+async def test_poller_drops_auto_forward_of_watched_channel(sender_id):
+    async def history(cid, limit):
+        if cid == GROUP_ID_P:
+            async for m in _agen([_fwd_msg(1, ORIGIN_ID_P, sender_id), _real_msg(2)]):
+                yield m
+
+    posts = await _poll_sweeps(history, {GROUP_ID_P, ORIGIN_ID_P}, max_sleeps=2)
+    assert [p.message_id for p in posts] == [2]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_keeps_forward_when_origin_unwatched():
+    posts = await _poll_sweeps(
+        lambda cid, limit: _agen([_fwd_msg(1, ORIGIN_ID_P, None)]),
+        {GROUP_ID_P}, max_sleeps=2,
+    )
+    assert [p.message_id for p in posts] == [1]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_keeps_forward_from_normal_user_even_if_origin_watched():
+    async def history(cid, limit):
+        if cid == GROUP_ID_P:
+            yield _fwd_msg(1, ORIGIN_ID_P, sender_id=4242)
+
+    posts = await _poll_sweeps(history, {GROUP_ID_P, ORIGIN_ID_P}, max_sleeps=2)
+    assert [p.message_id for p in posts] == [1]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_keeps_message_whose_forward_origin_is_its_own_chat():
+    async def history(cid, limit):
+        if cid == GROUP_ID_P:
+            yield _fwd_msg(1, GROUP_ID_P, None)
+
+    posts = await _poll_sweeps(history, {GROUP_ID_P}, max_sleeps=2)
+    assert [p.message_id for p in posts] == [1]

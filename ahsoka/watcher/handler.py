@@ -6,6 +6,7 @@ from pyrogram import Client
 from pyrogram.raw import types as raw_types
 
 from ahsoka.models import Post
+from ahsoka.watcher.migration import migrate_watched_chat, supergroup_chat_id
 from ahsoka.text_utils import slice_utf16
 
 logger = logging.getLogger(__name__)
@@ -16,6 +17,9 @@ def register_watcher_handlers(
     queue: asyncio.Queue,
     watched_channels: set[int],
     own_bot_id: int | None = None,
+    conn=None,
+    channel_names: dict[int, str] | None = None,
+    lost_channels: set[int] | None = None,
 ) -> None:
     @client.on_raw_update()
     async def on_raw(c: Client, update, users: dict, chats: dict) -> None:
@@ -25,6 +29,21 @@ def register_watcher_handlers(
             return
 
         msg = update.message
+        if isinstance(msg, raw_types.MessageService):
+            action = msg.action
+            if (
+                isinstance(action, raw_types.MessageActionChatMigrateTo)
+                and isinstance(msg.peer_id, raw_types.PeerChat)
+            ):
+                await migrate_watched_chat(
+                    conn,
+                    watched_channels,
+                    -msg.peer_id.chat_id,
+                    supergroup_chat_id(action.channel_id),
+                    channel_names,
+                    lost_channels,
+                )
+            return
         if not isinstance(msg, raw_types.Message):
             return
 
@@ -39,6 +58,19 @@ def register_watcher_handlers(
             return
 
         if chat_id not in watched_channels:
+            return
+
+        # A channel post auto-forwarded into its (watched) discussion group duplicates
+        # the original; skip it only when the origin channel is itself watched.
+        fwd = msg.fwd_from
+        if (
+            fwd is not None
+            and fwd.saved_from_peer is not None
+            and isinstance(fwd.from_id, raw_types.PeerChannel)
+            and fwd.channel_post is not None
+            and supergroup_chat_id(fwd.from_id.channel_id) in watched_channels
+        ):
+            logger.debug("Auto-forward of watched channel dropped: %s/%s", chat_id, msg.id)
             return
 
         # Skip bot-authored messages (group chatter from bots). Channel posts have no sender.

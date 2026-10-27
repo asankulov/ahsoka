@@ -53,3 +53,15 @@ def slice_utf16(text: str, offset: int, length: int) -> str:
     start = 2 * offset
     end = 2 * (offset + length)
     return encoded[start:end].decode("utf-16-le", errors="ignore")
+
+
+def build_message_link(
+    channel_id: int, message_id: int, username: str | None = None
+) -> str | None:
+    """Permalink for a message, or None when none exists (basic groups, no username)."""
+    if username:
+        return f"https://t.me/{username}/{message_id}"
+    if channel_id > -(10**12):
+        return None  # basic group: ids are small negatives, no permalinks
+    cid = str(abs(channel_id))[3:]  # strip leading "100" from e.g. 1001234567890
+    return f"https://t.me/c/{cid}/{message_id}"

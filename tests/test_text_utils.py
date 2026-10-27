@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from ahsoka.text_utils import entity_type_name, slice_utf16
+from ahsoka.text_utils import build_message_link, entity_type_name, slice_utf16
 
 
 def test_slice_utf16_emoji_before_url_extracts_full_url():
@@ -144,3 +144,28 @@ def test_entity_type_name_magicmock_string_value_fallback():
     # MagicMock auto-generates a `.name` attribute that is itself a MagicMock,
     # not a string, so this must fall through to the `.value` branch.
     assert entity_type_name(etype) == "url"
+
+
+# ---------------------------------------------------------------------------
+# build_message_link
+# ---------------------------------------------------------------------------
+
+def test_build_message_link_username_uses_public_form():
+    assert build_message_link(-1001234567890, 7, "jobchan") == "https://t.me/jobchan/7"
+
+
+def test_build_message_link_username_wins_even_for_basic_group_id():
+    assert build_message_link(-4567, 7, "mygroup") == "https://t.me/mygroup/7"
+
+
+def test_build_message_link_supergroup_without_username_uses_c_form():
+    assert build_message_link(-1001234567890, 7) == "https://t.me/c/1234567890/7"
+
+
+def test_build_message_link_basic_group_without_username_is_none():
+    assert build_message_link(-4567, 7) is None
+
+
+def test_build_message_link_boundary_is_c_form_and_just_above_is_none():
+    assert build_message_link(-(10**12), 7) == "https://t.me/c/0000000000/7"
+    assert build_message_link(-(10**12 - 1), 7) is None

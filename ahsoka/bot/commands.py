@@ -180,6 +180,15 @@ def register_bot_commands(
             return "I'm not allowed to send messages in that group."
         return None
 
+    async def _notify_target_warning(channel_id: int) -> str:
+        """Warning suffix when a chat being watched is also some user's notify target."""
+        if channel_id in await db.get_notify_chat_ids(conn):
+            return (
+                "\nWarning: this chat is also a notification target. Posts in it are "
+                "ignored by the pipeline to avoid a notification loop."
+            )
+        return ""
+
     async def _add_channel_by_id(message: Message, raw: str) -> bool:
         """Add a channel to the watchlist by ID. Returns True when the flow is finished,
         False when the input was invalid and the FSM state should be kept."""
@@ -217,6 +226,7 @@ def register_bot_commands(
         )
         watched_channels.add(channel_id)
         reply = f"Now watching: {title or channel_id}"
+        reply += await _notify_target_warning(channel_id)
         if not resolved:
             reply += "\n(Could not resolve chat metadata.)"
         if not username:
@@ -436,6 +446,8 @@ def register_bot_commands(
                 "Turn off anonymous mode and run /notify again."
             )
             return
+        # set_notify_target is a bare UPDATE; the row must exist first.
+        await db.get_or_create_user(conn, _uid(message))
         if arg == "dm":
             await db.set_notify_target(conn, _uid(message), _uid(message))
             await message.reply("Notifications will be sent to your DM.")
@@ -651,7 +663,10 @@ def register_bot_commands(
             title=getattr(chat, "title", None),
         )
         watched_channels.add(channel_id)
-        await message.reply(f"Now watching: {chat.title or channel_id}")
+        await message.reply(
+            f"Now watching: {chat.title or channel_id}"
+            + await _notify_target_warning(channel_id)
+        )
 
     @user_router.message(StateFilter(WaitingForInput.notify_channel))
     async def input_notify_channel(message: Message, state: FSMContext) -> None:

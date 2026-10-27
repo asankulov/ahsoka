@@ -8,6 +8,14 @@ from ahsoka.models import Post
 from ahsoka.pipeline.scraper import scrape_content
 
 
+@pytest.fixture(autouse=True)
+def _allow_urls():
+    """These tests exercise fetch/extract logic with mocked HTTP; skip real DNS in the
+    SSRF guard (the guard itself is covered in test_scraper_ssrf.py)."""
+    with patch("ahsoka.pipeline.scraper._is_url_allowed", new=AsyncMock(return_value=True)):
+        yield
+
+
 def make_post(text: str, url: str | None = None, urls: list[str] | None = None) -> Post:
     resolved = urls if urls is not None else ([url] if url else [])
     return Post(channel_id=1, message_id=1, channel_name="test",
