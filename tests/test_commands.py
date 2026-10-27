@@ -11,7 +11,10 @@ import aiosqlite
 from unittest.mock import AsyncMock, MagicMock
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import Chat, Message, Update, User
+from aiogram.types import (
+    Chat, Message, MessageOriginChannel, MessageOriginChat, MessageOriginHiddenUser,
+    MessageOriginUser, Update, User,
+)
 import datetime as _dt
 
 from ahsoka.bot.commands import register_bot_commands, WaitingForInput, _fmt_tokens, _pricing_for
@@ -53,7 +56,36 @@ def make_msg(text: str, user_id: int = USER_ID) -> MagicMock:
     msg.from_user = MagicMock()
     msg.from_user.id = user_id
     msg.forward_from_chat = None
+    msg.forward_origin = None
+    msg.chat.type = "private"
+    msg.sender_chat = None
     return msg
+
+
+def chan_origin(chat_id=-100999, title="Job Channel", username="jobchan"):
+    return MessageOriginChannel(
+        date=_dt.datetime(2026, 1, 1),
+        chat=Chat(id=chat_id, type="channel", title=title, username=username),
+        message_id=1,
+    )
+
+
+def group_origin(chat_id=-100777, title="Job Group", username=None, chat_type="supergroup"):
+    return MessageOriginChat(
+        date=_dt.datetime(2026, 1, 1),
+        sender_chat=Chat(id=chat_id, type=chat_type, title=title, username=username),
+    )
+
+
+def user_origin():
+    return MessageOriginUser(
+        date=_dt.datetime(2026, 1, 1),
+        sender_user=User(id=5, is_bot=False, first_name="Bob"),
+    )
+
+
+def hidden_origin():
+    return MessageOriginHiddenUser(date=_dt.datetime(2026, 1, 1), sender_user_name="Hidden")
 
 
 def make_ctx() -> MagicMock:
@@ -557,11 +589,7 @@ async def test_watch_prompts_for_forward(conn, settings):
 async def test_input_watch_adds_channel(conn, settings):
     _, h, watched = setup_dp(conn, settings)
     msg = make_msg("")
-    chat = MagicMock()
-    chat.id = -100999
-    chat.title = "Job Channel"
-    chat.username = "jobchan"
-    msg.forward_from_chat = chat
+    msg.forward_origin = chan_origin(-100999, "Job Channel", "jobchan")
     ctx = make_ctx()
     await h["input_watch_channel"](msg, ctx)
     ctx.clear.assert_awaited_once()
@@ -574,11 +602,7 @@ async def test_input_watch_persists_username_and_title(conn, settings):
 
     _, h, _ = setup_dp(conn, settings)
     msg = make_msg("")
-    chat = MagicMock()
-    chat.id = -100999
-    chat.title = "Job Channel"
-    chat.username = "jobchan"
-    msg.forward_from_chat = chat
+    msg.forward_origin = chan_origin(-100999, "Job Channel", "jobchan")
     await h["input_watch_channel"](msg, make_ctx())
     assert (await load_channel_names(conn))[-100999] == "Job Channel (@jobchan) [-100999]"
 
@@ -588,11 +612,7 @@ async def test_input_watch_private_channel_without_username_stores_title(conn, s
 
     _, h, _ = setup_dp(conn, settings)
     msg = make_msg("")
-    chat = MagicMock()
-    chat.id = -100998
-    chat.title = "Private Jobs"
-    chat.username = None
-    msg.forward_from_chat = chat
+    msg.forward_origin = chan_origin(-100998, "Private Jobs", None)
     await h["input_watch_channel"](msg, make_ctx())
     assert (await load_channel_names(conn))[-100998] == "Private Jobs [-100998]"
 
@@ -611,10 +631,7 @@ async def test_input_watch_skips_already_watched(conn, settings):
     _, h, watched = setup_dp(conn, settings)
     watched.add(-100999)
     msg = make_msg("")
-    chat = MagicMock()
-    chat.id = -100999
-    chat.title = "Job Channel"
-    msg.forward_from_chat = chat
+    msg.forward_origin = chan_origin(-100999, "Job Channel", None)
     ctx = make_ctx()
     await h["input_watch_channel"](msg, ctx)
     reply_text = msg.reply.call_args[0][0]
@@ -648,11 +665,7 @@ async def test_removechannel_valid(conn, settings):
     _, h, watched = setup_dp(conn, settings)
     # Add channel first via watch
     msg = make_msg("")
-    chat = MagicMock()
-    chat.id = -100999
-    chat.title = "Job Channel"
-    chat.username = "jobchan"
-    msg.forward_from_chat = chat
+    msg.forward_origin = chan_origin(-100999, "Job Channel", "jobchan")
     await h["input_watch_channel"](msg, make_ctx())
     assert -100999 in watched
 
@@ -680,11 +693,7 @@ async def test_input_removechannel_valid(conn, settings):
     _, h, watched = setup_dp(conn, settings)
     # Add first
     msg = make_msg("")
-    chat = MagicMock()
-    chat.id = -100777
-    chat.title = "Chan"
-    chat.username = "chan"
-    msg.forward_from_chat = chat
+    msg.forward_origin = chan_origin(-100777, "Chan", "chan")
     await h["input_watch_channel"](msg, make_ctx())
 
     ctx = make_ctx()
@@ -745,7 +754,7 @@ async def test_addchannel_no_arg_prompts_and_sets_state(conn, settings):
     msg = make_msg("/addchannel")
     await h["cmd_addchannel"](msg, ctx)
     ctx.set_state.assert_awaited_once_with(WaitingForInput.addchannel)
-    msg.reply.assert_awaited_once_with("Enter channel ID to add:")
+    msg.reply.assert_awaited_once_with("Enter channel or group ID to add:")
     assert watched == set()
 
 
@@ -753,7 +762,7 @@ async def test_addchannel_non_integer_arg_replies_error(conn, settings):
     _, h, watched = setup_dp(conn, settings)
     msg = make_msg("/addchannel abc")
     await h["cmd_addchannel"](msg, make_ctx())
-    assert msg.reply.call_args[0][0] == "Channel ID must be an integer."
+    assert msg.reply.call_args[0][0] == "Chat ID must be an integer (channels and groups are supported)."
     assert watched == set()
     assert await load_watched_channels(conn) == set()
 
@@ -774,7 +783,7 @@ async def test_input_addchannel_invalid_keeps_state(conn, settings):
     msg = make_msg("abc")
     await h["input_addchannel"](msg, ctx)
     ctx.clear.assert_not_called()
-    assert msg.reply.call_args[0][0] == "Channel ID must be an integer."
+    assert msg.reply.call_args[0][0] == "Chat ID must be an integer (channels and groups are supported)."
     assert watched == set()
 
 
@@ -909,12 +918,12 @@ async def test_commands_in_channel_input_state_reach_own_handler(conn, settings,
     bot = Bot("123:ABC")
     replies, state = await _feed(dp, bot, text, getattr(WaitingForInput, state_name))
     assert replies, "command handler should have replied"
-    assert not any("Channel ID must be an integer" in r for r in replies)
+    assert not any("Chat ID must be an integer" in r for r in replies)
     assert state is None  # the command's own handler cleared the FSM state
 
 
 @pytest.mark.parametrize("state_name,err", [
-    ("addchannel", "Channel ID must be an integer."),
+    ("addchannel", "Chat ID must be an integer (channels and groups are supported)."),
     ("removechannel", "Please enter a valid integer channel ID."),
 ])
 async def test_non_command_text_in_channel_input_state_reaches_input_handler(conn, settings, state_name, err):
@@ -939,7 +948,7 @@ async def test_numeric_id_in_channel_input_state_completes_and_clears(conn, sett
 
 
 @pytest.mark.parametrize("state_name,err", [
-    ("addchannel", "Channel ID must be an integer."),
+    ("addchannel", "Chat ID must be an integer (channels and groups are supported)."),
     ("removechannel", "Please enter a valid integer channel ID."),
 ])
 async def test_text_none_in_channel_input_state_does_not_crash(conn, settings, state_name, err):
@@ -2618,8 +2627,8 @@ async def test_textless_message_in_setter_state_behavior(conn, settings, state_n
 @pytest.mark.parametrize("text", ["Some job post", "/looks like a command"])
 async def test_watch_channel_state_still_accepts_forward_unfiltered(conn, settings, state_name, expected, text):
     dp, _, watched = setup_dp(conn, settings)
-    fwd = Chat(id=-100999, type="channel", title="Job Channel")
-    replies, state = await _feed(dp, Bot("123:ABC"), text, _st(state_name), forward_from_chat=fwd)
+    fwd = chan_origin(-100999, "Job Channel", None)
+    replies, state = await _feed(dp, Bot("123:ABC"), text, _st(state_name), forward_origin=fwd)
     assert replies == [expected]
     assert state is None
     assert -100999 in watched
@@ -2627,9 +2636,9 @@ async def test_watch_channel_state_still_accepts_forward_unfiltered(conn, settin
 
 async def test_notify_channel_state_still_receives_forward_unfiltered(conn, settings):
     dp, _, _ = setup_dp(conn, settings)
-    fwd = Chat(id=-100888, type="channel", title="Alerts")
+    fwd = chan_origin(-100888, "Alerts", None)
     replies, state = await _feed(dp, Bot("123:ABC"), "/forwarded slash text", WaitingForInput.notify_channel,
-                                 forward_from_chat=fwd)
+                                 forward_origin=fwd)
     # Reached input_notify_channel (state cleared); bot.get_chat_member is unreachable offline.
     assert state is None
     assert len(replies) == 1 and "Notifications will be sent" not in replies[0]
@@ -2644,3 +2653,406 @@ def test_user_input_handlers_have_slash_filter(conn, settings, name):
     register_bot_commands(dp, conn, settings, set())
     h = next(h for h in dp.sub_routers[0].message.handlers if h.callback.__name__ == name)
     assert len(h.filters) == 2  # StateFilter + ~F.text.startswith("/")
+
+
+# ---------------------------------------------------------------------------
+# Group chat support: /watch origins
+# ---------------------------------------------------------------------------
+
+_HINT_FRAGMENT = "group admin posting as the group"
+
+
+async def test_input_watch_channel_origin_accepted(conn, settings):
+    _, h, watched = setup_dp(conn, settings)
+    msg = make_msg("")
+    msg.forward_origin = chan_origin(-100321, "Chan", "chan")
+    ctx = make_ctx()
+    await h["input_watch_channel"](msg, ctx)
+    ctx.clear.assert_awaited_once()
+    assert -100321 in watched
+    assert msg.reply.call_args[0][0].startswith("Now watching: Chan")
+
+
+async def test_input_watch_group_origin_stores_id_title_username(conn, settings):
+    from ahsoka.database import load_channel_names
+
+    _, h, watched = setup_dp(conn, settings)
+    msg = make_msg("")
+    msg.forward_origin = group_origin(-100777, "Job Group", "jobgroup")
+    ctx = make_ctx()
+    await h["input_watch_channel"](msg, ctx)
+    ctx.clear.assert_awaited_once()
+    assert -100777 in watched
+    assert -100777 in await load_watched_channels(conn)
+    assert (await load_channel_names(conn))[-100777] == "Job Group (@jobgroup) [-100777]"
+
+
+@pytest.mark.parametrize("origin_factory", [user_origin, hidden_origin])
+@pytest.mark.parametrize("handler", ["input_watch_channel", "input_notify_channel"])
+async def test_input_forward_from_user_gets_hint_and_clears_state(conn, settings, handler, origin_factory):
+    _, h, watched = setup_dp(conn, settings)
+    msg = make_msg("")
+    msg.forward_origin = origin_factory()
+    ctx = make_ctx()
+    await h[handler](msg, ctx)
+    ctx.clear.assert_awaited_once()
+    assert _HINT_FRAGMENT in msg.reply.call_args[0][0]
+    assert watched == set()
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+@pytest.mark.parametrize("handler,cmd", [
+    ("input_watch_channel", "/watch"), ("input_notify_channel", "/notify"),
+])
+async def test_input_no_origin_asks_for_forward_and_clears_state(conn, settings, handler, cmd):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("hello")
+    ctx = make_ctx()
+    await h[handler](msg, ctx)
+    ctx.clear.assert_awaited_once()
+    assert msg.reply.call_args[0][0] == (
+        f"Please forward a message from a channel or group. Try {cmd} again."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Group chat support: /notify inside a group
+# ---------------------------------------------------------------------------
+
+GROUP_ID = -100777
+BOT_ID = 999
+
+
+def make_member(status, **kw):
+    m = MagicMock()
+    m.status = status
+    for k, v in kw.items():
+        setattr(m, k, v)
+    return m
+
+
+def make_group_msg(text="/notify", chat_type="supergroup", user_id=USER_ID, sender_status="administrator",
+                   bot_member=None, member_exc=None, bot_exc=None):
+    msg = make_msg(text, user_id)
+    msg.chat.type = chat_type
+    msg.chat.id = GROUP_ID
+    msg.chat.title = "Job Group"
+    bot = MagicMock()
+    bot.id = BOT_ID
+    bot_member = bot_member or make_member("administrator")
+
+    async def get_member(chat_id, uid):
+        assert chat_id == GROUP_ID
+        if uid == BOT_ID:
+            if bot_exc:
+                raise bot_exc
+            return bot_member
+        if member_exc:
+            raise member_exc
+        return make_member(sender_status)
+
+    bot.get_chat_member = AsyncMock(side_effect=get_member)
+    msg.bot = bot
+    return msg
+
+
+@pytest.mark.parametrize("chat_type", ["group", "supergroup"])
+@pytest.mark.parametrize("sender_status", ["administrator", "creator"])
+async def test_notify_in_group_admin_sets_target_without_fsm(conn, settings, chat_type, sender_status):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg(chat_type=chat_type, sender_status=sender_status)
+    ctx = make_ctx()
+    await h["cmd_notify"](msg, ctx)
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == GROUP_ID
+    ctx.set_state.assert_not_awaited()
+    assert msg.reply.call_args[0][0] == "Notifications will be sent to: Job Group"
+
+
+@pytest.mark.parametrize("status", ["member", "restricted", "left"])
+async def test_notify_in_group_non_admin_rejected(conn, settings, status):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg(sender_status=status)
+    await h["cmd_notify"](msg, make_ctx())
+    assert "Only group admins" in msg.reply.call_args[0][0]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+async def test_notify_in_group_get_chat_member_error_cannot_verify(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg(member_exc=RuntimeError("boom"))
+    await h["cmd_notify"](msg, make_ctx())
+    assert "I can't verify" in msg.reply.call_args[0][0]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+async def test_notify_in_group_anonymous_admin_rejected_before_any_lookup(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg()
+    msg.sender_chat = MagicMock()
+    msg.sender_chat.id = GROUP_ID
+    await h["cmd_notify"](msg, make_ctx())
+    assert "anonymous admin" in msg.reply.call_args[0][0]
+    msg.bot.get_chat_member.assert_not_awaited()
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+async def test_notify_in_group_linked_channel_sender_chat_is_not_anonymous(conn, settings):
+    """sender_chat != chat (e.g. channel post auto-forwarded into discussion group) is not the anon-admin case."""
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg()
+    msg.sender_chat = MagicMock()
+    msg.sender_chat.id = -100555
+    await h["cmd_notify"](msg, make_ctx())
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == GROUP_ID
+
+
+@pytest.mark.parametrize("status", ["left", "kicked"])
+async def test_notify_in_group_bot_not_member_rejected(conn, settings, status):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg(bot_member=make_member(status))
+    await h["cmd_notify"](msg, make_ctx())
+    assert "not a member" in msg.reply.call_args[0][0]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+async def test_notify_in_group_bot_lookup_error_rejected(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg(bot_exc=RuntimeError("nope"))
+    await h["cmd_notify"](msg, make_ctx())
+    assert "can't access that group" in msg.reply.call_args[0][0]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+async def test_notify_in_group_bot_restricted_cannot_send_rejected(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg(bot_member=make_member("restricted", can_send_messages=False))
+    await h["cmd_notify"](msg, make_ctx())
+    assert "not allowed to send" in msg.reply.call_args[0][0]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+async def test_notify_in_group_bot_restricted_can_send_accepted(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg(bot_member=make_member("restricted", can_send_messages=True))
+    await h["cmd_notify"](msg, make_ctx())
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == GROUP_ID
+
+
+async def test_notify_private_chat_still_enters_notify_channel_state(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/notify")  # chat.type == "private"
+    ctx = make_ctx()
+    await h["cmd_notify"](msg, ctx)
+    ctx.set_state.assert_awaited_once_with(WaitingForInput.notify_channel)
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+async def test_notify_dm_inside_group_resets_to_dm(conn, settings):
+    from ahsoka.database import set_notify_target
+
+    _, h, _ = setup_dp(conn, settings)
+    await set_notify_target(conn, USER_ID, GROUP_ID)
+    msg = make_group_msg(text="/notify dm")
+    await h["cmd_notify"](msg, make_ctx())
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+    msg.bot.get_chat_member.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Group chat support: /notify forward flow
+# ---------------------------------------------------------------------------
+
+async def test_notify_forward_channel_bot_admin_sets_target(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg(bot_member=make_member("administrator"))
+    msg.forward_origin = chan_origin(GROUP_ID, "Alerts", None)
+    await h["input_notify_channel"](msg, make_ctx())
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == GROUP_ID
+    assert msg.reply.call_args[0][0] == "Notifications will be sent to: Alerts"
+
+
+async def test_notify_forward_channel_bot_not_admin_rejected(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg(bot_member=make_member("member"))
+    msg.forward_origin = chan_origin(GROUP_ID, "Alerts", None)
+    await h["input_notify_channel"](msg, make_ctx())
+    assert "need to be an admin in that channel" in msg.reply.call_args[0][0]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+async def test_notify_forward_channel_lookup_exception_rejected(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg()
+    msg.bot.get_chat_member = AsyncMock(side_effect=RuntimeError("no access"))
+    msg.forward_origin = chan_origin(GROUP_ID, "Alerts", None)
+    await h["input_notify_channel"](msg, make_ctx())
+    assert "can't access that channel" in msg.reply.call_args[0][0]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+@pytest.mark.parametrize("chat_type", ["group", "supergroup"])
+async def test_notify_forward_group_origin_forwarder_admin_sets_target(conn, settings, chat_type):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg()
+    msg.forward_origin = group_origin(GROUP_ID, "Job Group", chat_type=chat_type)
+    await h["input_notify_channel"](msg, make_ctx())
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == GROUP_ID
+    assert msg.reply.call_args[0][0] == "Notifications will be sent to: Job Group"
+
+
+async def test_notify_forward_group_origin_forwarder_not_admin_rejected(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg(sender_status="member")
+    msg.forward_origin = group_origin(GROUP_ID, "Job Group")
+    await h["input_notify_channel"](msg, make_ctx())
+    assert "Only group admins" in msg.reply.call_args[0][0]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+async def test_notify_forward_group_origin_verification_error_rejected(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_group_msg(member_exc=RuntimeError("x"))
+    msg.forward_origin = group_origin(GROUP_ID, "Job Group")
+    await h["input_notify_channel"](msg, make_ctx())
+    assert "I can't verify" in msg.reply.call_args[0][0]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+# ---------------------------------------------------------------------------
+# Group gate: only /notify is accepted in groups (real Dispatcher routing)
+# ---------------------------------------------------------------------------
+
+BOT_USERNAME = "ahsokabot"
+
+
+async def _feed_chat(dp, bot, text, chat_type, state_to_set=None, user_id=USER_ID, sender_chat=None):
+    """Feed a real Update from a chat of `chat_type`; return (replies, final_state)."""
+    replies: list[str] = []
+
+    async def fake_reply(self, text, *a, **kw):
+        replies.append(text)
+
+    chat_id = user_id if chat_type == "private" else GROUP_ID
+    ctx = dp.fsm.get_context(bot, chat_id=chat_id, user_id=user_id)
+    if state_to_set is not None:
+        await ctx.set_state(state_to_set)
+    msg = Message(
+        message_id=1,
+        date=_dt.datetime(2026, 1, 1),
+        chat=Chat(id=chat_id, type=chat_type, title="Job Group" if chat_type != "private" else None),
+        from_user=User(id=user_id, is_bot=False, first_name="U"),
+        sender_chat=sender_chat,
+        text=text,
+    )
+    orig = Message.reply
+    Message.reply = fake_reply
+    try:
+        await dp.feed_update(bot, Update(update_id=1, message=msg))
+    finally:
+        Message.reply = orig
+    return replies, await ctx.get_state()
+
+
+@pytest.fixture
+def group_bot(monkeypatch):
+    async def fake_me(self):
+        return User(id=123, is_bot=True, first_name="Ahsoka", username=BOT_USERNAME)
+
+    async def fake_member(self, chat_id, user_id, *a, **kw):
+        m = MagicMock()
+        m.status = "administrator"
+        return m
+
+    monkeypatch.setattr(Bot, "me", fake_me)
+    monkeypatch.setattr(Bot, "get_chat_member", fake_member)
+    return Bot("123:ABC")
+
+
+@pytest.mark.parametrize("chat_type", ["group", "supergroup"])
+@pytest.mark.parametrize("text", ["/start", "/status", "/setkeywords python", "/help", "/pause", "/watch"])
+async def test_group_non_notify_command_ignored_and_user_not_registered(conn, settings, group_bot, chat_type, text):
+    dp, _, _ = setup_dp(conn, settings)
+    replies, state = await _feed_chat(dp, group_bot, text, chat_type, user_id=777)
+    assert replies == []
+    assert state is None
+    assert await get_user(conn, 777) is None  # ensure_user must not register on dropped group messages
+
+
+@pytest.mark.parametrize("chat_type", ["group", "supergroup"])
+@pytest.mark.parametrize("text", ["/users", "/ban 5", "/addchannel -100555", "/stats"])
+async def test_group_admin_command_as_admin_ignored(conn, settings, group_bot, chat_type, text):
+    dp, _, watched = setup_dp(conn, settings)
+    replies, state = await _feed_chat(dp, group_bot, text, chat_type, user_id=OWNER_ID)
+    assert replies == []
+    assert watched == set()
+    assert state is None
+
+
+async def test_group_command_does_not_run_handler_side_effects(conn, settings, group_bot):
+    dp, _, _ = setup_dp(conn, settings)
+    await _feed_chat(dp, group_bot, "/setkeywords rust", "supergroup", user_id=OWNER_ID)
+    assert (await get_user_config(conn, OWNER_ID)).keywords != "rust"
+
+
+@pytest.mark.parametrize("state_name", SETTER_STATES)
+async def test_group_plain_text_while_fsm_waiting_ignored(conn, settings, group_bot, state_name):
+    dp, _, _ = setup_dp(conn, settings)
+    before = await get_user_config(conn, USER_ID)
+    replies, state = await _feed_chat(dp, group_bot, SETTERS[state_name][0], "supergroup",
+                                      state_to_set=_st(state_name))
+    assert replies == []
+    assert state == _st(state_name).state  # untouched
+    assert await get_user_config(conn, USER_ID) == before
+
+
+@pytest.mark.parametrize("text", ["/notify", "/notify@ahsokabot"])
+@pytest.mark.parametrize("chat_type", ["group", "supergroup"])
+async def test_group_notify_reaches_handler_and_sets_group_target(conn, settings, group_bot, text, chat_type):
+    dp, _, _ = setup_dp(conn, settings)
+    replies, _ = await _feed_chat(dp, group_bot, text, chat_type)
+    assert replies == ["Notifications will be sent to: Job Group"]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == GROUP_ID
+
+
+@pytest.mark.parametrize("text", ["/notify", "/notify dm"])
+async def test_group_anonymous_admin_notify_gets_anonymous_reply_and_no_target_change(
+    conn, settings, group_bot, text
+):
+    dp, _, _ = setup_dp(conn, settings)
+    anon = Chat(id=GROUP_ID, type="supergroup", title="Job Group")
+    replies, _ = await _feed_chat(dp, group_bot, text, "supergroup", sender_chat=anon)
+    assert len(replies) == 1 and "anonymous admin" in replies[0]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+async def test_group_anonymous_notify_does_not_call_set_notify_target(conn, settings, group_bot, monkeypatch):
+    from unittest.mock import patch
+    dp, _, _ = setup_dp(conn, settings)
+    anon = Chat(id=GROUP_ID, type="supergroup", title="Job Group")
+    with patch("ahsoka.bot.commands.db.set_notify_target", new_callable=AsyncMock) as m:
+        await _feed_chat(dp, group_bot, "/notify dm", "supergroup", sender_chat=anon)
+        await _feed_chat(dp, group_bot, "/notify", "supergroup", sender_chat=anon)
+    m.assert_not_awaited()
+
+
+async def test_group_notify_dm_non_anonymous_still_resets_to_dm(conn, settings, group_bot):
+    dp, _, _ = setup_dp(conn, settings)
+    await _feed_chat(dp, group_bot, "/notify", "supergroup")
+    replies, _ = await _feed_chat(dp, group_bot, "/notify dm", "supergroup")
+    assert replies == ["Notifications will be sent to your DM."]
+    assert (await get_user_config(conn, USER_ID)).notify_chat_id == USER_ID
+
+
+async def test_private_chat_commands_unchanged_by_group_gate(conn, settings, group_bot):
+    dp, _, _ = setup_dp(conn, settings)
+    replies, _ = await _feed_chat(dp, group_bot, "/start", "private")
+    assert replies and replies[0].startswith("Welcome to Ahsoka")
+    replies, state = await _feed_chat(dp, group_bot, "/notify", "private")
+    assert state == WaitingForInput.notify_channel.state
+    assert "Forward a message" in replies[0]
+
+
+async def test_private_admin_command_still_works_for_admin(conn, settings, group_bot):
+    dp, _, _ = setup_dp(conn, settings)
+    replies, _ = await _feed_chat(dp, group_bot, "/users", "private", user_id=OWNER_ID)
+    assert replies

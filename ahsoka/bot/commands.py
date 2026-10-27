@@ -7,7 +7,13 @@ from aiogram import Dispatcher, F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BotCommand, BufferedInputFile, Message
+from aiogram.types import (
+    BotCommand,
+    BufferedInputFile,
+    Message,
+    MessageOriginChannel,
+    MessageOriginChat,
+)
 
 from ahsoka import database as db
 from ahsoka.bot.export import entities_to_markdown, parse_range, render_markdown
@@ -77,12 +83,12 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand(command="setkeywords",    description="Replace the entire keyword list"),
     BotCommand(command="addkeyword",     description="Append keyword(s) to the list"),
     BotCommand(command="resetkeywords",  description="Clear all keywords"),
-    BotCommand(command="watch",          description="Forward a message to add a watch channel"),
-    BotCommand(command="notify",         description="Set notification target (forward msg or /notify dm)"),
+    BotCommand(command="watch",          description="Forward a message to watch a channel or group"),
+    BotCommand(command="notify",         description="Set notification target (forward msg, run in a group, or dm)"),
     BotCommand(command="pause",          description="Pause notifications"),
     BotCommand(command="resume",         description="Resume notifications"),
     BotCommand(command="status",         description="Show current filter settings"),
-    BotCommand(command="channels",       description="List watched channels"),
+    BotCommand(command="channels",       description="List watched channels and groups"),
     BotCommand(command="help",           description="Show available commands"),
 ]
 
@@ -101,12 +107,22 @@ def register_bot_commands(
     user_router = Router()
     admin_router = Router()
 
+    _GROUP_CHAT_TYPES = ("group", "supergroup")
+
+    def _is_notify_command(message: Message) -> bool:
+        parts = (message.text or "").split(maxsplit=1)
+        if not parts:
+            return False
+        return parts[0].split("@", 1)[0].lower() == "/notify"
+
     # --- Middleware: ensure user is registered and not banned ---
 
     @user_router.message.middleware()
     async def ensure_user(handler, message: Message, data: dict) -> None:
         if not message.from_user:
             return
+        if message.chat.type in _GROUP_CHAT_TYPES and not _is_notify_command(message):
+            return  # groups: /notify only; ignore silently, no registration
         user = await db.get_user(conn, message.from_user.id)
         if user and user.is_banned:
             return
@@ -116,6 +132,8 @@ def register_bot_commands(
     async def admin_only(handler, message: Message, data: dict) -> None:
         if not message.from_user:
             return
+        if message.chat.type in _GROUP_CHAT_TYPES:
+            return  # admin commands are private-chat only
         user = await db.get_user(conn, message.from_user.id)
         if not user or not user.is_admin:
             return
@@ -128,13 +146,47 @@ def register_bot_commands(
     def _uid(message: Message) -> int:
         return message.from_user.id  # type: ignore[union-attr]
 
+    def _origin_chat(message: Message):
+        """Chat a message was forwarded from (channel, or group via anonymous admin), else None."""
+        origin = message.forward_origin
+        if isinstance(origin, MessageOriginChannel):
+            return origin.chat
+        if isinstance(origin, MessageOriginChat):
+            return origin.sender_chat
+        return None
+
+    _NOT_A_CHAT_FORWARD = (
+        "I can only see the source chat when the message was forwarded from a channel "
+        "or from a group admin posting as the group. Forward a channel post, or ask a "
+        "group admin to post as the group and forward that. Admins can also add a chat "
+        "by ID with /addchannel."
+    )
+
+    async def _group_target_error(bot, chat_id: int, user_id: int) -> str | None:
+        """Return an error message if user/bot can't use this group as a target, else None."""
+        try:
+            sender = await bot.get_chat_member(chat_id, user_id)
+        except Exception:
+            return "I can't verify your rights in that group."
+        if sender.status not in ("administrator", "creator"):
+            return "Only group admins can set the group as the notification target."
+        try:
+            me = await bot.get_chat_member(chat_id, bot.id)
+        except Exception:
+            return "I can't access that group. Add me to it first."
+        if me.status in ("left", "kicked"):
+            return "I'm not a member of that group. Add me to it first."
+        if me.status == "restricted" and not getattr(me, "can_send_messages", True):
+            return "I'm not allowed to send messages in that group."
+        return None
+
     async def _add_channel_by_id(message: Message, raw: str) -> bool:
         """Add a channel to the watchlist by ID. Returns True when the flow is finished,
         False when the input was invalid and the FSM state should be kept."""
         try:
             channel_id = int(raw.strip())
         except ValueError:
-            await message.reply("Channel ID must be an integer.")
+            await message.reply("Chat ID must be an integer (channels and groups are supported).")
             return False
         if channel_id in watched_channels:
             await message.reply(f"Already watching: {channel_id}")
@@ -166,10 +218,10 @@ def register_bot_commands(
         watched_channels.add(channel_id)
         reply = f"Now watching: {title or channel_id}"
         if not resolved:
-            reply += "\n(Could not resolve channel metadata.)"
+            reply += "\n(Could not resolve chat metadata.)"
         if not username:
             reply += (
-                "\nNote: the userbot account may not be a member of this channel. "
+                "\nNote: the userbot account may not be a member of this channel or group. "
                 "Add or join it with that account, or no updates will be received."
             )
         await message.reply(reply)
@@ -242,11 +294,11 @@ def register_bot_commands(
         await state.clear()
         user = await db.get_or_create_user(conn, _uid(message))
         await message.reply(
-            "Welcome to Ahsoka! I filter job postings from Telegram channels.\n\n"
+            "Welcome to Ahsoka! I filter job postings from Telegram channels and groups.\n\n"
             "Get started:\n"
             "  /setkeywords python backend — set keywords to match\n"
             "  /setthreshold 6 — minimum score (0-10)\n"
-            "  /watch — forward a message from a job channel\n"
+            "  /watch — forward a message from a job channel or group\n"
             "  /status — see your current settings\n"
             "  /help — all commands"
         )
@@ -364,21 +416,44 @@ def register_bot_commands(
     async def cmd_watch(message: Message, state: FSMContext) -> None:
         await state.clear()
         await state.set_state(WaitingForInput.watch_channel)
-        await message.reply("Forward a message from the channel you want to watch.")
+        await message.reply(
+            "Forward a message from the channel or group you want to watch.\n"
+            "For a group, the message must be posted by an admin as the group; "
+            "otherwise an admin can add it by ID with /addchannel."
+        )
 
     @user_router.message(Command("notify"))
     async def cmd_notify(message: Message, state: FSMContext) -> None:
         await state.clear()
         arg = _arg(message.text).lower()
+        if (
+            message.chat.type in _GROUP_CHAT_TYPES
+            and message.sender_chat is not None
+            and message.sender_chat.id == message.chat.id
+        ):
+            await message.reply(
+                "You are posting as an anonymous admin, so I can't tell who you are. "
+                "Turn off anonymous mode and run /notify again."
+            )
+            return
         if arg == "dm":
             await db.set_notify_target(conn, _uid(message), _uid(message))
             await message.reply("Notifications will be sent to your DM.")
             return
+        if message.chat.type in ("group", "supergroup"):
+            # Run inside a group: this group becomes the target.
+            error = await _group_target_error(message.bot, message.chat.id, _uid(message))
+            if error:
+                await message.reply(error)
+                return
+            await db.set_notify_target(conn, _uid(message), message.chat.id)
+            await message.reply(f"Notifications will be sent to: {message.chat.title or message.chat.id}")
+            return
         await state.set_state(WaitingForInput.notify_channel)
         await message.reply(
-            "Forward a message from the channel where you want notifications.\n"
-            "The bot must be added to that channel first.\n"
-            "Or send /notify dm to use direct messages."
+            "Forward a message from the channel or group where you want notifications.\n"
+            "The bot must be added to that chat first (admin for channels).\n"
+            "Or send /notify inside a group, or /notify dm to use direct messages."
         )
 
     @user_router.message(Command("pause"))
@@ -453,10 +528,10 @@ def register_bot_commands(
             "  /setsalary 3000 8000 - Monthly salary range",
             "",
             "Channels & notifications:",
-            "  /watch - Forward a msg to add a watch channel",
-            "  /notify - Forward a msg to set notification channel",
+            "  /watch - Forward a msg to watch a channel or group",
+            "  /notify - Forward a msg (or run in a group) to set notification chat",
             "  /notify dm - Send notifications to DM (default)",
-            "  /channels - List watched channels",
+            "  /channels - List watched channels and groups",
             "",
             "Controls:",
             "  /pause - Pause notifications",
@@ -551,9 +626,12 @@ def register_bot_commands(
     @user_router.message(StateFilter(WaitingForInput.watch_channel))
     async def input_watch_channel(message: Message, state: FSMContext) -> None:
         await state.clear()
-        chat = message.forward_from_chat
+        chat = _origin_chat(message)
         if not chat:
-            await message.reply("Please forward a message from a channel. Try /watch again.")
+            if message.forward_origin is not None:
+                await message.reply(_NOT_A_CHAT_FORWARD)
+            else:
+                await message.reply("Please forward a message from a channel or group. Try /watch again.")
             return
         channel_id = chat.id
         if channel_id in watched_channels:
@@ -578,21 +656,30 @@ def register_bot_commands(
     @user_router.message(StateFilter(WaitingForInput.notify_channel))
     async def input_notify_channel(message: Message, state: FSMContext) -> None:
         await state.clear()
-        chat = message.forward_from_chat
+        chat = _origin_chat(message)
         if not chat:
-            await message.reply("Please forward a message from a channel. Try /notify again.")
+            if message.forward_origin is not None:
+                await message.reply(_NOT_A_CHAT_FORWARD)
+            else:
+                await message.reply("Please forward a message from a channel or group. Try /notify again.")
             return
         # Verify bot can send to this channel by trying to get chat info
         from aiogram import Bot
         bot: Bot = message.bot  # type: ignore[assignment]
-        try:
-            member = await bot.get_chat_member(chat.id, bot.id)
-            if member.status not in ("administrator", "creator"):
-                await message.reply("I need to be an admin in that channel to send notifications there.")
+        if chat.type in ("group", "supergroup"):
+            error = await _group_target_error(bot, chat.id, _uid(message))
+            if error:
+                await message.reply(error)
                 return
-        except Exception:
-            await message.reply("I can't access that channel. Add me as an admin first.")
-            return
+        else:
+            try:
+                member = await bot.get_chat_member(chat.id, bot.id)
+                if member.status not in ("administrator", "creator"):
+                    await message.reply("I need to be an admin in that channel to send notifications there.")
+                    return
+            except Exception:
+                await message.reply("I can't access that channel. Add me as an admin first.")
+                return
         await db.set_notify_target(conn, _uid(message), chat.id)
         await message.reply(f"Notifications will be sent to: {chat.title or chat.id}")
 
@@ -606,8 +693,8 @@ def register_bot_commands(
         lines = [
             "Admin commands:",
             "",
-            "  /addchannel -100123 - Add a channel to watchlist by ID",
-            "  /removechannel -100123 - Remove a channel from watchlist",
+            "  /addchannel -100123 - Add a channel or group to watchlist by ID",
+            "  /removechannel -100123 - Remove a channel or group from watchlist",
             "  /users - List all registered users",
             "  /ban 123456 - Ban a user (stops notifications)",
             "  /unban 123456 - Unban a user",
@@ -640,7 +727,7 @@ def register_bot_commands(
             await _add_channel_by_id(message, arg)
             return
         await state.set_state(WaitingForInput.addchannel)
-        await message.reply("Enter channel ID to add:")
+        await message.reply("Enter channel or group ID to add:")
 
     @admin_router.message(StateFilter(WaitingForInput.addchannel), ~F.text.startswith("/"))
     async def input_addchannel(message: Message, state: FSMContext) -> None:

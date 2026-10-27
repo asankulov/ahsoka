@@ -2,7 +2,15 @@ import asyncio
 import logging
 
 from pyrogram import Client
-from pyrogram.errors import ChannelBanned, ChannelInvalid, ChannelPrivate
+from pyrogram.enums import MessageServiceType
+from pyrogram.errors import (
+    ChannelBanned,
+    ChannelInvalid,
+    ChannelPrivate,
+    ChatForbidden,
+    ChatInvalid,
+    PeerIdInvalid,
+)
 
 from ahsoka.models import Post
 
@@ -12,7 +20,10 @@ POLL_INTERVAL = 60.0  # seconds between sweeps
 READY_TIMEOUT = 120.0  # max wait for the warm-up before polling anyway
 MAX_BACKOFF = 900.0  # cap for per-channel failure backoff (15 min)
 LOST_THRESHOLD = 3  # consecutive access-lost failures before alerting
-ACCESS_LOST_ERRORS = (ChannelPrivate, ChannelBanned, ChannelInvalid)
+ACCESS_LOST_ERRORS = (
+    ChannelPrivate, ChannelBanned, ChannelInvalid,  # channels / supergroups
+    ChatForbidden, ChatInvalid, PeerIdInvalid,  # basic groups
+)
 MESSAGES_PER_CHANNEL = 20  # how many recent messages to fetch per channel
 
 
@@ -23,6 +34,7 @@ async def channel_poller(
     ready: asyncio.Future | None = None,
     lost_channels: set[int] | None = None,
     channel_names: dict[int, str] | None = None,
+    own_bot_id: int | None = None,
 ) -> None:
     """
     Fallback poller for channels that don't deliver push UpdateNewChannelMessage.
@@ -35,7 +47,7 @@ async def channel_poller(
     after READY_TIMEOUT the poller proceeds without cancelling it.
 
     Access loss: LOST_THRESHOLD consecutive ChannelPrivate/ChannelBanned/
-    ChannelInvalid failures mark a channel lost (added to `lost_channels`) and
+    ChannelInvalid/ChatForbidden/ChatInvalid/PeerIdInvalid failures mark a channel lost (added to `lost_channels`) and
     emit ONE logger.error (forwarded to the owner by the log handler). The
     streak counter is separate from the backoff count; a success resets it,
     a non-access error neither counts nor resets it. Failures of an already-lost
@@ -66,6 +78,13 @@ async def channel_poller(
                 async for message in client.get_chat_history(
                     channel_id, limit=MESSAGES_PER_CHANNEL
                 ):
+                    if isinstance(getattr(message, "service", None), MessageServiceType):
+                        continue
+                    from_user = getattr(message, "from_user", None)
+                    if getattr(from_user, "is_bot", False) is True:
+                        continue
+                    if own_bot_id is not None and getattr(from_user, "id", None) == own_bot_id:
+                        continue
                     post = Post.from_message(message)
                     await queue.put(post)
                 failures.pop(channel_id, None)

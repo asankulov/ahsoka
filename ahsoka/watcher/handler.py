@@ -15,6 +15,7 @@ def register_watcher_handlers(
     client: Client,
     queue: asyncio.Queue,
     watched_channels: set[int],
+    own_bot_id: int | None = None,
 ) -> None:
     @client.on_raw_update()
     async def on_raw(c: Client, update, users: dict, chats: dict) -> None:
@@ -39,6 +40,14 @@ def register_watcher_handlers(
 
         if chat_id not in watched_channels:
             return
+
+        # Skip bot-authored messages (group chatter from bots). Channel posts have no sender.
+        sender = msg.from_id
+        if isinstance(sender, raw_types.PeerUser):
+            if own_bot_id is not None and sender.user_id == own_bot_id:
+                return  # our own notifications (group is also a notify target)
+            if getattr(users.get(sender.user_id), "bot", False):
+                return
 
         text = msg.message or ""
 

@@ -1497,3 +1497,286 @@ async def test_channel_poller_success_on_seeded_lost_channel_restores():
     # no names given -> bare id label
     restored = [c for c in logger_mock.info.call_args_list if "Access restored" in c.args[0]]
     assert restored[0].args[1] == "-1001"
+
+
+# ---------------------------------------------------------------------------
+# Group chat support: handler bot-sender filter / basic groups
+# ---------------------------------------------------------------------------
+
+
+def _register_and_capture(queue, watched, **kwargs):
+    from ahsoka.watcher.handler import register_watcher_handlers
+
+    captured = {}
+
+    def fake_on_raw_update():
+        def decorator(fn):
+            captured["fn"] = fn
+            return fn
+        return decorator
+
+    client = MagicMock()
+    client.on_raw_update = fake_on_raw_update
+    register_watcher_handlers(client, queue, watched, **kwargs)
+    return client, captured["fn"]
+
+
+def _group_msg(peer, from_id=None, msg_id=300):
+    from pyrogram.raw import types as raw_types
+
+    msg = MagicMock(spec=raw_types.Message)
+    msg.id = msg_id
+    msg.message = "hi"
+    msg.date = 1_700_000_000
+    msg.entities = []
+    msg.peer_id = peer
+    msg.from_id = from_id
+    return msg
+
+
+def _peer_user(user_id):
+    from pyrogram.raw import types as raw_types
+
+    p = MagicMock(spec=raw_types.PeerUser)
+    p.user_id = user_id
+    return p
+
+
+def _peer_channel(channel_id):
+    from pyrogram.raw import types as raw_types
+
+    p = MagicMock(spec=raw_types.PeerChannel)
+    p.channel_id = channel_id
+    return p
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_drops_message_from_bot_sender():
+    from pyrogram.raw import types as raw_types
+
+    queue: asyncio.Queue = asyncio.Queue()
+    chat_id = -1001000000123
+    client, fn = _register_and_capture(queue, {chat_id})
+    msg = _group_msg(_peer_channel(1000000123), from_id=_peer_user(555))
+    update = _make_update(msg)
+    bot_user = MagicMock()
+    bot_user.bot = True
+    await fn(client, update, users={555: bot_user}, chats={})
+    assert queue.empty()
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_queues_message_from_human_sender():
+    queue: asyncio.Queue = asyncio.Queue()
+    chat_id = -1001000000123
+    client, fn = _register_and_capture(queue, {chat_id})
+    msg = _group_msg(_peer_channel(1000000123), from_id=_peer_user(556))
+    human = MagicMock()
+    human.bot = False
+    await fn(client, _make_update(msg), users={556: human}, chats={})
+    assert queue.qsize() == 1
+    assert queue.get_nowait().channel_id == chat_id
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_queues_message_when_sender_not_in_users_dict():
+    queue: asyncio.Queue = asyncio.Queue()
+    chat_id = -1001000000123
+    client, fn = _register_and_capture(queue, {chat_id})
+    msg = _group_msg(_peer_channel(1000000123), from_id=_peer_user(777))
+    await fn(client, _make_update(msg), users={}, chats={})
+    assert queue.qsize() == 1
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_queues_channel_post_without_from_id():
+    queue: asyncio.Queue = asyncio.Queue()
+    chat_id = -1001000000123
+    client, fn = _register_and_capture(queue, {chat_id})
+    msg = _group_msg(_peer_channel(1000000123), from_id=None)
+    await fn(client, _make_update(msg), users={}, chats={})
+    assert queue.qsize() == 1
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_basic_group_message_queued_with_negative_chat_id():
+    from pyrogram.raw import types as raw_types
+
+    queue: asyncio.Queue = asyncio.Queue()
+    client, fn = _register_and_capture(queue, {-4242})
+    peer = MagicMock(spec=raw_types.PeerChat)
+    peer.chat_id = 4242
+    msg = _group_msg(peer, from_id=_peer_user(9))
+    human = MagicMock()
+    human.bot = False
+    await fn(client, _make_update(msg, "private"), users={9: human}, chats={})
+    assert queue.get_nowait().channel_id == -4242
+
+
+# ---------------------------------------------------------------------------
+# Group chat support: poller filtering and access-loss errors
+# ---------------------------------------------------------------------------
+
+
+async def _poll_once(messages, channel_id=-1001, **kwargs):
+    """Run one real sweep with the real Post.from_message; return queued posts."""
+    from ahsoka.watcher.poller import channel_poller
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def history(cid, limit):
+        for m in messages:
+            yield m
+
+    client = MagicMock()
+    client.get_chat_history = history
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:
+            raise asyncio.CancelledError
+
+    with patch("ahsoka.watcher.poller.asyncio.sleep", side_effect=fake_sleep):
+        try:
+            await channel_poller(client, queue, {channel_id}, **kwargs)
+        except asyncio.CancelledError:
+            pass
+    return [queue.get_nowait() for _ in range(queue.qsize())]
+
+
+def _real_msg(msg_id, service=None, is_bot=False, user_id=None):
+    m = MagicMock()
+    m.id = msg_id
+    m.text = f"text {msg_id}"
+    m.caption = None
+    m.entities = []
+    m.caption_entities = None
+    m.date = datetime(2024, 1, 1)
+    m.chat.id = -1001
+    m.chat.username = "grp"
+    m.service = service
+    m.from_user.is_bot = is_bot
+    if user_id is not None:
+        m.from_user.id = user_id
+    return m
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_skips_service_messages():
+    from pyrogram.enums import MessageServiceType
+
+    posts = await _poll_once([
+        _real_msg(1, service=MessageServiceType.NEW_CHAT_MEMBERS),
+        _real_msg(2),
+    ])
+    assert [p.message_id for p in posts] == [2]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_skips_bot_authored_messages():
+    posts = await _poll_once([_real_msg(1, is_bot=True), _real_msg(2, is_bot=False)])
+    assert [p.message_id for p in posts] == [2]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_enqueues_plain_magicmock_message():
+    """A bare MagicMock (auto-attrs: service/from_user.is_bot are MagicMocks) is not filtered."""
+    m = _real_msg(5)
+    m.service = MagicMock()
+    m.from_user.is_bot = MagicMock()
+    posts = await _poll_once([m])
+    assert [p.message_id for p in posts] == [5]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_enqueues_message_without_from_user():
+    m = _real_msg(6)
+    m.from_user = None
+    posts = await _poll_once([m])
+    assert [p.message_id for p in posts] == [6]
+
+
+@pytest.mark.parametrize("name", ["ChatForbidden", "ChatInvalid", "PeerIdInvalid"])
+async def test_channel_poller_basic_group_access_errors_count_toward_lost(name):
+    import pyrogram.errors as perrors
+
+    err = getattr(perrors, name)()
+    lost: set[int] = set()
+    h = _PollerHarness({-4242: [err]}, sweeps=8, lost_channels=lost)
+    logger_mock = await h.run()
+    assert lost == {-4242}
+    assert len(_errors(logger_mock)) == 1
+
+
+# ---------------------------------------------------------------------------
+# own_bot_id: skip our own notifications in group chats
+# ---------------------------------------------------------------------------
+
+OWN_BOT = 4242
+
+
+def _human(is_bot=False):
+    u = MagicMock()
+    u.bot = is_bot
+    return u
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_own_bot_id_skips_message_from_own_bot():
+    queue: asyncio.Queue = asyncio.Queue()
+    client, fn = _register_and_capture(queue, {-1001000000123}, own_bot_id=OWN_BOT)
+    msg = _group_msg(_peer_channel(1000000123), from_id=_peer_user(OWN_BOT))
+    # users entry says NOT a bot: the skip must come from own_bot_id alone
+    await fn(client, _make_update(msg), users={OWN_BOT: _human()}, chats={})
+    assert queue.empty()
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_own_bot_id_still_skips_other_bots():
+    queue: asyncio.Queue = asyncio.Queue()
+    client, fn = _register_and_capture(queue, {-1001000000123}, own_bot_id=OWN_BOT)
+    msg = _group_msg(_peer_channel(1000000123), from_id=_peer_user(555))
+    await fn(client, _make_update(msg), users={555: _human(is_bot=True)}, chats={})
+    assert queue.empty()
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_own_bot_id_queues_human_sender():
+    queue: asyncio.Queue = asyncio.Queue()
+    client, fn = _register_and_capture(queue, {-1001000000123}, own_bot_id=OWN_BOT)
+    msg = _group_msg(_peer_channel(1000000123), from_id=_peer_user(9))
+    await fn(client, _make_update(msg), users={9: _human()}, chats={})
+    assert queue.qsize() == 1
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_own_bot_id_set_queues_channel_post_without_from_id():
+    queue: asyncio.Queue = asyncio.Queue()
+    client, fn = _register_and_capture(queue, {-1001000000123}, own_bot_id=OWN_BOT)
+    msg = _group_msg(_peer_channel(1000000123), from_id=None)
+    await fn(client, _make_update(msg), users={}, chats={})
+    assert queue.qsize() == 1
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_handler_default_own_bot_id_none_queues_non_bot_user():
+    queue: asyncio.Queue = asyncio.Queue()
+    client, fn = _register_and_capture(queue, {-1001000000123})
+    msg = _group_msg(_peer_channel(1000000123), from_id=_peer_user(OWN_BOT))
+    await fn(client, _make_update(msg), users={OWN_BOT: _human()}, chats={})
+    assert queue.qsize() == 1  # without own_bot_id nothing identifies it as ours
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_own_bot_id_skips_own_messages_keeps_humans():
+    posts = await _poll_once(
+        [_real_msg(1, user_id=OWN_BOT), _real_msg(2, user_id=9)], own_bot_id=OWN_BOT
+    )
+    assert [p.message_id for p in posts] == [2]
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_poller_default_own_bot_id_none_enqueues_everyone_non_bot():
+    posts = await _poll_once([_real_msg(1, user_id=OWN_BOT), _real_msg(2, user_id=9)])
+    assert [p.message_id for p in posts] == [1, 2]

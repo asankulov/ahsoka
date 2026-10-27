@@ -1409,7 +1409,7 @@ async def test_main_starts_warm_task_and_passes_it_as_poller_ready():
         await asyncio.sleep(9999)  # pragma: no cover - cancelled before start
 
     async def fake_poller(client, queue, channels, ready=None,
-                          lost_channels=None, channel_names=None):
+                          lost_channels=None, channel_names=None, own_bot_id=None):
         await asyncio.sleep(9999)  # pragma: no cover - cancelled before start
 
     async def capturing_gather(*tasks, **kwargs):
@@ -1446,3 +1446,101 @@ async def test_main_starts_warm_task_and_passes_it_as_poller_ready():
     assert warm_locals["channel_names"] is loaded_names
     assert warm_locals["lost_channels"] == set()
     assert warm_locals["conn"] is not None
+
+
+async def test_fan_out_passes_conn_and_user_id_to_send_notification(conn):
+    """send_notification must receive conn and the config's user_id (for group-migration retargeting)."""
+    from ahsoka.main import _fan_out_verdicts
+
+    post = make_post()
+    config = make_config(user_id=42, notify_chat_id=-100777)
+    bot = AsyncMock()
+
+    with patch("ahsoka.main.matches_user", return_value=True), \
+         patch("ahsoka.main.send_notification", new_callable=AsyncMock) as mock_send:
+        await _fan_out_verdicts(conn, bot, [(post, config, make_verdict(user_id=42))])
+
+    mock_send.assert_awaited_once()
+    assert mock_send.await_args.args[:2] == (bot, -100777)
+    assert mock_send.await_args.kwargs["conn"] is conn
+    assert mock_send.await_args.kwargs["user_id"] == 42
+
+
+# ---------------------------------------------------------------------------
+# Group chat support: empty-text drop, own bot id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text", ["", "   ", "\n\t  \n"])
+async def test_pipeline_worker_drops_empty_text_post_after_marking_seen(conn, text):
+    post = make_post(text=text)
+    keyword_index = MagicMock()
+    keyword_index.passes = MagicMock(return_value=True)
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock) as mock_configs, \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen, \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_enqueue:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), keyword_index)
+
+    mock_mark_seen.assert_called_once_with(conn, post.channel_id, post.message_id)
+    keyword_index.passes.assert_not_called()
+    mock_configs.assert_not_called()
+    mock_enqueue.assert_not_called()
+
+
+async def test_pipeline_worker_duplicate_empty_text_post_not_marked_again(conn):
+    """Empty-text check runs after dedup: a duplicate never reaches mark_seen."""
+    post = make_post(text="  ")
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=True), \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), MagicMock())
+
+    mock_mark_seen.assert_not_called()
+
+
+@pytest.mark.parametrize("token,expected", [
+    ("123:ABC", 123),
+    ("987654321:AAH-xyz_Q", 987654321),
+    ("tok", None),
+    ("abc:DEF", None),
+    ("", None),
+    (MagicMock(), None),
+])
+def test_bot_id_from_token(token, expected):
+    from ahsoka.main import _bot_id_from_token
+
+    assert _bot_id_from_token(token) == expected
+
+
+async def test_main_passes_own_bot_id_to_watcher_handlers_and_poller():
+    fake_settings = _make_fake_settings()
+    fake_settings.bot_token = "777:XYZ"
+    register = MagicMock()
+    poller = MagicMock(side_effect=lambda *a, **k: asyncio.sleep(0))
+    extra = [
+        patch("ahsoka.main.settings", fake_settings),
+        patch("ahsoka.main.register_watcher_handlers", register),
+        patch("ahsoka.main.channel_poller", poller),
+    ]
+    async with _main_env(extra_patches=extra) as task:
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    assert register.call_args.kwargs["own_bot_id"] == 777
+    assert poller.call_args.kwargs["own_bot_id"] == 777
+
+
+async def test_main_unparsable_bot_token_passes_none_own_bot_id():
+    register = MagicMock()
+    poller = MagicMock(side_effect=lambda *a, **k: asyncio.sleep(0))
+    extra = [
+        patch("ahsoka.main.register_watcher_handlers", register),
+        patch("ahsoka.main.channel_poller", poller),
+    ]
+    async with _main_env(extra_patches=extra):  # fake token is "tok"
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+    assert register.call_args.kwargs["own_bot_id"] is None
+    assert poller.call_args.kwargs["own_bot_id"] is None

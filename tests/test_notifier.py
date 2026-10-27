@@ -1,6 +1,12 @@
+import logging
 from datetime import datetime
+from unittest.mock import AsyncMock, patch
 
-from ahsoka.bot.notifier import format_notification
+import pytest
+from aiogram.exceptions import TelegramForbiddenError, TelegramMigrateToChat
+from aiogram.methods import SendMessage
+
+from ahsoka.bot.notifier import format_notification, send_notification
 from ahsoka.models import Post, Score
 
 
@@ -9,9 +15,10 @@ def make_post(
     channel_name: str = "jobschannel",
     timestamp: datetime | None = None,
     url: str | None = None,
+    channel_id: int = -100123,
 ) -> Post:
     return Post(
-        channel_id=-100123,
+        channel_id=channel_id,
         message_id=1,
         channel_name=channel_name,
         text=text,
@@ -177,3 +184,114 @@ def test_tags_stack_capped_at_five():
     )
     tags_part = result.split("🏷 ")[1].split("\n")[0]
     assert "f" not in tags_part
+
+
+# ---------------------------------------------------------------------------
+# Group chat support: link / footer
+# ---------------------------------------------------------------------------
+
+def test_link_first_line_followed_by_blank_when_present():
+    lines = format_notification(make_post(), make_score()).split("\n")
+    assert lines[0] == "https://t.me/jobschannel/1"
+    assert lines[1] == ""
+    assert lines[2].startswith("\u2b50")
+
+
+def test_no_leading_blank_line_when_link_is_none():
+    # basic group: negative id without -100 prefix and numeric name -> Post.link is None
+    post = make_post(channel_name="-4567", channel_id=-4567)
+    assert post.link is None
+    result = format_notification(post, make_score(score=7, reason="ok"))
+    assert result.split("\n")[0] == "\u2b50 7/10 \u2014 ok"
+
+
+def test_footer_shows_chat_id_for_numeric_channel_name():
+    result = format_notification(make_post(channel_name="-100123"), make_score())
+    footer = result.split("\n")[-1]
+    assert footer.startswith("\u2014 chat -100123 \u00b7 ")
+    assert "@-100123" not in result
+
+
+def test_footer_shows_at_username_for_named_channel():
+    footer = format_notification(make_post(channel_name="jobschannel"), make_score()).split("\n")[-1]
+    assert footer.startswith("\u2014 @jobschannel \u00b7 ")
+
+
+# ---------------------------------------------------------------------------
+# send_notification
+# ---------------------------------------------------------------------------
+
+def _migrate_exc(new_id=-100999):
+    return TelegramMigrateToChat(method=SendMessage(chat_id=-5, text="x"), message="migrated", migrate_to_chat_id=new_id)
+
+
+def _forbidden_exc():
+    return TelegramForbiddenError(method=SendMessage(chat_id=-5, text="x"), message="bot was kicked")
+
+
+async def test_send_notification_happy_path_sends_once():
+    bot = AsyncMock()
+    await send_notification(bot, 42, make_post(), make_score())
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.args[0] == 42
+
+
+async def test_send_notification_migrate_updates_target_and_resends_once():
+    bot = AsyncMock()
+    bot.send_message.side_effect = [_migrate_exc(-100999), None]
+    conn = object()
+    with patch("ahsoka.bot.notifier.db.set_notify_target", new_callable=AsyncMock) as set_target:
+        await send_notification(bot, -5, make_post(), make_score(), conn=conn, user_id=7)
+    set_target.assert_awaited_once_with(conn, 7, -100999)
+    assert bot.send_message.await_count == 2
+    assert bot.send_message.await_args_list[0].args[0] == -5
+    assert bot.send_message.await_args_list[1].args[0] == -100999
+    assert bot.send_message.await_args_list[0].args[1] == bot.send_message.await_args_list[1].args[1]
+
+
+@pytest.mark.parametrize("conn,user_id", [(None, None), (object(), None), (None, 7)])
+async def test_send_notification_migrate_without_conn_or_user_retries_without_db_update(conn, user_id):
+    bot = AsyncMock()
+    bot.send_message.side_effect = [_migrate_exc(-100999), None]
+    with patch("ahsoka.bot.notifier.db.set_notify_target", new_callable=AsyncMock) as set_target:
+        await send_notification(bot, -5, make_post(), make_score(), conn=conn, user_id=user_id)
+    set_target.assert_not_awaited()
+    assert bot.send_message.await_args_list[1].args[0] == -100999
+
+
+async def test_send_notification_forbidden_logs_warning_without_raising(caplog):
+    bot = AsyncMock()
+    bot.send_message.side_effect = _forbidden_exc()
+    with caplog.at_level(logging.DEBUG, logger="ahsoka.bot.notifier"):
+        await send_notification(bot, -5, make_post(), make_score())
+    recs = [r for r in caplog.records if r.name == "ahsoka.bot.notifier"]
+    assert any(r.levelno == logging.WARNING for r in recs)
+    assert not any(r.exc_info for r in recs)
+    assert not any(r.levelno >= logging.ERROR for r in recs)
+
+
+async def test_send_notification_generic_error_uses_logger_exception():
+    bot = AsyncMock()
+    bot.send_message.side_effect = RuntimeError("boom")
+    with patch("ahsoka.bot.notifier.logger") as lg:
+        await send_notification(bot, 42, make_post(), make_score())
+    lg.exception.assert_called_once()
+    lg.warning.assert_not_called()
+
+
+async def test_send_notification_forbidden_does_not_call_logger_exception():
+    bot = AsyncMock()
+    bot.send_message.side_effect = _forbidden_exc()
+    with patch("ahsoka.bot.notifier.logger") as lg:
+        await send_notification(bot, 42, make_post(), make_score())
+    lg.warning.assert_called_once()
+    lg.exception.assert_not_called()
+
+
+async def test_send_notification_forbidden_on_resend_after_migrate_is_warning():
+    bot = AsyncMock()
+    bot.send_message.side_effect = [_migrate_exc(), _forbidden_exc()]
+    with patch("ahsoka.bot.notifier.logger") as lg:
+        await send_notification(bot, -5, make_post(), make_score())
+    lg.warning.assert_called_once()
+    lg.exception.assert_not_called()

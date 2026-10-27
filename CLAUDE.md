@@ -69,8 +69,8 @@ tests/
 - Two routers: `user_router` (open to all, checks not banned) and `admin_router` (admin-only)
 - `BOT_COMMANDS` lists user-visible commands registered via `bot.set_my_commands()`. Admin commands are hidden.
 - **FSM**: `WaitingForInput(StatesGroup)` with states for all input-requiring commands
-- Channel discovery: `/watch` then forward a message → bot joins channel and adds to watchlist
-- Notification target: `/notify` then forward a message → bot verifies access, sets target; `/notify dm` resets to DM
+- Channel discovery: `/watch` then forward a message → bot joins channel/group and adds to watchlist (groups supported; forum topics ignored)
+- Notification target: `/notify` then forward a message → bot verifies access, sets target; `/notify` inside a group (admin only) targets that group; `/notify dm` resets to DM. In groups only `/notify` is honoured
 
 ### Testing aiogram Handlers
 Handlers are closures registered on Routers. Tests use name-based lookup:
