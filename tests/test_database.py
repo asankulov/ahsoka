@@ -737,3 +737,62 @@ async def test_update_channel_names_empty_is_noop(conn):
 async def test_update_channel_names_ignores_unwatched_channel(conn):
     await update_channel_names(conn, {-9999: ("x", "X")})
     assert await load_channel_names(conn) == {}
+
+
+# ---------------------------------------------------------------------------
+# migrate_channel / get_notify_chat_ids
+# ---------------------------------------------------------------------------
+
+async def _channel_row(conn, channel_id):
+    async with conn.execute(
+        "SELECT channel_id, added_by, added_at, username, title "
+        "FROM watched_channels WHERE channel_id = ?", (channel_id,)
+    ) as cur:
+        return await cur.fetchone()
+
+
+async def test_migrate_channel_preserves_metadata_and_deletes_old_row(conn):
+    from ahsoka.database import migrate_channel
+    await add_channel(conn, -4242, added_by=5, username="grp", title="My Group")
+    old = await _channel_row(conn, -4242)
+
+    assert await migrate_channel(conn, -4242, -1001000004242) is True
+
+    assert await _channel_row(conn, -4242) is None
+    new = await _channel_row(conn, -1001000004242)
+    assert new == (-1001000004242,) + old[1:]  # added_by/added_at/username/title kept
+    assert new[1] == 5 and new[3] == "grp" and new[4] == "My Group"
+
+
+async def test_migrate_channel_second_call_returns_false_and_changes_nothing(conn):
+    from ahsoka.database import migrate_channel
+    await add_channel(conn, -4242, added_by=5, title="G")
+    assert await migrate_channel(conn, -4242, -1001000004242) is True
+    before = await load_watched_channels(conn)
+    assert await migrate_channel(conn, -4242, -1001000004242) is False
+    assert await load_watched_channels(conn) == before == {-1001000004242}
+
+
+async def test_migrate_channel_does_not_clobber_existing_new_row(conn):
+    from ahsoka.database import migrate_channel
+    await add_channel(conn, -4242, added_by=5, username="old", title="Old")
+    await add_channel(conn, -1001000004242, added_by=9, username="new", title="New")
+
+    assert await migrate_channel(conn, -4242, -1001000004242) is True
+
+    assert await _channel_row(conn, -4242) is None
+    row = await _channel_row(conn, -1001000004242)
+    assert (row[1], row[3], row[4]) == (9, "new", "New")
+
+
+async def test_get_notify_chat_ids_returns_distinct_set_of_dms_and_groups(conn):
+    from ahsoka.database import get_notify_chat_ids, set_notify_target
+    await get_or_create_user(conn, 1)
+    await get_or_create_user(conn, 2)
+    await get_or_create_user(conn, 3)
+    await set_notify_target(conn, 1, -100777)
+    await set_notify_target(conn, 2, -100777)  # duplicate group target
+    # user 3 stays on DM (own id); owner stays on DM too
+    ids = await get_notify_chat_ids(conn)
+    assert isinstance(ids, set)
+    assert ids == {-100777, 3, OWNER_ID}

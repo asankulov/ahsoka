@@ -9,7 +9,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from ahsoka.models import NotifiedPost
-from ahsoka.text_utils import entity_type_name
+from ahsoka.text_utils import build_message_link, entity_type_name
 
 _RELATIVE_RE = re.compile(r"^(\d+)([mhdw])$")
 _UNIT_TO_KWARG = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
@@ -74,12 +74,14 @@ def parse_range(args: list[str], now: datetime) -> tuple[datetime, datetime] | N
     return start, end
 
 
-def build_post_link(channel_id: int, message_id: int, username: str | None = None) -> str:
-    """Fallback link builder for a (channel_id, message_id), mirroring Post.link."""
-    if username:
-        return f"https://t.me/{username}/{message_id}"
-    cid = str(abs(channel_id))[3:]  # strip leading "100" from e.g. 1001234567890
-    return f"https://t.me/c/{cid}/{message_id}"
+def build_post_link(
+    channel_id: int, message_id: int, username: str | None = None
+) -> str | None:
+    """Fallback link builder for a (channel_id, message_id), mirroring Post.link.
+
+    Returns None for basic groups without a username (no permalinks exist).
+    """
+    return build_message_link(channel_id, message_id, username)
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +284,8 @@ def render_markdown(
         lines.append("")
         for post in posts:
             link = build_post_link(post.channel_id, post.message_id, links.get(post.channel_id))
-            lines.append(f"### [{post.channel_id}/{post.message_id}]({link})")
+            ref = f"{post.channel_id}/{post.message_id}"
+            lines.append(f"### [{ref}]({link})" if link else f"### {ref}")
             lines.append("")
             body = bodies.get((post.channel_id, post.message_id))
             if body:

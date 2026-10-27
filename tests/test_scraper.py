@@ -21,7 +21,7 @@ async def test_no_url_returns_post_text():
 
 async def test_fallback_on_timeout():
     post = make_post("fallback text", urls=["http://example.com"])
-    with patch("ahsoka.pipeline.scraper.httpx.AsyncClient") as mock_cls:
+    with patch("ahsoka.pipeline.scraper._make_client") as mock_cls:
         mock_cls.return_value.__aenter__.return_value.get = AsyncMock(
             side_effect=httpx.TimeoutException("timeout")
         )
@@ -34,7 +34,7 @@ async def test_fallback_when_trafilatura_returns_none():
     mock_response = MagicMock()
     mock_response.text = "<html></html>"
     mock_response.raise_for_status = lambda: None
-    with patch("ahsoka.pipeline.scraper.httpx.AsyncClient") as mock_cls:
+    with patch("ahsoka.pipeline.scraper._make_client") as mock_cls:
         mock_cls.return_value.__aenter__.return_value.get = AsyncMock(return_value=mock_response)
         with patch("ahsoka.pipeline.scraper.trafilatura.extract", return_value=None):
             result = await scrape_content(post)
@@ -46,7 +46,7 @@ async def test_returns_extracted_text():
     mock_response = MagicMock()
     mock_response.text = "<html><body><article>Job description here</article></body></html>"
     mock_response.raise_for_status = lambda: None
-    with patch("ahsoka.pipeline.scraper.httpx.AsyncClient") as mock_cls:
+    with patch("ahsoka.pipeline.scraper._make_client") as mock_cls:
         mock_cls.return_value.__aenter__.return_value.get = AsyncMock(return_value=mock_response)
         with patch("ahsoka.pipeline.scraper.trafilatura.extract", return_value="Job description here"):
             result = await scrape_content(post)
@@ -75,9 +75,9 @@ async def test_partial_scrape_failure():
 async def test_tg_link_is_not_http_fetched():
     """Telegram deep links must be excluded from the httpx fetch list."""
     post = make_post("summary text", urls=["https://t.me/revacancy/137378"])
-    with patch("ahsoka.pipeline.scraper.httpx.AsyncClient") as mock_cls:
+    with patch("ahsoka.pipeline.scraper._make_client") as mock_cls:
         result = await scrape_content(post)
-    # httpx.AsyncClient should never have been entered
+    # no client should ever have been built/entered
     mock_cls.return_value.__aenter__.assert_not_called()
     assert result == "summary text"
 
@@ -101,7 +101,7 @@ async def test_http_error_status_falls_back_to_post_text():
     mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
         "404", request=MagicMock(), response=MagicMock()
     )
-    with patch("ahsoka.pipeline.scraper.httpx.AsyncClient") as mock_cls:
+    with patch("ahsoka.pipeline.scraper._make_client") as mock_cls:
         mock_cls.return_value.__aenter__.return_value.get = AsyncMock(return_value=mock_response)
         result = await scrape_content(post)
     assert result == "fallback text"
@@ -110,7 +110,7 @@ async def test_http_error_status_falls_back_to_post_text():
 async def test_connection_error_falls_back_to_post_text():
     """A connection error should be silently skipped."""
     post = make_post("fallback text", urls=["http://unreachable.example.com"])
-    with patch("ahsoka.pipeline.scraper.httpx.AsyncClient") as mock_cls:
+    with patch("ahsoka.pipeline.scraper._make_client") as mock_cls:
         mock_cls.return_value.__aenter__.return_value.get = AsyncMock(
             side_effect=httpx.ConnectError("connection refused")
         )

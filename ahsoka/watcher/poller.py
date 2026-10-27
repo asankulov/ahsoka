@@ -13,6 +13,7 @@ from pyrogram.errors import (
 )
 
 from ahsoka.models import Post
+from ahsoka.watcher.migration import migrate_watched_chat
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ ACCESS_LOST_ERRORS = (
     ChannelPrivate, ChannelBanned, ChannelInvalid,  # channels / supergroups
     ChatForbidden, ChatInvalid, PeerIdInvalid,  # basic groups
 )
+TELEGRAM_SERVICE_USER_ID = 777000  # sender of channel->discussion-group auto-forwards
 MESSAGES_PER_CHANNEL = 20  # how many recent messages to fetch per channel
 
 
@@ -35,6 +37,7 @@ async def channel_poller(
     lost_channels: set[int] | None = None,
     channel_names: dict[int, str] | None = None,
     own_bot_id: int | None = None,
+    conn=None,
 ) -> None:
     """
     Fallback poller for channels that don't deliver push UpdateNewChannelMessage.
@@ -75,9 +78,14 @@ async def channel_poller(
             if loop.time() < retry_at.get(channel_id, 0.0):
                 continue
             try:
+                migrated_to: int | None = None
                 async for message in client.get_chat_history(
                     channel_id, limit=MESSAGES_PER_CHANNEL
                 ):
+                    target = getattr(message, "migrate_to_chat_id", None)
+                    if isinstance(target, int) and not isinstance(target, bool):
+                        migrated_to = target
+                        break
                     if isinstance(getattr(message, "service", None), MessageServiceType):
                         continue
                     from_user = getattr(message, "from_user", None)
@@ -85,8 +93,24 @@ async def channel_poller(
                         continue
                     if own_bot_id is not None and getattr(from_user, "id", None) == own_bot_id:
                         continue
+                    fchat_id = getattr(getattr(message, "forward_from_chat", None), "id", None)
+                    if (
+                        isinstance(fchat_id, int)
+                        and fchat_id != channel_id
+                        and fchat_id in watched_channels
+                        and getattr(from_user, "id", None) in (None, TELEGRAM_SERVICE_USER_ID)
+                    ):
+                        continue  # auto-forward of a watched channel's post into its group
                     post = Post.from_message(message)
                     await queue.put(post)
+                if migrated_to is not None:
+                    await migrate_watched_chat(
+                        conn, watched_channels, channel_id, migrated_to,
+                        channel_names, lost_channels,
+                    )
+                    for state in (failures, lost_streak, retry_at):
+                        state.pop(channel_id, None)
+                    continue
                 failures.pop(channel_id, None)
                 retry_at.pop(channel_id, None)
                 lost_streak.pop(channel_id, None)

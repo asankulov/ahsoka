@@ -3056,3 +3056,93 @@ async def test_private_admin_command_still_works_for_admin(conn, settings, group
     dp, _, _ = setup_dp(conn, settings)
     replies, _ = await _feed_chat(dp, group_bot, "/users", "private", user_id=OWNER_ID)
     assert replies
+
+
+# ---------------------------------------------------------------------------
+# Group chat follow-ups: /notify registers the caller, notify-target warning
+# ---------------------------------------------------------------------------
+
+NEW_USER_ID = 777001  # never registered up front (OWNER_ID is pre-registered by init_db)
+
+
+async def test_group_notify_registers_unregistered_user_and_saves_target(conn, settings, group_bot):
+    dp, _, _ = setup_dp(conn, settings)
+    assert await get_user(conn, NEW_USER_ID) is None
+    replies, _ = await _feed_chat(dp, group_bot, "/notify", "supergroup", user_id=NEW_USER_ID)
+    assert replies == ["Notifications will be sent to: Job Group"]
+    assert await get_user(conn, NEW_USER_ID) is not None
+    assert (await get_user_config(conn, NEW_USER_ID)).notify_chat_id == GROUP_ID
+
+
+async def test_group_notify_dm_registers_unregistered_user_and_saves_dm_target(conn, settings, group_bot):
+    dp, _, _ = setup_dp(conn, settings)
+    replies, _ = await _feed_chat(dp, group_bot, "/notify dm", "supergroup", user_id=NEW_USER_ID)
+    assert replies == ["Notifications will be sent to your DM."]
+    assert await get_user(conn, NEW_USER_ID) is not None
+    assert (await get_user_config(conn, NEW_USER_ID)).notify_chat_id == NEW_USER_ID
+
+
+@pytest.mark.parametrize("text", ["/notify", "/notify dm"])
+async def test_group_anonymous_admin_notify_registers_nobody(conn, settings, group_bot, text):
+    dp, _, _ = setup_dp(conn, settings)
+    anon = Chat(id=GROUP_ID, type="supergroup", title="Job Group")
+    replies, _ = await _feed_chat(dp, group_bot, text, "supergroup",
+                                  user_id=NEW_USER_ID, sender_chat=anon)
+    assert len(replies) == 1 and "anonymous admin" in replies[0]
+    assert await get_user(conn, NEW_USER_ID) is None
+
+
+async def test_group_non_notify_command_registers_nobody_even_with_notify_prefix_lookalike(conn, settings, group_bot):
+    dp, _, _ = setup_dp(conn, settings)
+    replies, _ = await _feed_chat(dp, group_bot, "/notifyx", "supergroup", user_id=NEW_USER_ID)
+    assert replies == []
+    assert await get_user(conn, NEW_USER_ID) is None
+
+
+async def test_group_notify_banned_user_still_ignored(conn, settings, group_bot):
+    from ahsoka.database import ban_user
+    await get_or_create_user(conn, NEW_USER_ID)
+    await ban_user(conn, NEW_USER_ID)
+    dp, _, _ = setup_dp(conn, settings)
+    replies, _ = await _feed_chat(dp, group_bot, "/notify", "supergroup", user_id=NEW_USER_ID)
+    assert replies == []
+    assert (await get_user_config(conn, NEW_USER_ID)).notify_chat_id != GROUP_ID
+
+
+async def test_input_watch_warns_when_chat_is_notify_target_and_still_adds(conn, settings):
+    from ahsoka.database import set_notify_target
+    await set_notify_target(conn, OWNER_ID, -100999)
+    _, h, watched = setup_dp(conn, settings)
+    msg = make_msg("")
+    msg.forward_origin = chan_origin(-100999, "Job Channel", "jobchan")
+    await h["input_watch_channel"](msg, make_ctx())
+    assert -100999 in watched
+    assert -100999 in await load_watched_channels(conn)
+    assert "Now watching: Job Channel" in msg.reply.call_args[0][0]
+    assert "notification target" in msg.reply.call_args[0][0]
+
+
+async def test_input_watch_no_warning_when_chat_is_not_notify_target(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("")
+    msg.forward_origin = chan_origin(-100999, "Job Channel", "jobchan")
+    await h["input_watch_channel"](msg, make_ctx())
+    assert "notification target" not in msg.reply.call_args[0][0]
+
+
+async def test_addchannel_warns_when_chat_is_notify_target_and_still_adds(conn, settings):
+    from ahsoka.database import set_notify_target
+    await set_notify_target(conn, OWNER_ID, -100123)
+    _, h, watched = setup_dp(conn, settings)
+    msg = make_msg("/addchannel -100123")
+    await h["cmd_addchannel"](msg, make_ctx())
+    assert -100123 in watched
+    assert -100123 in await load_watched_channels(conn)
+    assert "notification target" in msg.reply.call_args[0][0]
+
+
+async def test_addchannel_no_warning_when_chat_is_not_notify_target(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/addchannel -100123")
+    await h["cmd_addchannel"](msg, make_ctx())
+    assert "notification target" not in msg.reply.call_args[0][0]

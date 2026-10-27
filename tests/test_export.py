@@ -636,6 +636,28 @@ def test_render_markdown_uses_links_mapping_for_channel():
 
 
 def test_render_markdown_falls_back_to_private_link_when_no_username():
-    bodies = {(100, 5): "Body"}
-    md = render_markdown({1: [_post()]}, START, END, {100: None}, bodies, retention_note=False)
-    assert "https://t.me/c/" in md
+    bodies = {(-1001234567890, 5): "Body"}
+    md = render_markdown(
+        {1: [_post(channel_id=-1001234567890)]}, START, END, {-1001234567890: None},
+        bodies, retention_note=False,
+    )
+    assert "https://t.me/c/1234567890/" in md
+
+
+def test_build_post_link_basic_group_without_username_is_none():
+    assert build_post_link(-4567, 5, None) is None
+
+
+def test_build_post_link_supergroup_and_username_forms():
+    assert build_post_link(-1001234567890, 5) == "https://t.me/c/1234567890/5"
+    assert build_post_link(-1001234567890, 5, "jobchan") == "https://t.me/jobchan/5"
+
+
+def test_render_markdown_basic_group_post_uses_plain_heading_without_link():
+    md = render_markdown(
+        {1: [_post(channel_id=-4567, message_id=9)]}, START, END, {-4567: None},
+        {(-4567, 9): "Body"}, retention_note=False,
+    )
+    assert "### -4567/9\n" in md
+    assert "[-4567/9](" not in md
+    assert "Body" in md

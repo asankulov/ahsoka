@@ -139,6 +139,11 @@ async def pipeline_worker(
                 logger.debug("Duplicate: %s/%s", post.channel_id, post.message_id)
                 continue
 
+            if post.channel_id in await db.get_notify_chat_ids(conn):
+                logger.debug("Notify-target drop: %s/%s", post.channel_id, post.message_id)
+                await db.mark_seen(conn, post.channel_id, post.message_id)
+                continue
+
             if not post.text.strip():
                 logger.debug("Empty-text drop: %s/%s", post.channel_id, post.message_id)
                 await db.mark_seen(conn, post.channel_id, post.message_id)
@@ -270,7 +275,12 @@ async def main() -> None:
 
     pyro = build_pyrogram_client(settings)
     own_bot_id = _bot_id_from_token(settings.bot_token)
-    register_watcher_handlers(pyro, queue, watched_channels, own_bot_id=own_bot_id)
+    channel_names = await db.load_channel_names(conn)
+    lost_channels: set[int] = set()
+    register_watcher_handlers(
+        pyro, queue, watched_channels, own_bot_id=own_bot_id,
+        conn=conn, channel_names=channel_names, lost_channels=lost_channels,
+    )
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
@@ -342,8 +352,6 @@ async def main() -> None:
 
     async with pyro:
         # Warm the peer cache in the background; the poller waits for it.
-        channel_names = await db.load_channel_names(conn)
-        lost_channels: set[int] = set()
         warm_task = asyncio.create_task(
             warm_peer_cache(pyro, watched_channels, conn, channel_names, lost_channels)
         )
@@ -358,6 +366,7 @@ async def main() -> None:
                 lost_channels=lost_channels,
                 channel_names=channel_names,
                 own_bot_id=own_bot_id,
+                conn=conn,
             )
         )
         all_tasks = [polling, poller, warm_task, cleanup, batch_task, recovery_task, *workers]
