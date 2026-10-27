@@ -59,7 +59,10 @@ async def _fan_out_verdicts(
             continue
         try:
             score = verdict.to_score()
-            await send_notification(bot, config.notify_chat_id, post, score, url=url or None)
+            await send_notification(
+                bot, config.notify_chat_id, post, score, url=url or None,
+                conn=conn, user_id=config.user_id,
+            )
             await db.mark_notified(conn, config.user_id, post.channel_id, post.message_id, url)
         except Exception:
             logger.exception(
@@ -134,6 +137,11 @@ async def pipeline_worker(
         try:
             if await is_duplicate(conn, post):
                 logger.debug("Duplicate: %s/%s", post.channel_id, post.message_id)
+                continue
+
+            if not post.text.strip():
+                logger.debug("Empty-text drop: %s/%s", post.channel_id, post.message_id)
+                await db.mark_seen(conn, post.channel_id, post.message_id)
                 continue
 
             if is_resume(post):
@@ -239,6 +247,14 @@ async def _recover_single_batch(
     await submitter.recover(batch_id, request_map)
 
 
+def _bot_id_from_token(token: object) -> int | None:
+    """Bot user ID is the numeric prefix of the token ("123:ABC"); None if unparsable."""
+    try:
+        return int(str(token).split(":")[0])
+    except ValueError:
+        return None
+
+
 async def main() -> None:
     conn = await aiosqlite.connect(settings.db_path)
     await db.init_db(conn, owner_chat_id=settings.owner_chat_id)
@@ -253,7 +269,8 @@ async def main() -> None:
     queue: asyncio.Queue = asyncio.Queue(maxsize=100)
 
     pyro = build_pyrogram_client(settings)
-    register_watcher_handlers(pyro, queue, watched_channels)
+    own_bot_id = _bot_id_from_token(settings.bot_token)
+    register_watcher_handlers(pyro, queue, watched_channels, own_bot_id=own_bot_id)
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
@@ -340,6 +357,7 @@ async def main() -> None:
                 ready=warm_task,
                 lost_channels=lost_channels,
                 channel_names=channel_names,
+                own_bot_id=own_bot_id,
             )
         )
         all_tasks = [polling, poller, warm_task, cleanup, batch_task, recovery_task, *workers]

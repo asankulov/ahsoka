@@ -60,9 +60,12 @@ class Post:
         )
 
     @property
-    def link(self) -> str:
+    def link(self) -> str | None:
+        """Message permalink, or None for basic groups (they have no message links)."""
         if not self.channel_name.lstrip("-").isdigit():
             return f"https://t.me/{self.channel_name}/{self.message_id}"
+        if self.channel_id > -(10**12):
+            return None  # basic group: ids are small negatives, no permalinks
         cid = str(abs(self.channel_id))[3:]  # strip leading "100" from e.g. 1001234567890
         return f"https://t.me/c/{cid}/{self.message_id}"
 

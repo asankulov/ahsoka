@@ -384,3 +384,41 @@ def test_from_message_magicmock_fallback_to_value_still_works():
     msg = make_message(text="legacy path", entities=entities)
     post = Post.from_message(msg)
     assert post.url == "https://legacy.example.com"
+
+
+# ---------------------------------------------------------------------------
+# Post.link
+# ---------------------------------------------------------------------------
+
+def _post(channel_id, channel_name):
+    return Post(channel_id=channel_id, message_id=77, channel_name=channel_name,
+                text="x", timestamp=datetime(2024, 1, 1))
+
+
+def test_link_private_supergroup_numeric_name_uses_c_form():
+    assert _post(-1001234567890, "-1001234567890").link == "https://t.me/c/1234567890/77"
+
+
+def test_link_username_uses_public_form():
+    assert _post(-1001234567890, "jobchan").link == "https://t.me/jobchan/77"
+
+
+def test_link_basic_group_numeric_name_is_none():
+    assert _post(-4567, "-4567").link is None
+
+
+def test_link_basic_group_with_small_id_is_none():
+    assert _post(-2345678, "-2345678").link is None
+
+
+def test_link_supergroup_boundary_is_c_form():
+    # -10**12 is the first id in supergroup/channel range
+    assert _post(-(10**12), str(-(10**12))).link == "https://t.me/c/0000000000/77"
+
+
+def test_link_just_above_boundary_is_basic_group():
+    assert _post(-(10**12 - 1), str(-(10**12 - 1))).link is None
+
+
+def test_link_username_wins_for_basic_group_id():
+    assert _post(-4567, "mygroup").link == "https://t.me/mygroup/77"

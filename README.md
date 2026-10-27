@@ -19,7 +19,7 @@ Pyrogram user client
        │
        ▼  per-(post, user) PersonalizedVerdict
   user filter      — not paused AND matched AND score >= threshold
-  notifier         — sends to each matching user's DM or channel
+  notifier         — sends to each matching user's DM, channel or group
 ```
 
 Each post is scored **once per user** with a fully personalised prompt — stack,
@@ -103,8 +103,8 @@ Any user can `/start` the bot and configure their own filters:
 | `/setkeywords` | `/setkeywords python backend` | Replace keyword list |
 | `/addkeyword` | `/addkeyword fastapi` | Append keyword(s) |
 | `/resetkeywords` | `/resetkeywords` | Clear all keywords |
-| `/watch` | `/watch` + forward a message | Add a channel to the watchlist |
-| `/notify` | `/notify` + forward a message | Set notification channel |
+| `/watch` | `/watch` + forward a message | Add a channel or group to the watchlist (group members' forwards can't be resolved — use `/addchannel <id>`) |
+| `/notify` | `/notify` + forward a message, or `/notify` sent inside a group (group admins only) | Set notification channel or group |
 | `/notify dm` | `/notify dm` | Reset notifications to DM (default) |
 | `/pause` | `/pause` | Pause notifications |
 | `/resume` | `/resume` | Resume notifications |
