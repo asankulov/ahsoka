@@ -32,6 +32,7 @@ from ahsoka.bot.notifier import send_notification
 from ahsoka.pipeline import costs, embedder
 from ahsoka.pipeline.costs import build_digest, embed_cost_for
 from ahsoka.pipeline.embedder import embed, take_token_count
+from ahsoka.pipeline.reconcile import reconcile_day
 from ahsoka.pipeline.repost_detector import check_and_store
 from ahsoka.pipeline.tg_resolver import is_tg_link, resolve_tg_link
 
@@ -346,6 +347,13 @@ async def digest_worker(
             due = (now.hour, now.minute) >= (0, 5)
             snap = await db.get_setting_snapshot(conn) or {}
             if due and snap.get("digest_last_sent") != today:
+                yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+                try:
+                    await reconcile_day(conn, yesterday)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("Cost reconciliation failed: %s", exc)
                 text = await build_digest(conn, today)
                 if log_bot is not None:
                     await log_bot.send_message(chat_id, text)
