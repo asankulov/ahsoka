@@ -749,3 +749,119 @@ async def test_recover_saves_token_usage(conn):
     assert u["input_tokens"] == 400
     assert u["output_tokens"] == 80
     assert u["succeeded"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Frozen cost recording
+# ---------------------------------------------------------------------------
+
+
+def _ended_client_with(client, *sdk_results):
+    client.messages.batches.retrieve = AsyncMock(
+        return_value=MagicMock(processing_status="ended")
+    )
+
+    async def fake_results(batch_id):
+        async def _gen():
+            for r in sdk_results:
+                yield r
+        return _gen()
+
+    client.messages.batches.results = fake_results
+
+
+async def _stored_cost(conn, batch_id):
+    async with conn.execute(
+        "SELECT cost_usd FROM batch_usage WHERE batch_id = ?", (batch_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    assert row is not None, "batch_usage row missing"
+    return row[0]
+
+
+async def test_poll_saves_cost_usd(conn):
+    from ahsoka.database import save_pending_batch
+    from ahsoka.pipeline.costs import cost_for
+
+    model = "claude-haiku-5-5"
+    submitter, client = make_submitter(conn, model=model)
+    r1 = _make_sdk_result_with_usage(
+        "111_222_42", input_tokens=500, output_tokens=100, cache_creation_input_tokens=50
+    )
+    r2 = _make_sdk_result_with_usage(
+        "111_222_43", input_tokens=300, output_tokens=50, cache_read_input_tokens=200
+    )
+    _ended_client_with(client, r1, r2)
+    await save_pending_batch(conn, "b_cost_poll", {
+        "111_222_42": [111, 222, 42], "111_222_43": [111, 222, 43],
+    })
+    reqs = [
+        make_request(make_post(111, 222), make_config(42)),
+        make_request(make_post(111, 222), make_config(43)),
+    ]
+
+    await submitter.poll_and_process("b_cost_poll", reqs)
+
+    expected = cost_for(model, 800, 150, 50, 200)
+    assert expected is not None and expected > 0
+    assert await _stored_cost(conn, "b_cost_poll") == pytest.approx(expected)
+
+
+async def test_recover_saves_cost_usd(conn):
+    from ahsoka.database import save_pending_batch
+    from ahsoka.pipeline.costs import cost_for
+
+    model = "claude-haiku-5-5"
+    submitter, client = make_submitter(conn, model=model)
+    cid = "111_222_42"
+    _ended_client_with(
+        client,
+        _make_sdk_result_with_usage(cid, input_tokens=400, output_tokens=80,
+                                    cache_read_input_tokens=30),
+    )
+    await save_pending_batch(conn, "b_cost_rec", {cid: [111, 222, 42]})
+
+    with patch("ahsoka.pipeline.batch_submitter.db.store_verdict", new_callable=AsyncMock):
+        await submitter.recover("b_cost_rec", {cid: [111, 222, 42]})
+
+    expected = cost_for(model, 400, 80, 0, 30)
+    assert expected is not None and expected > 0
+    assert await _stored_cost(conn, "b_cost_rec") == pytest.approx(expected)
+
+
+async def test_unknown_model_saves_null_and_warns(conn, caplog):
+    import logging
+    from ahsoka.database import save_pending_batch
+
+    submitter, client = make_submitter(conn, model="claude-mystery-9")
+    _ended_client_with(client, _make_sdk_result_with_usage("111_222_42"))
+    await save_pending_batch(conn, "b_cost_unknown", {"111_222_42": [111, 222, 42]})
+    reqs = [make_request(make_post(111, 222), make_config(42))]
+
+    with caplog.at_level(logging.WARNING):
+        await submitter.poll_and_process("b_cost_unknown", reqs)
+
+    assert await _stored_cost(conn, "b_cost_unknown") is None
+    assert any(
+        r.levelno == logging.WARNING and "claude-mystery-9" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_cost_failure_does_not_break_results(conn):
+    from ahsoka.database import save_pending_batch, get_pending_batches
+
+    submitter, client = make_submitter(conn, model="claude-haiku-5-5")
+    _ended_client_with(client, _make_sdk_result_with_usage("111_222_42"))
+    await save_pending_batch(conn, "b_cost_boom", {"111_222_42": [111, 222, 42]})
+    reqs = [make_request(make_post(111, 222), make_config(42))]
+
+    with patch(
+        "ahsoka.pipeline.batch_submitter.cost_for", side_effect=RuntimeError("boom")
+    ):
+        result_map = await submitter.poll_and_process("b_cost_boom", reqs)
+
+    assert len(result_map) == 1
+    assert result_map[0][2].user_id == 42
+    pending = await get_pending_batches(conn)
+    assert not any(p["batch_id"] == "b_cost_boom" for p in pending)

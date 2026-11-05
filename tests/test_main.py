@@ -2,6 +2,7 @@
 batch_worker, _enqueue_single, _recover_pending_batches,
 _recover_single_batch, and cleanup_worker."""
 import asyncio
+import re
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -2034,3 +2035,372 @@ async def test_repost_not_run_when_no_active_users(conn):
     m["embed"].assert_not_awaited()
     m["check"].assert_not_awaited()
     m["enqueue"].assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# make_embedding_usage_sink
+# ---------------------------------------------------------------------------
+
+
+async def test_embedding_usage_sink_records_today_row_with_cost(conn):
+    from datetime import timezone
+    from ahsoka.main import make_embedding_usage_sink
+
+    sink = make_embedding_usage_sink(conn, model_getter=lambda: "voyage-4-lite")
+    await sink(100)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async with conn.execute("SELECT day, model, tokens, cost_usd FROM embedding_usage") as cur:
+        rows = await cur.fetchall()
+    assert len(rows) == 1
+    day, model, tokens, cost = rows[0]
+    assert (day, model, tokens) == (today, "voyage-4-lite", 100)
+    assert cost is not None
+
+
+async def test_embedding_usage_sink_unknown_model_stores_null_cost(conn):
+    from ahsoka.main import make_embedding_usage_sink
+
+    sink = make_embedding_usage_sink(conn, model_getter=lambda: "mystery-model")
+    await sink(100)
+    async with conn.execute("SELECT model, tokens, cost_usd FROM embedding_usage") as cur:
+        rows = await cur.fetchall()
+    assert rows == [("mystery-model", 100, None)]
+
+
+# ---------------------------------------------------------------------------
+# population_worker
+# ---------------------------------------------------------------------------
+
+
+async def test_population_worker_records_each_iteration(conn):
+    from ahsoka.main import population_worker
+
+    with patch("ahsoka.main.costs.collect_population", new_callable=AsyncMock,
+               return_value=(3, 4, 5)) as collect, \
+         patch("ahsoka.main.costs.record_population", new_callable=AsyncMock,
+               return_value=0) as record:
+        await population_worker(conn, MagicMock(), [1, 2], interval_s=0, iterations=2)
+
+    assert collect.await_count == 2
+    assert record.await_count == 2
+    args = record.await_args.args
+    assert args[0] is conn
+    assert isinstance(args[1], str) and len(args[1]) == 10  # YYYY-MM-DD day
+    assert args[2:] == (3, 4, 5)
+
+
+async def test_population_worker_swallows_collect_failure_and_continues(conn, caplog):
+    from ahsoka.main import population_worker
+
+    with patch("ahsoka.main.costs.collect_population", new_callable=AsyncMock,
+               side_effect=[RuntimeError("boom"), (1, 2, 3)]) as collect, \
+         patch("ahsoka.main.costs.record_population", new_callable=AsyncMock,
+               return_value=0) as record:
+        await population_worker(conn, MagicMock(), [], interval_s=0, iterations=2)
+
+    assert collect.await_count == 2
+    assert record.await_count == 1  # only the second iteration succeeded
+
+
+# ---------------------------------------------------------------------------
+# digest_worker
+# ---------------------------------------------------------------------------
+
+from datetime import timezone as _tz
+
+
+def _digest_now(day="2026-11-05", hour=0, minute=10):
+    y, m, d = (int(x) for x in day.split("-"))
+    return lambda: datetime(y, m, d, hour, minute, tzinfo=_tz.utc)
+
+
+@pytest.fixture
+async def digest_conn():
+    async with aiosqlite.connect(":memory:") as c:
+        await init_db(c)
+        yield c
+
+
+async def test_digest_worker_sends_once_and_records_last_sent(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    sleep = AsyncMock()
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=sleep, iterations=1)
+    bot.send_message.assert_awaited_once()
+    args = bot.send_message.await_args.args
+    assert args[0] == 99
+    assert "2026-11-04" in args[1]
+    assert (await _db.get_setting_snapshot(digest_conn))["digest_last_sent"] == "2026-11-05"
+    sleep.assert_awaited_once()
+
+
+async def test_digest_worker_does_not_resend_same_day(digest_conn):
+    from ahsoka.main import digest_worker
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    sleep = AsyncMock()
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=sleep, iterations=2)
+    assert bot.send_message.await_count == 1
+
+
+async def test_digest_worker_no_resend_after_restart_same_day(digest_conn):
+    from ahsoka.main import digest_worker
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    for _ in range(2):  # two "process lifetimes" sharing the same DB
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    assert bot.send_message.await_count == 1
+
+
+async def test_digest_worker_sends_again_next_day(digest_conn):
+    from ahsoka.main import digest_worker
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now("2026-11-05"), sleep_fn=AsyncMock(), iterations=1)
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now("2026-11-06"), sleep_fn=AsyncMock(), iterations=1)
+    assert bot.send_message.await_count == 2
+    assert "2026-11-05" in bot.send_message.await_args.args[1]
+
+
+async def test_digest_worker_failed_send_not_recorded_and_retried(digest_conn, caplog):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock(side_effect=[RuntimeError("telegram down"), None])
+    sleep = AsyncMock()
+    with caplog.at_level(logging.WARNING, logger="ahsoka.main"):
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=sleep, iterations=1)
+    snap = await _db.get_setting_snapshot(digest_conn)
+    assert not snap or "digest_last_sent" not in snap
+    assert any("telegram down" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+    # next loop retries and succeeds
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=sleep, iterations=1)
+    assert bot.send_message.await_count == 2
+    assert (await _db.get_setting_snapshot(digest_conn))["digest_last_sent"] == "2026-11-05"
+
+
+async def test_digest_worker_failure_does_not_stop_later_iterations(digest_conn):
+    from ahsoka.main import digest_worker
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock(side_effect=[RuntimeError("boom"), None])
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=2)
+    assert bot.send_message.await_count == 2
+
+
+async def test_digest_worker_log_bot_none_logs_and_records(digest_conn, caplog):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    with caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        await digest_worker(digest_conn, None, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    assert any("2026-11-04" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records)
+    assert (await _db.get_setting_snapshot(digest_conn))["digest_last_sent"] == "2026-11-05"
+
+
+async def test_digest_worker_build_failure_swallowed_and_not_recorded(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    with patch("ahsoka.main.build_digest", new=AsyncMock(side_effect=RuntimeError("db gone"))):
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    bot.send_message.assert_not_awaited()
+    snap = await _db.get_setting_snapshot(digest_conn)
+    assert not snap or "digest_last_sent" not in snap
+
+
+async def test_digest_worker_preserves_tracked_settings_in_snapshot(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    await _db.save_setting_snapshot(digest_conn, {"claude_model": "claude-haiku-5-5"})
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    snap = await _db.get_setting_snapshot(digest_conn)
+    assert snap["claude_model"] == "claude-haiku-5-5"
+    assert snap["digest_last_sent"] == "2026-11-05"
+
+
+async def test_digest_worker_sleeps_until_next_0005_utc(digest_conn):
+    from ahsoka.main import digest_worker
+
+    sleep = AsyncMock()
+    # 2026-11-05 23:00 UTC -> next 00:05 UTC is 1h05m = 3900s away
+    await digest_worker(
+        digest_conn, None, 99,
+        now_fn=_digest_now("2026-11-05", 23, 0), sleep_fn=sleep, iterations=1,
+    )
+    secs = sleep.await_args.args[0]
+    assert secs == pytest.approx(3900, abs=60)
+
+
+async def test_digest_worker_reconciles_yesterday_before_building_digest(digest_conn):
+    from ahsoka.main import digest_worker
+
+    order = []
+
+    async def fake_reconcile(conn, day):
+        order.append(("reconcile", day))
+
+    async def fake_build(conn, today):
+        order.append(("build", today))
+        return "digest text"
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    with patch("ahsoka.main.reconcile_day", side_effect=fake_reconcile) as rec, \
+         patch("ahsoka.main.build_digest", side_effect=fake_build):
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    rec.assert_awaited_once()
+    assert rec.await_args.args == (digest_conn, "2026-11-04")
+    assert order == [("reconcile", "2026-11-04"), ("build", "2026-11-05")]
+    bot.send_message.assert_awaited_once_with(99, "digest text")
+
+
+async def test_digest_worker_reconcile_failure_does_not_block_digest(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    with patch("ahsoka.main.reconcile_day", new=AsyncMock(side_effect=RuntimeError("admin api down"))):
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    bot.send_message.assert_awaited_once()
+    assert (await _db.get_setting_snapshot(digest_conn))["digest_last_sent"] == "2026-11-05"
+
+
+async def test_digest_worker_skips_reconcile_when_already_sent(digest_conn):
+    from ahsoka.main import digest_worker
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    with patch("ahsoka.main.reconcile_day", new=AsyncMock()) as rec:
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=2)
+    assert rec.await_count == 1
+
+
+async def test_digest_worker_saves_date_and_full_utc_ts_after_success(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    await digest_worker(
+        digest_conn, bot, 99, now_fn=_digest_now("2026-11-05", 0, 10), sleep_fn=AsyncMock(), iterations=1
+    )
+    snap = await _db.get_setting_snapshot(digest_conn)
+    assert snap["digest_last_sent"] == "2026-11-05"
+    ts = snap["digest_last_sent_ts"]
+    assert re.fullmatch(r"2026-11-05T00:\d\d:\d\dZ", ts)
+
+
+async def test_digest_worker_failing_send_saves_neither_key(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock(side_effect=RuntimeError("down"))
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    snap = await _db.get_setting_snapshot(digest_conn) or {}
+    assert "digest_last_sent" not in snap
+    assert "digest_last_sent_ts" not in snap
+
+
+async def test_digest_worker_log_bot_none_saves_both_keys(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    await digest_worker(digest_conn, None, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    snap = await _db.get_setting_snapshot(digest_conn)
+    assert "digest_last_sent" in snap and "digest_last_sent_ts" in snap
+
+
+async def test_digest_worker_event_not_repeated_in_next_day_digest(digest_conn):
+    from ahsoka.main import digest_worker
+
+    await digest_conn.execute(
+        "INSERT INTO cost_events (ts, kind, key, old_value, new_value) VALUES (?, ?, ?, ?, ?)",
+        ("2026-11-04T10:00:00Z", "setting", "repeat_k", "a", "b"),
+    )
+    await digest_conn.commit()
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now("2026-11-05"), sleep_fn=AsyncMock(), iterations=1)
+    assert "repeat_k" in bot.send_message.await_args.args[1]
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now("2026-11-06"), sleep_fn=AsyncMock(), iterations=1)
+    assert bot.send_message.await_count == 2
+    assert "repeat_k" not in bot.send_message.await_args.args[1]
+
+
+def _ticking_now(start=(2026, 11, 5, 0, 10, 0), step_s=60):
+    """now_fn that returns a strictly later time on every call; records call count."""
+    from datetime import timedelta as _td
+
+    base = datetime(*start, tzinfo=_tz.utc)
+    calls = []
+
+    def fn():
+        t = base + _td(seconds=step_s * len(calls))
+        calls.append(t)
+        return t
+
+    fn.calls = calls
+    return fn
+
+
+async def test_digest_worker_saved_ts_is_iteration_start_time(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    now_fn = _ticking_now()
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    await digest_worker(digest_conn, bot, 99, now_fn=now_fn, sleep_fn=AsyncMock(), iterations=1)
+    snap = await _db.get_setting_snapshot(digest_conn)
+    assert snap["digest_last_sent_ts"] == "2026-11-05T00:10:00Z"
+    assert snap["digest_last_sent"] == "2026-11-05"
+    assert len(now_fn.calls) == 1
+
+
+async def test_digest_worker_calls_now_fn_once_per_iteration(digest_conn):
+    from ahsoka.main import digest_worker
+
+    now_fn = _ticking_now()
+    await digest_worker(digest_conn, None, 99, now_fn=now_fn, sleep_fn=AsyncMock(), iterations=3)
+    assert len(now_fn.calls) == 3
+
+
+async def test_digest_worker_event_written_during_build_shows_in_next_digest(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka.pipeline.costs import build_digest as real_build
+
+    async def build_then_event(conn, today):
+        text = await real_build(conn, today)
+        # lands after the captured iteration time (00:10:00) but before any later clock read
+        await conn.execute(
+            "INSERT INTO cost_events (ts, kind, key, old_value, new_value) VALUES (?, ?, ?, ?, ?)",
+            ("2026-11-05T00:10:30Z", "setting", "race_k", "a", "b"),
+        )
+        await conn.commit()
+        return text
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    with patch("ahsoka.main.build_digest", new=build_then_event):
+        await digest_worker(digest_conn, bot, 99, now_fn=_ticking_now(), sleep_fn=AsyncMock(), iterations=1)
+    assert "race_k" not in bot.send_message.await_args.args[1]
+
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now("2026-11-06"), sleep_fn=AsyncMock(), iterations=1)
+    assert bot.send_message.await_count == 2
+    assert "race_k" in bot.send_message.await_args.args[1]

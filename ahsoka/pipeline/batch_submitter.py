@@ -13,6 +13,7 @@ from anthropic import AsyncAnthropic
 from ahsoka import database as db
 from ahsoka.models import PersonalizedVerdict, Post, UserConfig
 from ahsoka.pipeline.batch_queue import BatchRequest
+from ahsoka.pipeline.costs import cost_for
 from ahsoka.pipeline.scorer import build_personalized_prompt, parse_verdict
 
 if TYPE_CHECKING:
@@ -171,6 +172,9 @@ class BatchSubmitter:
         await db.save_batch_usage(
             self._conn, batch_id, self._model,
             total_input, total_output, total_cache_write, total_cache_read, succeeded_count,
+            cost_usd=_batch_cost(
+                self._model, total_input, total_output, total_cache_write, total_cache_read,
+            ),
         )
         return results
 
@@ -234,8 +238,29 @@ class BatchSubmitter:
         await db.save_batch_usage(
             self._conn, batch_id, self._model,
             total_input, total_output, total_cache_write, total_cache_read, succeeded_count,
+            cost_usd=_batch_cost(
+                self._model, total_input, total_output, total_cache_write, total_cache_read,
+            ),
         )
         logger.info("Recovery: batch %s completed and verdicts stored", batch_id)
+
+
+def _batch_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_write: int,
+    cache_read: int,
+) -> float | None:
+    """Compute frozen batch cost; fail open (None) on unknown model or any error."""
+    try:
+        cost = cost_for(model, input_tokens, output_tokens, cache_write, cache_read)
+    except Exception as exc:
+        logger.warning("cost computation failed for model %s: %s", model, exc)
+        return None
+    if cost is None:
+        logger.warning("no pricing for model %s; cost_usd will be NULL", model)
+    return cost
 
 
 def _sdk_result_to_dict(result: object) -> dict:

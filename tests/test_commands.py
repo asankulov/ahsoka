@@ -17,7 +17,8 @@ from aiogram.types import (
 )
 import datetime as _dt
 
-from ahsoka.bot.commands import register_bot_commands, WaitingForInput, _fmt_tokens, _pricing_for
+from ahsoka.bot.commands import register_bot_commands, WaitingForInput
+from ahsoka.pipeline.costs import fmt_tokens, price_for
 from ahsoka.config import Settings
 from ahsoka.database import (
     get_user_config, init_db, load_watched_channels, get_or_create_user, get_user,
@@ -1155,7 +1156,7 @@ async def test_stats_shows_api_line_when_usage_exists(conn, settings):
         conn, "batch_x1", "claude-haiku-4-5-20251001",
         input_tokens=500_000, output_tokens=20_000,
         cache_creation_input_tokens=0, cache_read_input_tokens=0,
-        succeeded=10,
+        succeeded=10, cost_usd=0.54,
     )
     _, h, _ = setup_dp(conn, settings)
     msg = make_msg("/stats")
@@ -1178,6 +1179,115 @@ async def test_stats_shows_cached_tokens_when_nonzero(conn, settings):
     await h["cmd_stats"](msg, make_ctx())
     reply_text = msg.reply.call_args[0][0]
     assert "cached" in reply_text
+
+
+async def test_stats_summary_uses_stored_cost_not_price_table(conn, settings):
+    # 500k in / 20k out on haiku-4-5 would price far below $7.77 via the table.
+    await save_batch_usage(
+        conn, "batch_stored", "claude-haiku-4-5-20251001",
+        input_tokens=500_000, output_tokens=20_000,
+        cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        succeeded=10, cost_usd=7.77,
+    )
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/stats")
+    await h["cmd_stats"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert "$7.77" in reply_text
+
+
+async def test_stats_summary_keeps_all_lines(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/stats")
+    await h["cmd_stats"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    for prefix in ("Users:", "Channels:", "Posts:", "Notifications:", "API:", "Debug mode:"):
+        assert prefix in reply_text
+
+
+async def _seed_cost_data(conn):
+    today = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+    await save_batch_usage(
+        conn, "b_cost", "claude-haiku-5-5",
+        input_tokens=2_000_000, output_tokens=50_000,
+        cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        succeeded=20, cost_usd=2.0,
+    )
+    return today
+
+
+@pytest.mark.parametrize("arg", ["day", "month", "year"])
+async def test_stats_granularity_reports_bucket_with_cost_and_per_req(conn, settings, arg):
+    today = await _seed_cost_data(conn)
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg(f"/stats {arg}")
+    await h["cmd_stats"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    label = {"day": today, "month": today[:7], "year": today[:4]}[arg]
+    assert label in reply_text
+    assert "$2.00" in reply_text
+    assert "$0.10/req" in reply_text  # 2.00 / 20 successful requests
+    assert "Users:" not in reply_text
+
+
+async def test_stats_invalid_argument_replies_usage(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/stats week")
+    await h["cmd_stats"](msg, make_ctx())
+    assert "Usage: /stats [day|month|year]" in msg.reply.call_args[0][0]
+
+
+async def test_stats_granularity_empty_db_says_no_cost_data(conn, settings):
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/stats day")
+    await h["cmd_stats"](msg, make_ctx())
+    assert "No cost data yet" in msg.reply.call_args[0][0]
+
+
+async def test_stats_day_shows_unpriced_batches(conn, settings):
+    await save_batch_usage(
+        conn, "b_unpriced", "mystery-model",
+        input_tokens=1000, output_tokens=100,
+        cache_creation_input_tokens=0, cache_read_input_tokens=0,
+        succeeded=1, cost_usd=None,
+    )
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/stats day")
+    await h["cmd_stats"](msg, make_ctx())
+    assert "1 unpriced" in msg.reply.call_args[0][0]
+
+
+async def test_stats_day_shows_change_events(conn, settings):
+    await _seed_cost_data(conn)
+    await conn.execute(
+        "INSERT INTO cost_events (ts, kind, key, old_value, new_value) VALUES (?, ?, ?, ?, ?)",
+        (_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+         "setting", "claude_model", "claude-haiku-4-5", "claude-haiku-5-5"),
+    )
+    await conn.commit()
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/stats day")
+    await h["cmd_stats"](msg, make_ctx())
+    assert "claude_model: claude-haiku-4-5 \u2192 claude-haiku-5-5" in msg.reply.call_args[0][0]
+
+
+async def test_stats_day_limited_to_14_buckets_and_under_telegram_limit(conn, settings):
+    for i in range(30):
+        await conn.execute(
+            """INSERT INTO batch_usage (batch_id, model, input_tokens, output_tokens,
+               cache_creation_input_tokens, cache_read_input_tokens, succeeded,
+               recorded_at, cost_usd) VALUES (?, 'claude-haiku-5-5', 1, 1, 0, 0, 1, ?, 1.0)""",
+            (f"b{i}", f"2026-10-{i + 1:02d}T00:00:00Z"),
+        )
+    await conn.commit()
+    _, h, _ = setup_dp(conn, settings)
+    msg = make_msg("/stats day")
+    await h["cmd_stats"](msg, make_ctx())
+    reply_text = msg.reply.call_args[0][0]
+    assert len(reply_text) <= 4096
+    assert "2026-10-30" in reply_text
+    assert "2026-10-17" in reply_text  # 14th newest kept
+    assert "2026-10-16" not in reply_text  # 15th newest cut
 
 
 async def test_stats_cancels_waiting_state(conn, settings):
@@ -1229,33 +1339,33 @@ async def test_debug_clears_state(conn, settings):
 
 
 def test_fmt_tokens_millions():
-    assert _fmt_tokens(1_200_000) == "1.2M"
+    assert fmt_tokens(1_200_000) == "1.2M"
 
 
 def test_fmt_tokens_thousands():
-    assert _fmt_tokens(45_000) == "45K"
+    assert fmt_tokens(45_000) == "45K"
 
 
 def test_fmt_tokens_small():
-    assert _fmt_tokens(500) == "500"
+    assert fmt_tokens(500) == "500"
 
 
 def test_pricing_for_known_model():
-    prices = _pricing_for("claude-haiku-4-5-20251001")
+    prices = price_for("claude-haiku-4-5-20251001")
     assert prices is not None
     assert len(prices) == 4
 
 
 def test_pricing_for_haiku_5_5():
-    assert _pricing_for("claude-haiku-5-5") == (0.05e-6, 0.25e-6, 0.0625e-6, 0.005e-6)
+    assert price_for("claude-haiku-5-5") == (0.05e-6, 0.25e-6, 0.0625e-6, 0.005e-6)
 
 
 def test_pricing_for_haiku_4_5_corrected_rates():
-    assert _pricing_for("claude-haiku-4-5-20251001") == (0.50e-6, 2.50e-6, 0.625e-6, 0.05e-6)
+    assert price_for("claude-haiku-4-5-20251001") == (0.50e-6, 2.50e-6, 0.625e-6, 0.05e-6)
 
 
 def test_pricing_for_unknown_model():
-    assert _pricing_for("gpt-99") is None
+    assert price_for("gpt-99") is None
 
 
 # ---------------------------------------------------------------------------

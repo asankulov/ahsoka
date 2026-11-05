@@ -24,3 +24,21 @@ def test_repost_mode_invalid_falls_back_to_shadow_with_warning(monkeypatch, raw)
     with pytest.warns(UserWarning, match="REPOST_MODE"):
         s = _make(monkeypatch, raw)
     assert s.repost_mode == "shadow"
+
+
+def test_anthropic_admin_key_defaults_empty(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_ADMIN_KEY", raising=False)
+    s = Settings(
+        _env_file=None, telegram_api_id=1, telegram_api_hash="h", bot_token="t",
+        owner_chat_id=1, anthropic_api_key="k",
+    )
+    assert s.anthropic_admin_key == ""
+
+
+def test_anthropic_admin_key_read_from_env(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_ADMIN_KEY", "sk-ant-admin-xyz")
+    s = Settings(
+        _env_file=None, telegram_api_id=1, telegram_api_hash="h", bot_token="t",
+        owner_chat_id=1, anthropic_api_key="k",
+    )
+    assert s.anthropic_admin_key == "sk-ant-admin-xyz"

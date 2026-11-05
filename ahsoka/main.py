@@ -1,5 +1,7 @@
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta, timezone
 
 # Pyrogram's sync.py calls asyncio.get_event_loop() at import time.
 # On Python 3.12+ there is no implicit event loop, so we create one first.
@@ -27,7 +29,10 @@ from ahsoka.pipeline.batch_queue import BatchQueue
 from ahsoka.pipeline.batch_submitter import BatchSubmitter
 from ahsoka.bot.commands import register_bot_commands, BOT_COMMANDS
 from ahsoka.bot.notifier import send_notification
+from ahsoka.pipeline import costs, embedder
+from ahsoka.pipeline.costs import build_digest, embed_cost_for
 from ahsoka.pipeline.embedder import embed, take_token_count
+from ahsoka.pipeline.reconcile import reconcile_day
 from ahsoka.pipeline.repost_detector import check_and_store
 from ahsoka.pipeline.tg_resolver import is_tg_link, resolve_tg_link
 
@@ -303,6 +308,75 @@ async def cleanup_worker(conn: aiosqlite.Connection) -> None:
         logger.info("Voyage usage: %d tokens in last 24h", take_token_count())
 
 
+async def population_worker(
+    conn: aiosqlite.Connection,
+    keyword_index: KeywordIndex,
+    watched_channels,
+    *,
+    interval_s: float = 86_400.0,
+    iterations: int | None = None,
+) -> None:
+    """Daily population snapshot for cost-change tracking. Fails open."""
+    done = 0
+    while iterations is None or done < iterations:
+        try:
+            counts = await costs.collect_population(conn, keyword_index, watched_channels)
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            await costs.record_population(conn, day, *counts)
+        except Exception as exc:
+            logger.warning("Population snapshot failed: %s", exc)
+        done += 1
+        await asyncio.sleep(interval_s)
+
+
+async def digest_worker(
+    conn: aiosqlite.Connection,
+    log_bot: Bot | None,
+    chat_id: int,
+    *,
+    now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    iterations: int | None = None,
+) -> None:
+    """Send the daily cost digest once per UTC day, after 00:05Z. Fails open."""
+    done = 0
+    while iterations is None or done < iterations:
+        now = now_fn()
+        try:
+            today = now.strftime("%Y-%m-%d")
+            due = (now.hour, now.minute) >= (0, 5)
+            snap = await db.get_setting_snapshot(conn) or {}
+            if due and snap.get("digest_last_sent") != today:
+                yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+                try:
+                    await reconcile_day(conn, yesterday)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("Cost reconciliation failed: %s", exc)
+                text = await build_digest(conn, today)
+                if log_bot is not None:
+                    await log_bot.send_message(chat_id, text)
+                else:
+                    logger.info("Daily cost digest:\n%s", text)
+                await db.save_setting_snapshot(
+                    conn,
+                    {
+                        "digest_last_sent": today,
+                        "digest_last_sent_ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    },
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Daily cost digest failed: %s", exc)
+        done += 1
+        target = now.replace(hour=0, minute=5, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await sleep_fn((target - now).total_seconds())
+
+
 async def _recover_pending_batches(
     conn: aiosqlite.Connection,
     bot: Bot,
@@ -349,9 +423,28 @@ def _bot_id_from_token(token: object) -> int | None:
         return None
 
 
+def make_embedding_usage_sink(
+    conn: aiosqlite.Connection,
+    model_getter: Callable[[], str] = lambda: settings.voyage_model,
+) -> Callable[[int], Awaitable[None]]:
+    async def sink(tokens: int) -> None:
+        model = model_getter()
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        await db.record_embedding_usage(
+            conn, day, model, tokens, embed_cost_for(model, tokens)
+        )
+
+    return sink
+
+
 async def main() -> None:
     conn = await aiosqlite.connect(settings.db_path)
     await db.init_db(conn, owner_chat_id=settings.owner_chat_id)
+    try:
+        await costs.record_setting_changes(conn, settings)
+    except Exception as exc:
+        logger.warning("Setting change tracking failed: %s", exc)
+    embedder.set_usage_sink(make_embedding_usage_sink(conn))
     await db.seed_channels(conn, settings.channel_ids)
 
     watched_channels = await db.load_watched_channels(conn)
@@ -438,6 +531,12 @@ async def main() -> None:
         batch_worker(conn, bot, submitter, batch_queue)
     )
     cleanup = asyncio.create_task(cleanup_worker(conn))
+    population = asyncio.create_task(
+        population_worker(conn, keyword_index, watched_channels)
+    )
+    digest = asyncio.create_task(
+        digest_worker(conn, log_bot, settings.owner_chat_id)
+    )
 
     async with pyro:
         # Warm the peer cache in the background; the poller waits for it.
@@ -458,7 +557,7 @@ async def main() -> None:
                 conn=conn,
             )
         )
-        all_tasks = [polling, poller, warm_task, cleanup, batch_task, recovery_task, *workers]
+        all_tasks = [polling, poller, warm_task, cleanup, population, digest, batch_task, recovery_task, *workers]
         try:
             await asyncio.gather(*all_tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):

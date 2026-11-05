@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     batch_flush_seconds: int = 600
     batch_poll_interval_seconds: int = 60
     batch_max_wait_seconds: int = 1800
+    anthropic_admin_key: str = ""  # optional; enables Admin API cost reconciliation
     voyage_api_key: str = ""  # empty disables repost detection entirely
     voyage_model: str = "voyage-4-lite"
     repost_dimensions: int = 512

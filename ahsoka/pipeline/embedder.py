@@ -1,5 +1,6 @@
 import logging
 import re
+from collections.abc import Awaitable, Callable
 
 import httpx
 
@@ -11,6 +12,13 @@ VOYAGE_URL = "https://api.voyageai.com/v1/embeddings"
 
 _WS = re.compile(r"\s+")
 _tokens = 0
+_usage_sink: Callable[[int], Awaitable[None]] | None = None
+
+
+def set_usage_sink(sink: Callable[[int], Awaitable[None]] | None) -> None:
+    """Register an async callback invoked with tokens after each successful embed."""
+    global _usage_sink
+    _usage_sink = sink
 
 
 def normalize(text: str, max_chars: int) -> str:
@@ -55,9 +63,16 @@ async def _post(client: httpx.AsyncClient, text: str) -> list[float] | None:
         logger.warning("Voyage embeddings response has invalid embedding")
         return None
     try:
-        _tokens += int(body["usage"]["total_tokens"])
+        tokens = int(body["usage"]["total_tokens"])
     except (KeyError, TypeError, ValueError):
-        pass
+        tokens = None
+    if tokens is not None:
+        _tokens += tokens
+        if _usage_sink is not None:
+            try:
+                await _usage_sink(tokens)
+            except Exception as e:
+                logger.warning("Voyage usage sink failed: %s", e)
     return embedding
 
 
