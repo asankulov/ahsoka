@@ -197,6 +197,19 @@ When deciding which specialist owns a change:
 | `README.md` deployment section | kuiil |
 | Diff review before commit | ig-11 |
 
+### ig-11 model selection
+
+ig-11 defaults to Sonnet (its frontmatter). When dispatching it via the `Agent` tool, pass `model: "opus"` if **any** of these hold; otherwise omit the override:
+
+- **Large diff:** more than ~400 changed lines or ~8 files (`git diff --shortstat main`).
+- **Security-sensitive paths:** `pipeline/scraper.py`, `pipeline/tg_resolver.py`, the ban gate (`matches_user`, `_fan_out_verdicts`), admin router / permission checks in `bot/commands.py`.
+- **Persistence and concurrency:** `database.init_db()` migrations, `batch_queue.py`, `batch_submitter.py`, dedup / seen-claim logic, `main.py` worker wiring.
+- **Secrets and deploy:** `.github/workflows/`, `.env.example`, `Settings` fields holding tokens or keys.
+- **New untrusted input:** new handling of user, channel or HTTP content, or a new external API call.
+- **Re-review:** a previous ig-11 pass returned REQUEST CHANGES or BLOCK.
+
+Small handler tweaks, text changes, test-only and docs-only diffs stay on Sonnet. If Sonnet misses something on a diff that did not trigger this rule, add the path or pattern here.
+
 ## Housekeeping (you may do directly, no delegation)
 
 These are the only things you write code for yourself. Everything else delegates.
