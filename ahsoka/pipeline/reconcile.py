@@ -90,5 +90,6 @@ async def reconcile_day(conn: aiosqlite.Connection, day: str) -> None:
                 estimated = b["scoring_usd"] + b["embedding_usd"]
                 break
         await db.save_reconciliation(conn, day, billed, estimated)
+        logger.info("Reconciled %s: billed $%.4f vs est. $%.4f", day, billed, estimated)
     except Exception as exc:
         logger.warning("Cost reconciliation failed: %s", type(exc).__name__)

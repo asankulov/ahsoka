@@ -257,6 +257,43 @@ async def test_reconcile_day_http_failure_stores_nothing(conn):
     assert await db.get_reconciliation(conn, "2026-11-04") is None
 
 
+def _reconciled(caplog):
+    return [r for r in caplog.records
+            if r.name == "ahsoka.pipeline.reconcile" and "Reconciled" in r.getMessage()]
+
+
+async def test_reconcile_day_success_logs_one_info_record(conn, caplog):
+    buckets = [{"bucket": "2026-11-04", "scoring_usd": 1.5, "embedding_usd": 0.25}]
+    with patch("ahsoka.pipeline.reconcile.settings", _settings()), \
+         patch("ahsoka.pipeline.reconcile.fetch_billed_usd", new=AsyncMock(return_value=2.2345)), \
+         patch("ahsoka.database.get_cost_buckets", new=AsyncMock(return_value=buckets)):
+        with caplog.at_level(logging.INFO, logger="ahsoka.pipeline.reconcile"):
+            await reconcile_day(conn, "2026-11-04")
+    recs = _reconciled(caplog)
+    assert len(recs) == 1
+    assert recs[0].levelno == logging.INFO
+    msg = recs[0].getMessage()
+    assert "2026-11-04" in msg
+    assert "$2.2345" in msg
+    assert "$1.7500" in msg
+    assert KEY not in caplog.text
+
+
+async def test_reconcile_day_fetch_none_logs_no_reconciled_record(conn, caplog):
+    with patch("ahsoka.pipeline.reconcile.settings", _settings()), \
+         patch("ahsoka.pipeline.reconcile.fetch_billed_usd", new=AsyncMock(return_value=None)):
+        with caplog.at_level(logging.INFO, logger="ahsoka.pipeline.reconcile"):
+            await reconcile_day(conn, "2026-11-04")
+    assert _reconciled(caplog) == []
+
+
+async def test_reconcile_day_no_key_logs_no_reconciled_record(conn, caplog):
+    with patch("ahsoka.pipeline.reconcile.settings", _settings(key="")):
+        with caplog.at_level(logging.INFO, logger="ahsoka.pipeline.reconcile"):
+            await reconcile_day(conn, "2026-11-04")
+    assert _reconciled(caplog) == []
+
+
 async def test_reconcile_day_never_raises_on_fetch_error(conn, caplog):
     with patch("ahsoka.pipeline.reconcile.settings", _settings()), \
          patch("ahsoka.pipeline.reconcile.fetch_billed_usd", new=AsyncMock(side_effect=RuntimeError("boom"))):
