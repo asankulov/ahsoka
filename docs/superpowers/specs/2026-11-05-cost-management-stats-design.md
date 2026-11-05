@@ -6,7 +6,7 @@ Date: 2026-11-05 · Status: draft for review
 Admin-only cost visibility answering "what did we spend, when, and why did it change".
 
 Success criteria:
-- `/stats day|month|year` shows cost, tokens, batches and cost per scored post per bucket, split by model and component (scoring vs Voyage embeddings).
+- `/stats day|month|year` shows cost, tokens, batches and cost per scored request per bucket, split by component (scoring vs Voyage embeddings). A per-model split is a deferred follow-up.
 - Dollars are frozen at record time; later price-table edits never rewrite history.
 - Config/env changes and population changes appear as markers beside the cost.
 - A daily digest is sent via the existing log bot (no second logging mechanism).
@@ -46,7 +46,7 @@ Success criteria:
 - Cost recording, snapshotting and reconciliation fail open: log and continue, never block scoring or notifications.
 
 ### Schema (additive, idempotent in `init_db()`)
-- `batch_usage`: add `cost_usd`, rate snapshot columns, `estimated`.
+- `batch_usage`: add `cost_usd` (frozen at record time) and `estimated` (backfilled rows).
 - New tables: `embedding_usage`, `cost_events`, `daily_snapshots`, `cost_reconciliation`.
 
 ## Out of scope
