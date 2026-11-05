@@ -5,6 +5,7 @@ import aiosqlite
 
 from ahsoka.database import (
     add_channel,
+    count_scored_posts,
     format_channel_label,
     load_channel_names,
     update_channel_names,
@@ -311,6 +312,82 @@ async def test_delete_old_posts_keeps_recent(conn):
     deleted = await delete_old_posts(conn, days=30)
     assert deleted == 0
     assert await is_seen(conn, 1, 1) is True
+
+
+# --- count_scored_posts ---
+
+
+async def _seen_count(conn):
+    async with conn.execute("SELECT COUNT(*) FROM seen_posts") as cur:
+        return (await cur.fetchone())[0]
+
+
+async def test_count_scored_posts_empty_db_returns_zero(conn):
+    assert await count_scored_posts(conn) == 0
+
+
+async def test_count_scored_posts_seen_without_verdict_is_zero(conn):
+    await mark_seen(conn, 10, 1)
+    assert await count_scored_posts(conn) == 0
+
+
+async def test_count_scored_posts_seen_with_verdict_counts_one(conn):
+    await mark_seen(conn, 10, 1)
+    await store_verdict(conn, make_verdict(user_id=1), channel_id=10, message_id=1)
+    assert await count_scored_posts(conn) == 1
+
+
+async def test_count_scored_posts_multiple_users_one_post_counts_once(conn):
+    await mark_seen(conn, 10, 1)
+    for uid in (1, 2, 3):
+        await store_verdict(conn, make_verdict(user_id=uid), channel_id=10, message_id=1)
+    assert await count_scored_posts(conn) == 1
+
+
+async def test_count_scored_posts_orphan_verdict_not_counted(conn):
+    await mark_seen(conn, 10, 1)
+    await store_verdict(conn, make_verdict(user_id=1), channel_id=10, message_id=1)
+    await conn.execute("DELETE FROM seen_posts")
+    await conn.commit()
+    assert await count_scored_posts(conn) == 0
+
+
+async def test_count_scored_posts_orphan_after_delete_old_posts_not_counted(conn):
+    await conn.execute(
+        "INSERT INTO seen_posts (channel_id, message_id, scored_at) "
+        "VALUES (10, 1, datetime('now', '-31 days'))"
+    )
+    await conn.commit()
+    await store_verdict(conn, make_verdict(user_id=1), channel_id=10, message_id=1)
+    assert await count_scored_posts(conn) == 1
+    await delete_old_posts(conn, days=30)
+    assert await count_scored_posts(conn) == 0
+
+
+async def test_count_scored_posts_mixed_seen_scored_and_orphan(conn):
+    await mark_seen(conn, 10, 1)  # scored
+    await mark_seen(conn, 10, 2)  # unscored
+    await store_verdict(conn, make_verdict(user_id=1), channel_id=10, message_id=1)
+    await store_verdict(conn, make_verdict(user_id=1), channel_id=10, message_id=99)  # orphan
+    scored = await count_scored_posts(conn)
+    assert scored == 1
+    assert scored <= await _seen_count(conn) == 2
+
+
+async def test_count_scored_posts_same_message_different_urls_bounded_by_seen(conn):
+    await mark_seen(conn, 10, 1, url="https://a.example")
+    await mark_seen(conn, 10, 1, url="https://b.example")
+    await store_verdict(conn, make_verdict(user_id=1), channel_id=10, message_id=1)
+    scored = await count_scored_posts(conn)
+    assert scored == 2
+    assert scored <= await _seen_count(conn)
+
+
+async def test_count_scored_posts_matches_on_channel_message_pair(conn):
+    await mark_seen(conn, 10, 5)
+    await mark_seen(conn, 20, 5)
+    await store_verdict(conn, make_verdict(user_id=1), channel_id=10, message_id=5)
+    assert await count_scored_posts(conn) == 1
 
 
 # --- Personalized verdicts ---
