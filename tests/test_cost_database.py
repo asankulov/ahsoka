@@ -333,3 +333,45 @@ async def test_reconciliation_round_trip_and_overwrite(conn):
     rec = await get_reconciliation(conn, "2026-10-01")
     assert rec["billed_usd"] == pytest.approx(2.0)
     assert await get_reconciliation(conn, "2026-10-02") is None
+
+
+# --- Migration from the pre-cost schema ---
+
+
+async def test_init_db_migrates_old_schema_batch_usage(tmp_path):
+    path = str(tmp_path / "old.db")
+    async with aiosqlite.connect(path) as c:
+        await c.execute(
+            """CREATE TABLE batch_usage (
+                batch_id TEXT PRIMARY KEY,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                succeeded INTEGER NOT NULL DEFAULT 0,
+                recorded_at TEXT NOT NULL
+            )"""
+        )
+        for bid, model in (("old_known", KNOWN), ("old_unknown", UNKNOWN)):
+            await c.execute(
+                "INSERT INTO batch_usage VALUES (?, ?, 1000, 200, 0, 0, 5, '2026-01-01T00:00:00Z')",
+                (bid, model),
+            )
+        await c.commit()
+
+        await init_db(c, owner_chat_id=OWNER_ID)
+
+        async with c.execute("PRAGMA table_info(batch_usage)") as cur:
+            cols = {r[1] for r in await cur.fetchall()}
+        assert {"cost_usd", "estimated"} <= cols
+
+        known = await _row(c, "old_known")
+        assert known[0] == pytest.approx(cost_for(KNOWN, 1000, 200, 0, 0))
+        assert known[1] == 1
+        unknown = await _row(c, "old_unknown")
+        assert unknown[0] is None
+
+        await init_db(c, owner_chat_id=OWNER_ID)
+        assert await _row(c, "old_known") == known
+        assert await _row(c, "old_unknown") == unknown
