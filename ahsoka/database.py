@@ -95,6 +95,15 @@ CREATE TABLE IF NOT EXISTS batch_usage (
     succeeded                   INTEGER NOT NULL DEFAULT 0,
     recorded_at                 TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS post_embeddings (
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    vector     BLOB    NOT NULL,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (channel_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_post_embeddings_created ON post_embeddings(created_at);
 """
 
 
@@ -632,8 +641,37 @@ async def delete_old_posts(conn: aiosqlite.Connection, days: int = 30) -> int:
         "DELETE FROM user_notified WHERE sent_at < datetime('now', ?)",
         (f"-{days} days",),
     )
+    await conn.execute(
+        "DELETE FROM post_embeddings WHERE created_at < datetime('now', ?)",
+        (f"-{days} days",),
+    )
     await conn.commit()
     return cursor.rowcount  # type: ignore[return-value]
+
+
+# --- Post embeddings (repost detection) ---
+
+
+async def insert_post_embedding(
+    conn: aiosqlite.Connection, channel_id: int, message_id: int, vector: bytes
+) -> None:
+    await conn.execute(
+        "INSERT OR IGNORE INTO post_embeddings (channel_id, message_id, vector) VALUES (?, ?, ?)",
+        (channel_id, message_id, vector),
+    )
+    await conn.commit()
+
+
+async def get_recent_post_embeddings(
+    conn: aiosqlite.Connection, days: int = 30
+) -> list[tuple[int, int, bytes]]:
+    async with conn.execute(
+        "SELECT channel_id, message_id, vector FROM post_embeddings "
+        "WHERE created_at >= datetime('now', ?)",
+        (f"-{days} days",),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [(r[0], r[1], bytes(r[2])) for r in rows]
 
 
 # --- Personalized verdicts ---

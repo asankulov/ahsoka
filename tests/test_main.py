@@ -1852,3 +1852,185 @@ async def test_fetch_content_http_only_never_calls_resolver():
          patch("ahsoka.main.resolve_tg_link", new_callable=AsyncMock) as mock_resolve:
         assert await _fetch_content(post, MagicMock()) == "scraped"
     mock_resolve.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Repost detection stage (_post_ref, _repost_check, pipeline hook, usage log)
+# ---------------------------------------------------------------------------
+
+import logging
+
+from ahsoka.pipeline.repost_detector import RepostMatch
+
+
+def _repost_settings(mode="shadow", key="k"):
+    s = MagicMock()
+    s.repost_mode = mode
+    s.voyage_api_key = key
+    s.repost_threshold = 0.95
+    s.repost_near_miss_floor = 0.85
+    s.short_post_chars = 200
+    s.scrape_timeout_s = 5
+    return s
+
+
+async def _run_repost_pipeline(conn, post, *, mode="shadow", key="k", embed_ret=None,
+                               match=None, fetch=None, embed_side=None, check_side=None,
+                               configs=None):
+    """Run pipeline_worker once with the repost stage mocked. Returns the mocks."""
+    keyword_index = MagicMock()
+    keyword_index.passes = MagicMock(return_value=True)
+    mocks = {}
+    with patch("ahsoka.main.settings", _repost_settings(mode, key)), \
+         patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main.db.get_notify_chat_ids", new_callable=AsyncMock, return_value=set()), \
+         patch("ahsoka.main.db.get_all_active_configs", new_callable=AsyncMock,
+               return_value=[make_config(user_id=1)] if configs is None else configs), \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mocks["mark_seen"], \
+         patch("ahsoka.main._fetch_content", new_callable=AsyncMock, return_value=fetch), \
+         patch("ahsoka.main.embed", new_callable=AsyncMock, return_value=embed_ret,
+               side_effect=embed_side) as mocks["embed"], \
+         patch("ahsoka.main.check_and_store", new_callable=AsyncMock, return_value=match,
+               side_effect=check_side) as mocks["check"], \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mocks["enqueue"]:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), keyword_index)
+    return mocks
+
+
+async def test_repost_off_mode_skips_embed(conn):
+    m = await _run_repost_pipeline(conn, make_post(), mode="off", embed_ret=[0.1])
+    m["embed"].assert_not_awaited()
+    m["enqueue"].assert_awaited_once()
+
+
+async def test_repost_disabled_without_key(conn):
+    m = await _run_repost_pipeline(conn, make_post(), key="", embed_ret=[0.1])
+    m["embed"].assert_not_awaited()
+    m["enqueue"].assert_awaited_once()
+
+
+async def test_repost_shadow_logs_and_enqueues(conn, caplog):
+    match = RepostMatch(channel_id=-1001458440404, message_id=7, similarity=0.97)
+    with caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        m = await _run_repost_pipeline(
+            conn, make_post(channel_id=-1009999, message_id=9), mode="shadow",
+            embed_ret=[0.1], match=match,
+        )
+    assert "Repost candidate (shadow)" in caplog.text
+    assert "https://t.me/c/1458440404/7" in caplog.text
+    assert "sim=0.970" in caplog.text
+    m["enqueue"].assert_awaited_once()
+    m["mark_seen"].assert_not_awaited()
+
+
+async def test_repost_enforce_drops(conn, caplog):
+    post = make_post()
+    match = RepostMatch(channel_id=1, message_id=2, similarity=0.97)
+    with caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        m = await _run_repost_pipeline(conn, post, mode="enforce", embed_ret=[0.1], match=match)
+    assert "Repost drop" in caplog.text
+    m["mark_seen"].assert_awaited_once_with(conn, post.channel_id, post.message_id)
+    m["enqueue"].assert_not_awaited()
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+async def test_repost_near_miss_logged(conn, caplog, mode):
+    match = RepostMatch(channel_id=1, message_id=2, similarity=0.90)
+    with caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        m = await _run_repost_pipeline(conn, make_post(), mode=mode, embed_ret=[0.1], match=match)
+    assert "Repost near-miss" in caplog.text
+    m["enqueue"].assert_awaited_once()
+
+
+async def test_repost_below_floor_not_logged_at_info(conn, caplog):
+    match = RepostMatch(channel_id=1, message_id=2, similarity=0.50)
+    with caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        m = await _run_repost_pipeline(conn, make_post(), mode="enforce", embed_ret=[0.1], match=match)
+    assert "Repost" not in caplog.text
+    m["enqueue"].assert_awaited_once()
+
+
+async def test_repost_no_match_enqueues(conn, caplog):
+    with caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        m = await _run_repost_pipeline(conn, make_post(), mode="enforce", embed_ret=[0.1], match=None)
+    m["check"].assert_awaited_once()
+    assert "Repost" not in caplog.text
+    m["enqueue"].assert_awaited_once()
+
+
+async def test_repost_embed_failure_fails_open(conn):
+    m = await _run_repost_pipeline(conn, make_post(), mode="enforce", embed_ret=None)
+    m["embed"].assert_awaited_once()
+    m["check"].assert_not_awaited()
+    m["enqueue"].assert_awaited_once()
+
+
+async def test_repost_embeds_prefetched_content(conn):
+    post = make_post(text="Details", urls=["https://example.com/job"])
+    m = await _run_repost_pipeline(conn, post, embed_ret=[0.1], fetch="LINKED")
+    sent = m["embed"].await_args.args[0]
+    assert "Details" in sent and "LINKED" in sent
+
+
+async def test_repost_embeds_only_post_text_without_prefetch(conn):
+    post = make_post(text="Python job")
+    m = await _run_repost_pipeline(conn, post, embed_ret=[0.1])
+    m["embed"].assert_awaited_once_with("Python job")
+
+
+@pytest.mark.parametrize(
+    "channel_id,message_id,expected",
+    [
+        (-1001458440404, 7, "https://t.me/c/1458440404/7"),
+        (-4123, 7, "-4123/7"),
+    ],
+)
+def test_post_ref_formats(channel_id, message_id, expected):
+    from ahsoka.main import _post_ref
+
+    assert _post_ref(channel_id, message_id) == expected
+
+
+async def test_cleanup_worker_logs_voyage_usage(conn, caplog):
+    from ahsoka.main import cleanup_worker
+
+    sleep = AsyncMock(side_effect=[None, asyncio.CancelledError()])
+    with patch("ahsoka.main.asyncio.sleep", sleep), \
+         patch("ahsoka.main.take_token_count", return_value=42), \
+         caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup_worker(conn)
+    assert "Voyage usage: 42 tokens" in caplog.text
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+async def test_repost_check_store_error_fails_open_and_logs_warning(conn, caplog, mode):
+    with caplog.at_level(logging.WARNING, logger="ahsoka.main"):
+        m = await _run_repost_pipeline(
+            conn, make_post(), mode=mode, embed_ret=[0.1],
+            check_side=aiosqlite.OperationalError("database is locked"),
+        )
+    m["check"].assert_awaited_once()
+    m["enqueue"].assert_awaited_once()
+    warns = [r for r in caplog.records
+             if r.levelno == logging.WARNING and "Repost check failed, failing open" in r.getMessage()]
+    assert len(warns) == 1
+
+
+async def test_repost_embed_unexpected_exception_fails_open(conn, caplog):
+    with caplog.at_level(logging.WARNING, logger="ahsoka.main"):
+        m = await _run_repost_pipeline(
+            conn, make_post(), mode="enforce", embed_side=RuntimeError("boom"),
+        )
+    m["check"].assert_not_awaited()
+    m["enqueue"].assert_awaited_once()
+    assert any("Repost check failed, failing open" in r.getMessage() for r in caplog.records)
+
+
+async def test_repost_not_run_when_no_active_users(conn):
+    m = await _run_repost_pipeline(
+        conn, make_post(), mode="enforce", embed_ret=[0.1], configs=[],
+    )
+    m["embed"].assert_not_awaited()
+    m["check"].assert_not_awaited()
+    m["enqueue"].assert_not_awaited()

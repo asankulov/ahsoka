@@ -796,3 +796,51 @@ async def test_get_notify_chat_ids_returns_distinct_set_of_dms_and_groups(conn):
     ids = await get_notify_chat_ids(conn)
     assert isinstance(ids, set)
     assert ids == {-100777, 3, OWNER_ID}
+
+
+# --- Post embeddings (repost detection) ---
+
+from ahsoka.database import get_recent_post_embeddings, insert_post_embedding  # noqa: E402
+
+
+async def test_post_embeddings_table_created_idempotently(conn):
+    await init_db(conn, owner_chat_id=OWNER_ID)
+    async with conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='post_embeddings'"
+    ) as cur:
+        assert await cur.fetchone() is not None
+
+
+async def test_insert_and_get_recent_post_embeddings(conn):
+    await insert_post_embedding(conn, -100123, 5, b"\x00" * 8)
+    assert await get_recent_post_embeddings(conn) == [(-100123, 5, b"\x00" * 8)]
+
+
+async def test_insert_post_embedding_ignores_duplicate(conn):
+    await insert_post_embedding(conn, -100123, 5, b"\x01" * 8)
+    await insert_post_embedding(conn, -100123, 5, b"\x02" * 8)
+    rows = await get_recent_post_embeddings(conn)
+    assert rows == [(-100123, 5, b"\x01" * 8)]
+
+
+async def test_get_recent_excludes_older_than_window(conn):
+    await insert_post_embedding(conn, 1, 1, b"\x00" * 4)
+    await insert_post_embedding(conn, 1, 2, b"\x00" * 4)
+    await conn.execute(
+        "UPDATE post_embeddings SET created_at = datetime('now','-31 days') WHERE message_id = 1"
+    )
+    await conn.commit()
+    rows = await get_recent_post_embeddings(conn)
+    assert [(c, m) for c, m, _ in rows] == [(1, 2)]
+
+
+async def test_delete_old_posts_prunes_embeddings(conn):
+    await insert_post_embedding(conn, 1, 1, b"\x00" * 4)
+    await insert_post_embedding(conn, 1, 2, b"\x00" * 4)
+    await conn.execute(
+        "UPDATE post_embeddings SET created_at = datetime('now','-31 days') WHERE message_id = 1"
+    )
+    await conn.commit()
+    await delete_old_posts(conn, 30)
+    async with conn.execute("SELECT message_id FROM post_embeddings") as cur:
+        assert [r[0] for r in await cur.fetchall()] == [2]

@@ -111,7 +111,7 @@ Stage logic in `pipeline_worker`, after the keyword filter passes:
 5. Else, if `match` and `match.similarity >= repost_near_miss_floor`: INFO `Repost near-miss: … sim=0.91`. Continue.
 6. Otherwise continue silently (DEBUG log of the best similarity).
 
-INFO lines reach the owner through the existing `bot/log_handler.py`; no new logging path. Log lines use the channel names stored in the DB where available, otherwise the raw ids.
+INFO lines reach the owner through the existing `bot/log_handler.py`; no new logging path. Log lines reference posts as clickable `https://t.me/c/<id>/<msg>` links for `-100…` ids, otherwise raw `channel_id/message_id`.
 
 **Storage rule:** a post's vector is stored only when it is *not* a repost (similarity < threshold). Repost chains therefore resolve to the original, and copies do not fill the window. This applies in shadow mode too, so shadow logs predict enforce behaviour exactly.
 

@@ -65,6 +65,10 @@ jobs:
             TELEGRAM_API_HASH=${{ secrets.TELEGRAM_API_HASH }}
             CLAUDE_MODEL=${{ vars.CLAUDE_MODEL }}
             DEFAULT_SCORE_THRESHOLD=${{ vars.DEFAULT_SCORE_THRESHOLD }}
+            VOYAGE_API_KEY=${{ secrets.VOYAGE_API_KEY }}
+            VOYAGE_MODEL=${{ vars.VOYAGE_MODEL }}
+            REPOST_MODE=${{ vars.REPOST_MODE }}
+            REPOST_THRESHOLD=${{ vars.REPOST_THRESHOLD }}
         run: |
           printf '%s\n' "$DOTENV" | grep -v '=$' \
             | ssh ahsoka@${{ secrets.DEPLOY_HOST }} "cat > /home/ahsoka/ahsoka/.env"
