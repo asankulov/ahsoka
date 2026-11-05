@@ -61,6 +61,7 @@ jobs:
             LOG_BOT_TOKEN=${{ secrets.LOG_BOT_TOKEN }}
             OWNER_CHAT_ID=${{ secrets.OWNER_CHAT_ID }}
             ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+            ANTHROPIC_ADMIN_KEY=${{ secrets.ANTHROPIC_ADMIN_KEY }}
             TELEGRAM_API_ID=${{ secrets.TELEGRAM_API_ID }}
             TELEGRAM_API_HASH=${{ secrets.TELEGRAM_API_HASH }}
             CLAUDE_MODEL=${{ vars.CLAUDE_MODEL }}
