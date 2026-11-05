@@ -224,14 +224,23 @@ def test_format_buckets_shows_label_total_split_and_batches():
     assert "2.0M" in out
 
 
-def test_format_buckets_cost_per_post():
+def test_format_buckets_cost_per_request():
     out = costs.format_buckets([_bucket(scoring_usd=3.0, embedding_usd=0.0, succeeded=30)], [], "day")
-    assert "$0.10" in out  # 3.00 / 30
+    assert "$0.10/req" in out  # 3.00 / 30
+    assert "/post" not in out
 
 
-def test_format_buckets_no_per_post_when_none_succeeded():
+def test_format_buckets_tiny_per_request_four_decimals():
+    out = costs.format_buckets(
+        [_bucket(scoring_usd=0.0123, embedding_usd=0.0, succeeded=1)], [], "day"
+    )
+    assert "$0.0123/req" in out
+
+
+def test_format_buckets_no_per_request_when_none_succeeded():
     out = costs.format_buckets([_bucket(succeeded=0)], [], "day")
-    assert "per post" not in out.lower()
+    assert "/req" not in out
+    assert "/post" not in out
 
 
 def test_format_buckets_tiny_cost_uses_four_decimals():
@@ -279,6 +288,89 @@ def test_format_buckets_event_outside_buckets_not_shown():
     ev = [{"ts": "2026-10-01T10:00:00Z", "kind": "setting", "key": "k",
            "old_value": "a", "new_value": "b"}]
     assert "k: a" not in costs.format_buckets([_bucket("2026-11-05")], ev, "day")
+
+
+def _ev(ts, key="k", old="a", new="b", kind="setting"):
+    return {"ts": ts, "kind": kind, "key": key, "old_value": old, "new_value": new}
+
+
+def test_format_buckets_event_on_day_without_bucket_between_buckets_shown():
+    out = costs.format_buckets(
+        [_bucket("2026-11-05"), _bucket("2026-11-03")],
+        [_ev("2026-11-04T10:00:00Z", key="claude_model")],
+        "day",
+    )
+    ph = "2026-11-04 \u2014 no API activity"
+    assert ph in out
+    assert "  \u2699 claude_model: a \u2192 b" in out
+    assert out.index("2026-11-05") < out.index(ph) < out.index("2026-11-03")
+    assert out.index(ph) < out.index("claude_model") < out.index("2026-11-03")
+
+
+def test_format_buckets_event_newer_than_newest_bucket_shown_first():
+    out = costs.format_buckets(
+        [_bucket("2026-11-05")], [_ev("2026-11-07T10:00:00Z", key="zzz")], "day"
+    )
+    ph = "2026-11-07 \u2014 no API activity"
+    assert ph in out
+    assert out.index(ph) < out.index("zzz") < out.index("2026-11-05")
+
+
+def test_format_buckets_event_older_than_oldest_bucket_hidden():
+    out = costs.format_buckets(
+        [_bucket("2026-11-05"), _bucket("2026-11-03")],
+        [_ev("2026-11-02T10:00:00Z", key="old_key")],
+        "day",
+    )
+    assert "old_key" not in out
+    assert "no API activity" not in out
+
+
+def test_format_buckets_event_equal_to_oldest_bucket_label_is_under_real_bucket():
+    out = costs.format_buckets(
+        [_bucket("2026-11-05")], [_ev("2026-11-05T01:00:00Z", key="here")], "day"
+    )
+    assert "here" in out
+    assert "no API activity" not in out
+
+
+def test_format_buckets_multiple_events_same_empty_day_one_placeholder():
+    out = costs.format_buckets(
+        [_bucket("2026-11-05"), _bucket("2026-11-01")],
+        [_ev("2026-11-03T01:00:00Z", key="e1"), _ev("2026-11-03T02:00:00Z", key="e2")],
+        "day",
+    )
+    assert out.count("2026-11-03 \u2014 no API activity") == 1
+    assert "e1" in out and "e2" in out
+
+
+def test_format_buckets_no_buckets_with_events_still_no_cost_data():
+    out = costs.format_buckets([], [_ev("2026-11-05T01:00:00Z")], "day")
+    assert out == "No cost data yet."
+
+
+def test_format_buckets_month_event_without_bucket_placeholder():
+    out = costs.format_buckets(
+        [_bucket("2026-11"), _bucket("2026-08")],
+        [_ev("2026-10-15T00:00:00Z", key="mk"), _ev("2026-07-15T00:00:00Z", key="hidden_m")],
+        "month",
+    )
+    ph = "2026-10 \u2014 no API activity"
+    assert ph in out
+    assert out.index("2026-11") < out.index(ph) < out.index("2026-08")
+    assert "mk" in out and "hidden_m" not in out
+
+
+def test_format_buckets_year_event_without_bucket_placeholder():
+    out = costs.format_buckets(
+        [_bucket("2026"), _bucket("2024")],
+        [_ev("2025-06-01T00:00:00Z", key="yk"), _ev("2023-06-01T00:00:00Z", key="hidden_y")],
+        "year",
+    )
+    ph = "2025 \u2014 no API activity"
+    assert ph in out
+    assert out.index("2026") < out.index(ph) < out.index("2024")
+    assert "yk" in out and "hidden_y" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -402,3 +494,78 @@ async def test_build_digest_month_boundary_yesterday_in_previous_month(conn):
     assert "2026-10-31" in out
     assert "$4.00" in out
     assert "$54.00" not in out
+
+
+async def _add_event(conn, ts, key="claude_model"):
+    await conn.execute(
+        "INSERT INTO cost_events (ts, kind, key, old_value, new_value) VALUES (?, ?, ?, ?, ?)",
+        (ts, "setting", key, "old", "new"),
+    )
+    await conn.commit()
+
+
+async def test_build_digest_ts_key_excludes_event_before_stored_ts(conn):
+    await _add_event(conn, "2026-11-04T10:00:00Z", key="before_k")
+    await db.save_setting_snapshot(conn, {"digest_last_sent_ts": "2026-11-04T12:00:00Z"})
+    out = await costs.build_digest(conn, TODAY)
+    assert "before_k" not in out
+    assert "Changes since last digest" not in out
+
+
+async def test_build_digest_ts_key_includes_event_after_stored_ts(conn):
+    await _add_event(conn, "2026-11-04T13:00:00Z", key="after_k")
+    await db.save_setting_snapshot(conn, {"digest_last_sent_ts": "2026-11-04T12:00:00Z"})
+    out = await costs.build_digest(conn, TODAY)
+    assert "after_k" in out
+
+
+async def test_build_digest_ts_key_is_exclusive(conn):
+    await _add_event(conn, "2026-11-04T12:00:00Z", key="edge_k")
+    await db.save_setting_snapshot(conn, {"digest_last_sent_ts": "2026-11-04T12:00:00Z"})
+    assert "edge_k" not in await costs.build_digest(conn, TODAY)
+
+
+async def test_build_digest_no_ts_key_falls_back_to_yesterday_start(conn):
+    await _add_event(conn, "2026-11-04T00:00:00Z", key="fb_in")
+    await _add_event(conn, "2026-11-03T23:59:59Z", key="fb_out")
+    out = await costs.build_digest(conn, TODAY)
+    assert "fb_in" in out and "fb_out" not in out
+
+
+async def test_build_digest_no_event_repeat_across_consecutive_digests(conn):
+    await _add_event(conn, "2026-11-04T10:00:00Z", key="once_k")
+    first = await costs.build_digest(conn, TODAY)
+    assert "once_k" in first
+    await db.save_setting_snapshot(
+        conn, {"digest_last_sent": TODAY, "digest_last_sent_ts": "2026-11-05T00:05:03Z"}
+    )
+    second = await costs.build_digest(conn, "2026-11-06")
+    assert "once_k" not in second
+    assert "Changes since last digest" not in second
+
+
+async def test_build_digest_missed_day_includes_whole_gap(conn):
+    await db.save_setting_snapshot(conn, {"digest_last_sent_ts": "2026-11-03T00:05:00Z"})
+    await _add_event(conn, "2026-11-03T08:00:00Z", key="gap1")
+    await _add_event(conn, "2026-11-04T08:00:00Z", key="gap2")
+    await _add_event(conn, "2026-11-02T08:00:00Z", key="too_old")
+    out = await costs.build_digest(conn, TODAY)
+    assert "gap1" in out and "gap2" in out and "too_old" not in out
+
+
+async def test_digest_last_sent_ts_not_diffed_as_setting(conn):
+    await db.save_setting_snapshot(conn, {"digest_last_sent_ts": "2026-11-04T12:00:00Z"})
+    assert await costs.record_setting_changes(conn, make_settings()) == 0
+    # first-run semantics unaffected by the ts key; snapshot preserved afterwards
+    assert await costs.record_setting_changes(conn, make_settings(claude_model="x")) == 1
+    snap = await db.get_setting_snapshot(conn)
+    assert snap["digest_last_sent_ts"] == "2026-11-04T12:00:00Z"
+    events = await db.list_cost_events(conn, "2000-01-01T00:00:00Z", "2999-01-01T00:00:00Z")
+    assert [e["key"] for e in events] == ["claude_model"]
+
+
+async def test_save_setting_snapshot_preserves_digest_ts(conn):
+    await db.save_setting_snapshot(conn, {"digest_last_sent_ts": "2026-11-04T12:00:00Z"})
+    await db.save_setting_snapshot(conn, {"claude_model": "m"})
+    snap = await db.get_setting_snapshot(conn)
+    assert snap["digest_last_sent_ts"] == "2026-11-04T12:00:00Z"

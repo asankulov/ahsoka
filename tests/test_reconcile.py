@@ -280,3 +280,24 @@ async def test_admin_key_never_logged_across_failures(conn, caplog):
     with caplog.at_level(logging.DEBUG):
         assert await _fetch(handler) is None
     assert KEY not in caplog.text
+
+
+@pytest.mark.parametrize("amount", ["NaN", "Infinity", "-Infinity"])
+async def test_fetch_billed_non_finite_amount_returns_none_and_warns(amount, caplog):
+    h = _recorder(_body([_bucket(["10", amount])]))
+    with caplog.at_level(logging.WARNING):
+        assert await _fetch(h) is None
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+    assert KEY not in caplog.text
+
+
+async def test_fetch_billed_negative_total_returned_unchanged():
+    h = _recorder(_body([_bucket(["-250"])]))
+    assert await _fetch(h) == pytest.approx(-2.5)
+
+
+async def test_fetch_billed_page_cap_stops_endless_has_more():
+    h = _recorder(_body([_bucket(["1"])], has_more=True, next_page="p"))
+    result = await _fetch(h)
+    assert len(h.requests) <= 50
+    assert result is None or isinstance(result, float)

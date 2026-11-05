@@ -17,7 +17,8 @@ from aiogram.types import (
 )
 import datetime as _dt
 
-from ahsoka.bot.commands import register_bot_commands, WaitingForInput, _fmt_tokens, _pricing_for
+from ahsoka.bot.commands import register_bot_commands, WaitingForInput
+from ahsoka.pipeline.costs import fmt_tokens, price_for
 from ahsoka.config import Settings
 from ahsoka.database import (
     get_user_config, init_db, load_watched_channels, get_or_create_user, get_user,
@@ -1216,7 +1217,7 @@ async def _seed_cost_data(conn):
 
 
 @pytest.mark.parametrize("arg", ["day", "month", "year"])
-async def test_stats_granularity_reports_bucket_with_cost_and_per_post(conn, settings, arg):
+async def test_stats_granularity_reports_bucket_with_cost_and_per_req(conn, settings, arg):
     today = await _seed_cost_data(conn)
     _, h, _ = setup_dp(conn, settings)
     msg = make_msg(f"/stats {arg}")
@@ -1225,7 +1226,7 @@ async def test_stats_granularity_reports_bucket_with_cost_and_per_post(conn, set
     label = {"day": today, "month": today[:7], "year": today[:4]}[arg]
     assert label in reply_text
     assert "$2.00" in reply_text
-    assert "$0.10" in reply_text  # 2.00 / 20 scored posts
+    assert "$0.10/req" in reply_text  # 2.00 / 20 successful requests
     assert "Users:" not in reply_text
 
 
@@ -1338,33 +1339,33 @@ async def test_debug_clears_state(conn, settings):
 
 
 def test_fmt_tokens_millions():
-    assert _fmt_tokens(1_200_000) == "1.2M"
+    assert fmt_tokens(1_200_000) == "1.2M"
 
 
 def test_fmt_tokens_thousands():
-    assert _fmt_tokens(45_000) == "45K"
+    assert fmt_tokens(45_000) == "45K"
 
 
 def test_fmt_tokens_small():
-    assert _fmt_tokens(500) == "500"
+    assert fmt_tokens(500) == "500"
 
 
 def test_pricing_for_known_model():
-    prices = _pricing_for("claude-haiku-4-5-20251001")
+    prices = price_for("claude-haiku-4-5-20251001")
     assert prices is not None
     assert len(prices) == 4
 
 
 def test_pricing_for_haiku_5_5():
-    assert _pricing_for("claude-haiku-5-5") == (0.05e-6, 0.25e-6, 0.0625e-6, 0.005e-6)
+    assert price_for("claude-haiku-5-5") == (0.05e-6, 0.25e-6, 0.0625e-6, 0.005e-6)
 
 
 def test_pricing_for_haiku_4_5_corrected_rates():
-    assert _pricing_for("claude-haiku-4-5-20251001") == (0.50e-6, 2.50e-6, 0.625e-6, 0.05e-6)
+    assert price_for("claude-haiku-4-5-20251001") == (0.50e-6, 2.50e-6, 0.625e-6, 0.05e-6)
 
 
 def test_pricing_for_unknown_model():
-    assert _pricing_for("gpt-99") is None
+    assert price_for("gpt-99") is None
 
 
 # ---------------------------------------------------------------------------
