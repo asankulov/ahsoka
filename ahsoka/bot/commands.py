@@ -19,34 +19,11 @@ from ahsoka import database as db
 from ahsoka.bot.export import entities_to_markdown, parse_range, render_markdown
 from ahsoka.config import Settings
 from ahsoka.models import Post
+from ahsoka.pipeline.costs import price_for as _pricing_for
 from ahsoka.pipeline.keyword_index import KeywordIndex
 from ahsoka.text_utils import slice_utf16
 
 logger = logging.getLogger(__name__)
-
-# Batch API pricing per token (USD). Keys are model-name prefixes; longest match wins.
-# Prices reflect the 50% batch-API discount vs. standard rates.
-_BATCH_PRICING: dict[str, tuple[float, float, float, float]] = {
-    # prefix → (input, output, cache_write, cache_read) per token
-    "claude-haiku-3-5":  (0.40e-6, 2.00e-6, 0.50e-6, 0.04e-6),
-    "claude-haiku-4-5":  (0.50e-6, 2.50e-6, 0.625e-6, 0.05e-6),
-    # haiku-5-5: cache rates derived from 1.25x (write) / 0.1x (read) of input price
-    "claude-haiku-5-5":  (0.05e-6, 0.25e-6, 0.0625e-6, 0.005e-6),
-    "claude-sonnet-3-5": (1.50e-6, 7.50e-6, 1.875e-6, 0.15e-6),
-    "claude-sonnet-4":   (1.50e-6, 7.50e-6, 1.875e-6, 0.15e-6),
-    "claude-sonnet-4-6": (1.50e-6, 7.50e-6, 1.875e-6, 0.15e-6),
-}
-
-
-def _pricing_for(model: str) -> tuple[float, float, float, float] | None:
-    """Return (input, output, cache_write, cache_read) per-token prices, or None if unknown."""
-    match = None
-    for prefix, prices in _BATCH_PRICING.items():
-        if model.startswith(prefix):
-            if match is None or len(prefix) > len(match[0]):
-                match = (prefix, prices)
-    return match[1] if match else None
-
 
 def _fmt_tokens(n: int) -> str:
     if n >= 1_000_000:
