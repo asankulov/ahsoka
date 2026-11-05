@@ -1,3 +1,6 @@
+import warnings
+from typing import Literal
+
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings.sources.providers.env import EnvSettingsSource
@@ -39,6 +42,14 @@ class Settings(BaseSettings):
     batch_flush_seconds: int = 600
     batch_poll_interval_seconds: int = 60
     batch_max_wait_seconds: int = 1800
+    voyage_api_key: str = ""  # empty disables repost detection entirely
+    voyage_model: str = "voyage-4-lite"
+    repost_dimensions: int = 512
+    repost_max_chars: int = 8000
+    repost_mode: Literal["off", "shadow", "enforce"] = "shadow"
+    repost_threshold: float = 0.95
+    repost_near_miss_floor: float = 0.85
+    embed_timeout_s: float = 5.0
 
     @classmethod
     def settings_customise_sources(cls, settings_cls, **kwargs):  # type: ignore[override]
@@ -50,6 +61,18 @@ class Settings(BaseSettings):
             _LenientDotEnvSource(settings_cls, env_file=".env", env_file_encoding="utf-8"),
             *([] if secrets_settings is None else [secrets_settings]),
         )
+
+    @field_validator("repost_mode", mode="before")
+    @classmethod
+    def normalize_repost_mode(cls, v: object) -> object:
+        if isinstance(v, str):
+            v = v.strip().lower()
+        if v not in ("off", "shadow", "enforce"):
+            warnings.warn(
+                f"Invalid REPOST_MODE {v!r}; falling back to 'shadow'", stacklevel=2
+            )
+            return "shadow"
+        return v
 
     @field_validator("channel_ids", mode="before")
     @classmethod

@@ -27,6 +27,8 @@ from ahsoka.pipeline.batch_queue import BatchQueue
 from ahsoka.pipeline.batch_submitter import BatchSubmitter
 from ahsoka.bot.commands import register_bot_commands, BOT_COMMANDS
 from ahsoka.bot.notifier import send_notification
+from ahsoka.pipeline.embedder import embed, take_token_count
+from ahsoka.pipeline.repost_detector import check_and_store
 from ahsoka.pipeline.tg_resolver import is_tg_link, resolve_tg_link
 
 logging.basicConfig(
@@ -34,6 +36,59 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _post_ref(channel_id: int, message_id: int) -> str:
+    """Clickable t.me/c link for supergroup/channel ids, else raw ids."""
+    if str(channel_id).startswith("-100"):
+        return f"https://t.me/c/{str(channel_id)[4:]}/{message_id}"
+    return f"{channel_id}/{message_id}"
+
+
+async def _repost_check(
+    conn: aiosqlite.Connection, post: Post, prefetched: str | None
+) -> bool:
+    """Embedding-based repost detection. Returns True if the post should be dropped."""
+    try:
+        if settings.repost_mode == "off" or not settings.voyage_api_key:
+            return False
+        text = f"{post.text}\n{prefetched}" if prefetched else post.text
+        vector = await embed(text)
+        if vector is None:
+            return False  # fail open
+        match = await check_and_store(
+            conn, post.channel_id, post.message_id, vector, settings.repost_threshold
+        )
+        if match is None:
+            return False
+        new_ref = _post_ref(post.channel_id, post.message_id)
+        orig_ref = _post_ref(match.channel_id, match.message_id)
+        if match.similarity >= settings.repost_threshold:
+            if settings.repost_mode == "shadow":
+                logger.info(
+                    "Repost candidate (shadow): %s ≈ %s, sim=%.3f",
+                    new_ref, orig_ref, match.similarity,
+                )
+                return False
+            logger.info(
+                "Repost drop: %s ≈ %s, sim=%.3f", new_ref, orig_ref, match.similarity
+            )
+            return True
+        if match.similarity >= settings.repost_near_miss_floor:
+            logger.info(
+                "Repost near-miss: %s ≈ %s, sim=%.3f", new_ref, orig_ref, match.similarity
+            )
+            return False
+        logger.debug(
+            "Repost check: best sim=%.3f for %s", match.similarity, new_ref
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "Repost check failed, failing open: %s/%s",
+            post.channel_id, post.message_id, exc_info=True,
+        )
+        return False
 
 
 async def _fan_out_verdicts(
@@ -182,6 +237,10 @@ async def pipeline_worker(
                 await db.mark_seen(conn, post.channel_id, post.message_id)
                 continue
 
+            if await _repost_check(conn, post, prefetched):
+                await db.mark_seen(conn, post.channel_id, post.message_id)
+                continue
+
             await _enqueue_single(
                 conn, batch_queue, post, active_configs, pyro, content=prefetched
             )
@@ -241,6 +300,7 @@ async def cleanup_worker(conn: aiosqlite.Connection) -> None:
         await asyncio.sleep(86_400)  # 24 h
         deleted = await db.delete_old_posts(conn, days=30)
         logger.info("Cleanup: removed %d stale seen_posts rows", deleted)
+        logger.info("Voyage usage: %d tokens in last 24h", take_token_count())
 
 
 async def _recover_pending_batches(
