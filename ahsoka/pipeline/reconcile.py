@@ -10,6 +10,7 @@ Notes (researched 2026-11-05 from Anthropic's docs):
 - Any failure is logged as a warning (never the key or response body) and ignored.
 """
 import logging
+import math
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -53,7 +54,11 @@ async def _fetch(client: httpx.AsyncClient, day: str) -> float | None:
             if not total.is_finite():
                 logger.warning("Admin API cost report returned a non-finite total")
                 return None
-            return float(total / 100)
+            result = float(total / 100)
+            if not math.isfinite(result):
+                logger.warning("Admin API cost report total overflowed float range")
+                return None
+            return result
     logger.warning("Admin API cost report exceeded %d pages", _MAX_PAGES)
     return None
 

@@ -363,7 +363,7 @@ async def digest_worker(
                     conn,
                     {
                         "digest_last_sent": today,
-                        "digest_last_sent_ts": now_fn().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "digest_last_sent_ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     },
                 )
         except asyncio.CancelledError:
