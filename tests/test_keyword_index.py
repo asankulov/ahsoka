@@ -202,3 +202,15 @@ async def test_passes_any_empty_keywords_true_regardless_of_extra_text(conn):
     with patch("ahsoka.pipeline.keyword_index.db.get_all_active_configs", new_callable=AsyncMock, return_value=configs):
         await idx.rebuild(conn)
     assert idx.passes(make_post("nothing"), extra_text="zip") is True
+
+
+async def test_keyword_count_is_union_size(conn):
+    configs = [
+        make_config(user_id=1, keywords="python django"),
+        make_config(user_id=2, keywords="Python rust"),
+    ]
+    idx = KeywordIndex()
+    assert idx.keyword_count == 0
+    with patch("ahsoka.pipeline.keyword_index.db.get_all_active_configs", new_callable=AsyncMock, return_value=configs):
+        await idx.rebuild(conn)
+    assert idx.keyword_count == 3  # python (deduped, lowercased), django, rust

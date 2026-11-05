@@ -1,4 +1,9 @@
+import aiosqlite
 import pytest
+from unittest.mock import MagicMock
+
+from ahsoka import database as db
+from ahsoka.config import Settings
 
 from ahsoka.pipeline import costs
 from ahsoka.pipeline.costs import cost_for, embed_cost_for, price_for
@@ -26,3 +31,165 @@ def test_longest_prefix_wins(monkeypatch):
 
 def test_embed_cost_for_unknown_none():
     assert embed_cost_for("not-a-voyage-model", 1000) is None
+
+
+# ---------------------------------------------------------------------------
+# Change tracking
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def conn():
+    async with aiosqlite.connect(":memory:") as c:
+        await db.init_db(c)
+        yield c
+
+
+def make_settings(**overrides):
+    s = MagicMock(spec=Settings)
+    values = dict(
+        claude_model="claude-haiku-5-5",
+        repost_mode="shadow",
+        repost_threshold=0.95,
+        batch_flush_size=50,
+        batch_flush_seconds=300,
+        voyage_model="voyage-4-lite",
+        repost_dimensions=512,
+        default_score_threshold=7,
+        bot_token="secret-token",
+    )
+    values.update(overrides)
+    for k, v in values.items():
+        setattr(s, k, v)
+    return s
+
+
+def test_tracked_settings_exact():
+    assert costs.TRACKED_SETTINGS == (
+        "claude_model", "repost_mode", "repost_threshold", "batch_flush_size",
+        "batch_flush_seconds", "voyage_model", "repost_dimensions",
+        "default_score_threshold",
+    )
+
+
+async def test_first_run_saves_snapshot_writes_no_events(conn):
+    n = await costs.record_setting_changes(conn, make_settings())
+    assert n == 0
+    assert await db.list_cost_events(conn, "0000-01-01", "9999-12-31") == []
+    snap = await db.get_setting_snapshot(conn)
+    assert snap["claude_model"] == "claude-haiku-5-5"
+    assert snap["repost_threshold"] == "0.95"
+
+
+async def test_unchanged_second_run_writes_no_events(conn):
+    await costs.record_setting_changes(conn, make_settings())
+    assert await costs.record_setting_changes(conn, make_settings()) == 0
+    assert await db.list_cost_events(conn, "0000-01-01", "9999-12-31") == []
+
+
+async def test_changed_claude_model_writes_one_event_with_old_new(conn):
+    await costs.record_setting_changes(conn, make_settings())
+    n = await costs.record_setting_changes(conn, make_settings(claude_model="claude-sonnet-4-6"))
+    assert n == 1
+    evs = await db.list_cost_events(conn, "0000-01-01", "9999-12-31")
+    assert len(evs) == 1
+    e = evs[0]
+    assert e["kind"] == "setting"
+    assert e["key"] == "claude_model"
+    assert e["old_value"] == "claude-haiku-5-5"
+    assert e["new_value"] == "claude-sonnet-4-6"
+    # no duplicate after restart with same new value
+    assert await costs.record_setting_changes(conn, make_settings(claude_model="claude-sonnet-4-6")) == 0
+
+
+async def test_float_setting_change_stored_as_string(conn):
+    await costs.record_setting_changes(conn, make_settings())
+    n = await costs.record_setting_changes(conn, make_settings(repost_threshold=0.9))
+    assert n == 1
+    e = (await db.list_cost_events(conn, "0000-01-01", "9999-12-31"))[0]
+    assert (e["key"], e["old_value"], e["new_value"]) == ("repost_threshold", "0.95", "0.9")
+    assert (await db.get_setting_snapshot(conn))["repost_threshold"] == "0.9"
+
+
+async def test_untracked_setting_change_ignored(conn):
+    await costs.record_setting_changes(conn, make_settings())
+    n = await costs.record_setting_changes(conn, make_settings(bot_token="other"))
+    assert n == 0
+    assert await db.list_cost_events(conn, "0000-01-01", "9999-12-31") == []
+    assert "bot_token" not in await db.get_setting_snapshot(conn)
+
+
+async def test_other_snapshot_keys_preserved(conn):
+    await db.save_setting_snapshot(conn, {"digest_last_sent": "2026-11-01"})
+    await costs.record_setting_changes(conn, make_settings())
+    await costs.record_setting_changes(conn, make_settings(claude_model="x"))
+    snap = await db.get_setting_snapshot(conn)
+    assert snap["digest_last_sent"] == "2026-11-01"
+    assert snap["claude_model"] == "x"
+
+
+async def test_first_run_with_only_digest_key_writes_no_events(conn):
+    """Table non-empty (digest_last_sent) must not make first run look like a diff against nothing."""
+    await db.save_setting_snapshot(conn, {"digest_last_sent": "2026-11-01"})
+    assert await costs.record_setting_changes(conn, make_settings()) == 0
+    assert await db.list_cost_events(conn, "0000-01-01", "9999-12-31") == []
+
+
+async def test_first_population_snapshot_writes_no_events(conn):
+    assert await costs.record_population(conn, "2026-11-01", 10, 5, 20) == 0
+    snap = await db.get_last_population_snapshot(conn)
+    assert (snap["users"], snap["channels"], snap["keywords"]) == (10, 5, 20)
+
+
+@pytest.mark.parametrize(
+    "new,expected",
+    [(13, 1), (11, 0), (12, 1), (10, 0)],
+)
+async def test_population_threshold_users_from_10(conn, new, expected):
+    await costs.record_population(conn, "2026-11-01", 10, 5, 20)
+    n = await costs.record_population(conn, "2026-11-02", new, 5, 20)
+    assert n == expected
+    evs = await db.list_cost_events(conn, "0000-01-01", "9999-12-31")
+    assert len(evs) == expected
+    if expected:
+        assert evs[0]["kind"] == "population"
+        assert evs[0]["key"] == "users"
+        assert evs[0]["old_value"] == "10"
+        assert evs[0]["new_value"] == str(new)
+    assert (await db.get_last_population_snapshot(conn))["users"] == new
+
+
+async def test_population_large_base_small_change_ignored(conn):
+    await costs.record_population(conn, "2026-11-01", 100, 5, 20)
+    assert await costs.record_population(conn, "2026-11-02", 101, 5, 20) == 0
+
+
+async def test_population_large_relative_but_abs_one_ignored(conn):
+    await costs.record_population(conn, "2026-11-01", 2, 5, 20)
+    assert await costs.record_population(conn, "2026-11-02", 3, 5, 20) == 0
+
+
+async def test_population_from_zero_abs_two_qualifies(conn):
+    await costs.record_population(conn, "2026-11-01", 0, 0, 0)
+    n = await costs.record_population(conn, "2026-11-02", 2, 1, 0)
+    assert n == 1
+    evs = await db.list_cost_events(conn, "0000-01-01", "9999-12-31")
+    assert evs[0]["key"] == "users"
+
+
+async def test_population_multiple_metrics_each_get_event(conn):
+    await costs.record_population(conn, "2026-11-01", 10, 10, 10)
+    n = await costs.record_population(conn, "2026-11-02", 10, 20, 5)
+    assert n == 2
+    keys = {e["key"] for e in await db.list_cost_events(conn, "0000-01-01", "9999-12-31")}
+    assert keys == {"channels", "keywords"}
+
+
+async def test_collect_population_excludes_banned_users(conn):
+    for uid in (1, 2, 3):
+        await db.get_or_create_user(conn, uid)
+    await db.ban_user(conn, 3)
+    idx = MagicMock()
+    idx.keyword_count = 7
+    users, channels, kws = await costs.collect_population(conn, idx, [101, 102, 103, 104])
+    assert (users, channels, kws) == (2, 4, 7)

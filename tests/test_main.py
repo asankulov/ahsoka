@@ -2064,3 +2064,38 @@ async def test_embedding_usage_sink_unknown_model_stores_null_cost(conn):
     async with conn.execute("SELECT model, tokens, cost_usd FROM embedding_usage") as cur:
         rows = await cur.fetchall()
     assert rows == [("mystery-model", 100, None)]
+
+
+# ---------------------------------------------------------------------------
+# population_worker
+# ---------------------------------------------------------------------------
+
+
+async def test_population_worker_records_each_iteration(conn):
+    from ahsoka.main import population_worker
+
+    with patch("ahsoka.main.costs.collect_population", new_callable=AsyncMock,
+               return_value=(3, 4, 5)) as collect, \
+         patch("ahsoka.main.costs.record_population", new_callable=AsyncMock,
+               return_value=0) as record:
+        await population_worker(conn, MagicMock(), [1, 2], interval_s=0, iterations=2)
+
+    assert collect.await_count == 2
+    assert record.await_count == 2
+    args = record.await_args.args
+    assert args[0] is conn
+    assert isinstance(args[1], str) and len(args[1]) == 10  # YYYY-MM-DD day
+    assert args[2:] == (3, 4, 5)
+
+
+async def test_population_worker_swallows_collect_failure_and_continues(conn, caplog):
+    from ahsoka.main import population_worker
+
+    with patch("ahsoka.main.costs.collect_population", new_callable=AsyncMock,
+               side_effect=[RuntimeError("boom"), (1, 2, 3)]) as collect, \
+         patch("ahsoka.main.costs.record_population", new_callable=AsyncMock,
+               return_value=0) as record:
+        await population_worker(conn, MagicMock(), [], interval_s=0, iterations=2)
+
+    assert collect.await_count == 2
+    assert record.await_count == 1  # only the second iteration succeeded
