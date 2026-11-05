@@ -279,3 +279,126 @@ def test_format_buckets_event_outside_buckets_not_shown():
     ev = [{"ts": "2026-10-01T10:00:00Z", "kind": "setting", "key": "k",
            "old_value": "a", "new_value": "b"}]
     assert "k: a" not in costs.format_buckets([_bucket("2026-11-05")], ev, "day")
+
+
+# ---------------------------------------------------------------------------
+# build_digest
+# ---------------------------------------------------------------------------
+
+TODAY = "2026-11-05"  # digest covers yesterday = 2026-11-04
+
+
+async def _seed_batch(conn, batch_id, day, cost, succeeded=10, inp=1_000_000, out=50_000):
+    await db.save_batch_usage(conn, batch_id, "claude-haiku-5-5", inp, out, 0, 0, succeeded, cost)
+    await conn.execute(
+        "UPDATE batch_usage SET recorded_at = ? WHERE batch_id = ?",
+        (f"{day}T12:00:00Z", batch_id),
+    )
+    await conn.commit()
+
+
+async def _seed_activity(conn):
+    await _seed_batch(conn, "b-prev-month", "2026-10-31", 100.0)  # excluded from MTD
+    await _seed_batch(conn, "b-early", "2026-11-02", 2.0)  # in MTD, not in yesterday
+    await _seed_batch(conn, "b-yday", "2026-11-04", 1.0)
+    await db.record_embedding_usage(conn, "2026-11-04", "voyage-4-lite", 10_000, 0.5)
+
+
+async def test_build_digest_header_has_yesterday_date(conn):
+    await _seed_activity(conn)
+    out = await costs.build_digest(conn, TODAY)
+    assert "2026-11-04" in out
+
+
+async def test_build_digest_yesterday_total_batches_tokens(conn):
+    await _seed_activity(conn)
+    out = await costs.build_digest(conn, TODAY)
+    assert "$1.50" in out  # 1.00 scoring + 0.50 embedding
+    assert "1 batches" in out or "1 batch" in out
+    assert "1.0M" in out  # input tokens
+
+
+async def test_build_digest_month_to_date_includes_earlier_days_same_month(conn):
+    await _seed_activity(conn)
+    out = await costs.build_digest(conn, TODAY)
+    assert "month" in out.lower()
+    assert "$3.50" in out  # 2.00 + 1.00 + 0.50
+    assert "$103.50" not in out  # previous month excluded
+
+
+async def test_build_digest_includes_change_event_since_yesterday(conn):
+    await _seed_activity(conn)
+    await conn.execute(
+        "INSERT INTO cost_events (ts, kind, key, old_value, new_value) VALUES (?, ?, ?, ?, ?)",
+        ("2026-11-04T10:00:00Z", "setting", "claude_model", "claude-haiku-4-5", "claude-haiku-5-5"),
+    )
+    await conn.execute(
+        "INSERT INTO cost_events (ts, kind, key, old_value, new_value) VALUES (?, ?, ?, ?, ?)",
+        ("2026-10-01T10:00:00Z", "setting", "voyage_model", "old-v", "new-v"),
+    )
+    await conn.commit()
+    out = await costs.build_digest(conn, TODAY)
+    assert "Changes since last digest:" in out
+    assert "  ⚙ claude_model: claude-haiku-4-5 → claude-haiku-5-5" in out
+    assert "voyage_model" not in out
+
+
+async def test_build_digest_no_changes_no_changes_header(conn):
+    await _seed_activity(conn)
+    out = await costs.build_digest(conn, TODAY)
+    assert "Changes since last digest" not in out
+
+
+async def test_build_digest_reconciliation_line_signed_percent(conn):
+    await _seed_activity(conn)
+    await db.save_reconciliation(conn, "2026-11-04", billed_usd=1.65, estimated_usd=1.5)
+    out = await costs.build_digest(conn, TODAY)
+    assert "billed $1.65 vs est. $1.50 (Δ +10.0%)" in out
+
+
+async def test_build_digest_reconciliation_negative_percent(conn):
+    await _seed_activity(conn)
+    await db.save_reconciliation(conn, "2026-11-04", billed_usd=1.35, estimated_usd=1.5)
+    out = await costs.build_digest(conn, TODAY)
+    assert "(Δ -10.0%)" in out
+
+
+async def test_build_digest_reconciliation_absent_no_line(conn):
+    await _seed_activity(conn)
+    out = await costs.build_digest(conn, TODAY)
+    assert "billed" not in out
+
+
+async def test_build_digest_reconciliation_zero_estimate_prints_na(conn):
+    await _seed_activity(conn)
+    await db.save_reconciliation(conn, "2026-11-04", billed_usd=0.5, estimated_usd=0.0)
+    out = await costs.build_digest(conn, TODAY)
+    assert "n/a" in out
+    assert "billed $0.50 vs est. $0.00" in out
+
+
+async def test_build_digest_no_activity_still_produced(conn):
+    out = await costs.build_digest(conn, TODAY)
+    assert out
+    assert "2026-11-04" in out
+    assert "No API activity" in out
+
+
+async def test_build_digest_activity_has_no_no_activity_line(conn):
+    await _seed_activity(conn)
+    assert "No API activity" not in await costs.build_digest(conn, TODAY)
+
+
+async def test_build_digest_unpriced_batch_shown_not_as_zero(conn):
+    await _seed_batch(conn, "b-unpriced", "2026-11-04", None)
+    out = await costs.build_digest(conn, TODAY)
+    assert "1 unpriced" in out
+
+
+async def test_build_digest_month_boundary_yesterday_in_previous_month(conn):
+    await _seed_batch(conn, "b-oct", "2026-10-31", 4.0)
+    await _seed_batch(conn, "b-nov", "2026-11-01", 50.0)
+    out = await costs.build_digest(conn, "2026-11-01")  # yesterday = 2026-10-31
+    assert "2026-10-31" in out
+    assert "$4.00" in out
+    assert "$54.00" not in out

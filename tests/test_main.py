@@ -2099,3 +2099,146 @@ async def test_population_worker_swallows_collect_failure_and_continues(conn, ca
 
     assert collect.await_count == 2
     assert record.await_count == 1  # only the second iteration succeeded
+
+
+# ---------------------------------------------------------------------------
+# digest_worker
+# ---------------------------------------------------------------------------
+
+from datetime import timezone as _tz
+
+
+def _digest_now(day="2026-11-05", hour=0, minute=10):
+    y, m, d = (int(x) for x in day.split("-"))
+    return lambda: datetime(y, m, d, hour, minute, tzinfo=_tz.utc)
+
+
+@pytest.fixture
+async def digest_conn():
+    async with aiosqlite.connect(":memory:") as c:
+        await init_db(c)
+        yield c
+
+
+async def test_digest_worker_sends_once_and_records_last_sent(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    sleep = AsyncMock()
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=sleep, iterations=1)
+    bot.send_message.assert_awaited_once()
+    args = bot.send_message.await_args.args
+    assert args[0] == 99
+    assert "2026-11-04" in args[1]
+    assert (await _db.get_setting_snapshot(digest_conn))["digest_last_sent"] == "2026-11-05"
+    sleep.assert_awaited_once()
+
+
+async def test_digest_worker_does_not_resend_same_day(digest_conn):
+    from ahsoka.main import digest_worker
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    sleep = AsyncMock()
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=sleep, iterations=2)
+    assert bot.send_message.await_count == 1
+
+
+async def test_digest_worker_no_resend_after_restart_same_day(digest_conn):
+    from ahsoka.main import digest_worker
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    for _ in range(2):  # two "process lifetimes" sharing the same DB
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    assert bot.send_message.await_count == 1
+
+
+async def test_digest_worker_sends_again_next_day(digest_conn):
+    from ahsoka.main import digest_worker
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now("2026-11-05"), sleep_fn=AsyncMock(), iterations=1)
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now("2026-11-06"), sleep_fn=AsyncMock(), iterations=1)
+    assert bot.send_message.await_count == 2
+    assert "2026-11-05" in bot.send_message.await_args.args[1]
+
+
+async def test_digest_worker_failed_send_not_recorded_and_retried(digest_conn, caplog):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock(side_effect=[RuntimeError("telegram down"), None])
+    sleep = AsyncMock()
+    with caplog.at_level(logging.WARNING, logger="ahsoka.main"):
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=sleep, iterations=1)
+    snap = await _db.get_setting_snapshot(digest_conn)
+    assert not snap or "digest_last_sent" not in snap
+    assert any("telegram down" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+
+    # next loop retries and succeeds
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=sleep, iterations=1)
+    assert bot.send_message.await_count == 2
+    assert (await _db.get_setting_snapshot(digest_conn))["digest_last_sent"] == "2026-11-05"
+
+
+async def test_digest_worker_failure_does_not_stop_later_iterations(digest_conn):
+    from ahsoka.main import digest_worker
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock(side_effect=[RuntimeError("boom"), None])
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=2)
+    assert bot.send_message.await_count == 2
+
+
+async def test_digest_worker_log_bot_none_logs_and_records(digest_conn, caplog):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    with caplog.at_level(logging.INFO, logger="ahsoka.main"):
+        await digest_worker(digest_conn, None, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    assert any("2026-11-04" in r.getMessage() and r.levelno == logging.INFO for r in caplog.records)
+    assert (await _db.get_setting_snapshot(digest_conn))["digest_last_sent"] == "2026-11-05"
+
+
+async def test_digest_worker_build_failure_swallowed_and_not_recorded(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    with patch("ahsoka.main.build_digest", new=AsyncMock(side_effect=RuntimeError("db gone"))):
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    bot.send_message.assert_not_awaited()
+    snap = await _db.get_setting_snapshot(digest_conn)
+    assert not snap or "digest_last_sent" not in snap
+
+
+async def test_digest_worker_preserves_tracked_settings_in_snapshot(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    await _db.save_setting_snapshot(digest_conn, {"claude_model": "claude-haiku-5-5"})
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    snap = await _db.get_setting_snapshot(digest_conn)
+    assert snap["claude_model"] == "claude-haiku-5-5"
+    assert snap["digest_last_sent"] == "2026-11-05"
+
+
+async def test_digest_worker_sleeps_until_next_0005_utc(digest_conn):
+    from ahsoka.main import digest_worker
+
+    sleep = AsyncMock()
+    # 2026-11-05 23:00 UTC -> next 00:05 UTC is 1h05m = 3900s away
+    await digest_worker(
+        digest_conn, None, 99,
+        now_fn=_digest_now("2026-11-05", 23, 0), sleep_fn=sleep, iterations=1,
+    )
+    secs = sleep.await_args.args[0]
+    assert secs == pytest.approx(3900, abs=60)
