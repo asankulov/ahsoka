@@ -2242,3 +2242,48 @@ async def test_digest_worker_sleeps_until_next_0005_utc(digest_conn):
     )
     secs = sleep.await_args.args[0]
     assert secs == pytest.approx(3900, abs=60)
+
+
+async def test_digest_worker_reconciles_yesterday_before_building_digest(digest_conn):
+    from ahsoka.main import digest_worker
+
+    order = []
+
+    async def fake_reconcile(conn, day):
+        order.append(("reconcile", day))
+
+    async def fake_build(conn, today):
+        order.append(("build", today))
+        return "digest text"
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    with patch("ahsoka.main.reconcile_day", side_effect=fake_reconcile) as rec, \
+         patch("ahsoka.main.build_digest", side_effect=fake_build):
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    rec.assert_awaited_once()
+    assert rec.await_args.args == (digest_conn, "2026-11-04")
+    assert order == [("reconcile", "2026-11-04"), ("build", "2026-11-05")]
+    bot.send_message.assert_awaited_once_with(99, "digest text")
+
+
+async def test_digest_worker_reconcile_failure_does_not_block_digest(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    with patch("ahsoka.main.reconcile_day", new=AsyncMock(side_effect=RuntimeError("admin api down"))):
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=1)
+    bot.send_message.assert_awaited_once()
+    assert (await _db.get_setting_snapshot(digest_conn))["digest_last_sent"] == "2026-11-05"
+
+
+async def test_digest_worker_skips_reconcile_when_already_sent(digest_conn):
+    from ahsoka.main import digest_worker
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    with patch("ahsoka.main.reconcile_day", new=AsyncMock()) as rec:
+        await digest_worker(digest_conn, bot, 99, now_fn=_digest_now(), sleep_fn=AsyncMock(), iterations=2)
+    assert rec.await_count == 1
