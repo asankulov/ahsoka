@@ -61,3 +61,76 @@ def embed_cost_for(model: str, tokens: int) -> float | None:
     if price is None:
         return None
     return tokens * price
+
+
+# --- Change tracking: cost-relevant settings and population ---
+
+TRACKED_SETTINGS: tuple[str, ...] = (
+    "claude_model",
+    "repost_mode",
+    "repost_threshold",
+    "batch_flush_size",
+    "batch_flush_seconds",
+    "voyage_model",
+    "repost_dimensions",
+    "default_score_threshold",
+)
+
+_POP_REL_THRESHOLD = 0.20
+_POP_ABS_THRESHOLD = 2
+
+
+async def record_setting_changes(conn, settings) -> int:
+    """Diff tracked settings against the stored snapshot; write 'setting' events.
+
+    A run is "first" when no tracked key is stored yet (other keys such as
+    digest_last_sent may share the table). First runs only save the snapshot.
+    Returns the number of events written.
+    """
+    # Lazy import: database.py imports this module, so a top-level import would cycle.
+    from ahsoka import database as db
+
+    current = {k: str(getattr(settings, k)) for k in TRACKED_SETTINGS}
+    stored = await db.get_setting_snapshot(conn) or {}
+    is_first = not any(k in stored for k in TRACKED_SETTINGS)
+
+    written = 0
+    if not is_first:
+        for k in TRACKED_SETTINGS:
+            old = stored.get(k)
+            if old != current[k]:
+                await db.add_cost_event(conn, "setting", k, old, current[k])
+                written += 1
+    await db.save_setting_snapshot(conn, current)
+    return written
+
+
+async def record_population(conn, day: str, users: int, channels: int, keywords: int) -> int:
+    """Write 'population' events for metrics that moved >=20% and >=2 absolute.
+
+    Always saves the new snapshot; the first snapshot writes no events.
+    """
+    from ahsoka import database as db  # lazy: avoids database <-> costs import cycle
+
+    new = {"users": users, "channels": channels, "keywords": keywords}
+    last = await db.get_last_population_snapshot(conn)
+    written = 0
+    if last is not None:
+        for key, value in new.items():
+            old = last[key]
+            diff = abs(value - old)
+            if diff < _POP_ABS_THRESHOLD:
+                continue
+            if old == 0 or diff / old >= _POP_REL_THRESHOLD:
+                await db.add_cost_event(conn, "population", key, str(old), str(value))
+                written += 1
+    await db.save_population_snapshot(conn, day, users, channels, keywords)
+    return written
+
+
+async def collect_population(conn, keyword_index, watched_channels) -> tuple[int, int, int]:
+    """Return (non-banned users, watched channels, union keywords)."""
+    from ahsoka import database as db  # lazy: avoids database <-> costs import cycle
+
+    users = [u for u in await db.list_users(conn) if not u.is_banned]
+    return len(users), len(watched_channels), keyword_index.keyword_count

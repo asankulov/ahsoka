@@ -13,6 +13,10 @@ class KeywordIndex:
         self._union: set[str] = set()
         self._any_empty: bool = True
 
+    @property
+    def keyword_count(self) -> int:
+        return len(self._union)
+
     async def rebuild(self, conn: aiosqlite.Connection) -> None:
         configs = await db.get_all_active_configs(conn)
         self._any_empty = any(not c.keywords.strip() for c in configs)

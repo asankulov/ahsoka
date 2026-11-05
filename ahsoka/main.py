@@ -29,7 +29,7 @@ from ahsoka.pipeline.batch_queue import BatchQueue
 from ahsoka.pipeline.batch_submitter import BatchSubmitter
 from ahsoka.bot.commands import register_bot_commands, BOT_COMMANDS
 from ahsoka.bot.notifier import send_notification
-from ahsoka.pipeline import embedder
+from ahsoka.pipeline import costs, embedder
 from ahsoka.pipeline.costs import embed_cost_for
 from ahsoka.pipeline.embedder import embed, take_token_count
 from ahsoka.pipeline.repost_detector import check_and_store
@@ -307,6 +307,27 @@ async def cleanup_worker(conn: aiosqlite.Connection) -> None:
         logger.info("Voyage usage: %d tokens in last 24h", take_token_count())
 
 
+async def population_worker(
+    conn: aiosqlite.Connection,
+    keyword_index: KeywordIndex,
+    watched_channels,
+    *,
+    interval_s: float = 86_400.0,
+    iterations: int | None = None,
+) -> None:
+    """Daily population snapshot for cost-change tracking. Fails open."""
+    done = 0
+    while iterations is None or done < iterations:
+        try:
+            counts = await costs.collect_population(conn, keyword_index, watched_channels)
+            day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            await costs.record_population(conn, day, *counts)
+        except Exception as exc:
+            logger.warning("Population snapshot failed: %s", exc)
+        done += 1
+        await asyncio.sleep(interval_s)
+
+
 async def _recover_pending_batches(
     conn: aiosqlite.Connection,
     bot: Bot,
@@ -370,6 +391,10 @@ def make_embedding_usage_sink(
 async def main() -> None:
     conn = await aiosqlite.connect(settings.db_path)
     await db.init_db(conn, owner_chat_id=settings.owner_chat_id)
+    try:
+        await costs.record_setting_changes(conn, settings)
+    except Exception as exc:
+        logger.warning("Setting change tracking failed: %s", exc)
     embedder.set_usage_sink(make_embedding_usage_sink(conn))
     await db.seed_channels(conn, settings.channel_ids)
 
@@ -457,6 +482,9 @@ async def main() -> None:
         batch_worker(conn, bot, submitter, batch_queue)
     )
     cleanup = asyncio.create_task(cleanup_worker(conn))
+    population = asyncio.create_task(
+        population_worker(conn, keyword_index, watched_channels)
+    )
 
     async with pyro:
         # Warm the peer cache in the background; the poller waits for it.
@@ -477,7 +505,7 @@ async def main() -> None:
                 conn=conn,
             )
         )
-        all_tasks = [polling, poller, warm_task, cleanup, batch_task, recovery_task, *workers]
+        all_tasks = [polling, poller, warm_task, cleanup, population, batch_task, recovery_task, *workers]
         try:
             await asyncio.gather(*all_tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):
