@@ -1,9 +1,11 @@
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Literal
 
 import aiosqlite
 
+from ahsoka.pipeline.costs import cost_for
 from ahsoka.models import NotifiedPost, PersonalizedVerdict, User, UserConfig
 
 logger = logging.getLogger(__name__)
@@ -94,6 +96,41 @@ CREATE TABLE IF NOT EXISTS batch_usage (
     cache_read_input_tokens     INTEGER NOT NULL DEFAULT 0,
     succeeded                   INTEGER NOT NULL DEFAULT 0,
     recorded_at                 TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS embedding_usage (
+    day      TEXT NOT NULL,
+    model    TEXT NOT NULL,
+    tokens   INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL,
+    PRIMARY KEY (day, model)
+);
+
+CREATE TABLE IF NOT EXISTS cost_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        TEXT NOT NULL,
+    kind      TEXT NOT NULL,
+    key       TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS setting_snapshot (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daily_snapshots (
+    day      TEXT PRIMARY KEY,
+    users    INTEGER NOT NULL,
+    channels INTEGER NOT NULL,
+    keywords INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cost_reconciliation (
+    day           TEXT PRIMARY KEY,
+    billed_usd    REAL NOT NULL,
+    estimated_usd REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS post_embeddings (
@@ -229,6 +266,17 @@ async def init_db(conn: aiosqlite.Connection, owner_chat_id: int = 0) -> None:
         except aiosqlite.OperationalError:
             pass  # column already exists
 
+    # Add cost columns to batch_usage if upgrading (guarded: idempotent)
+    async with conn.execute("PRAGMA table_info(batch_usage)") as cur:
+        usage_cols = {row[1] for row in await cur.fetchall()}
+    if "cost_usd" not in usage_cols:
+        await conn.execute("ALTER TABLE batch_usage ADD COLUMN cost_usd REAL")
+    if "estimated" not in usage_cols:
+        await conn.execute(
+            "ALTER TABLE batch_usage ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0"
+        )
+    await conn.commit()
+
     # Ensure owner exists as admin
     if owner_chat_id:
         await conn.execute(
@@ -240,6 +288,33 @@ async def init_db(conn: aiosqlite.Connection, owner_chat_id: int = 0) -> None:
             (owner_chat_id,),
         )
         await conn.commit()
+
+    await backfill_batch_costs(conn)
+
+
+async def backfill_batch_costs(conn: aiosqlite.Connection) -> int:
+    """Price pre-existing batch_usage rows (cost_usd IS NULL). Returns rows updated.
+
+    Priced rows get estimated=1; unknown-model rows stay NULL. Idempotent.
+    """
+    async with conn.execute(
+        """SELECT batch_id, model, input_tokens, output_tokens,
+                  cache_creation_input_tokens, cache_read_input_tokens
+           FROM batch_usage WHERE cost_usd IS NULL"""
+    ) as cur:
+        rows = await cur.fetchall()
+    updated = 0
+    for batch_id, model, inp, out, cw, cr in rows:
+        cost = cost_for(model, inp, out, cw, cr)
+        if cost is None:
+            continue
+        await conn.execute(
+            "UPDATE batch_usage SET cost_usd = ?, estimated = 1 WHERE batch_id = ?",
+            (cost, batch_id),
+        )
+        updated += 1
+    await conn.commit()
+    return updated
 
 
 async def seed_channels(conn: aiosqlite.Connection, channel_ids: list[int]) -> None:
@@ -793,6 +868,7 @@ async def save_batch_usage(
     cache_creation_input_tokens: int,
     cache_read_input_tokens: int,
     succeeded: int,
+    cost_usd: float | None = None,
 ) -> None:
     """Persist aggregated token counts for a completed batch."""
     recorded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -800,12 +876,12 @@ async def save_batch_usage(
         """INSERT OR REPLACE INTO batch_usage
            (batch_id, model, input_tokens, output_tokens,
             cache_creation_input_tokens, cache_read_input_tokens,
-            succeeded, recorded_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            succeeded, recorded_at, cost_usd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             batch_id, model, input_tokens, output_tokens,
             cache_creation_input_tokens, cache_read_input_tokens,
-            succeeded, recorded_at,
+            succeeded, recorded_at, cost_usd,
         ),
     )
     await conn.commit()
@@ -836,3 +912,168 @@ async def get_total_usage(conn: aiosqlite.Connection) -> dict:
         }
         for row in rows
     }
+
+
+# --- Cost tracking: embeddings, events, snapshots, buckets, reconciliation ---
+
+
+async def record_embedding_usage(
+    conn: aiosqlite.Connection,
+    day: str,
+    model: str,
+    tokens: int,
+    cost_usd: float | None,
+) -> None:
+    """Accumulate embedding tokens/cost per (day, model)."""
+    await conn.execute(
+        """INSERT INTO embedding_usage (day, model, tokens, cost_usd)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(day, model) DO UPDATE SET
+               tokens = tokens + excluded.tokens,
+               cost_usd = CASE
+                   WHEN cost_usd IS NULL AND excluded.cost_usd IS NULL THEN NULL
+                   ELSE COALESCE(cost_usd, 0) + COALESCE(excluded.cost_usd, 0)
+               END""",
+        (day, model, tokens, cost_usd),
+    )
+    await conn.commit()
+
+
+async def add_cost_event(
+    conn: aiosqlite.Connection,
+    kind: str,
+    key: str,
+    old_value: str | None,
+    new_value: str | None,
+) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    await conn.execute(
+        "INSERT INTO cost_events (ts, kind, key, old_value, new_value) VALUES (?, ?, ?, ?, ?)",
+        (ts, kind, key, old_value, new_value),
+    )
+    await conn.commit()
+
+
+async def list_cost_events(
+    conn: aiosqlite.Connection, since: str, until: str
+) -> list[dict]:
+    async with conn.execute(
+        """SELECT ts, kind, key, old_value, new_value FROM cost_events
+           WHERE ts >= ? AND ts <= ? ORDER BY ts, id""",
+        (since, until),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [
+        {"ts": r[0], "kind": r[1], "key": r[2], "old_value": r[3], "new_value": r[4]}
+        for r in rows
+    ]
+
+
+async def get_setting_snapshot(conn: aiosqlite.Connection) -> dict[str, str] | None:
+    async with conn.execute("SELECT key, value FROM setting_snapshot") as cur:
+        rows = await cur.fetchall()
+    if not rows:
+        return None
+    return {r[0]: r[1] for r in rows}
+
+
+async def save_setting_snapshot(
+    conn: aiosqlite.Connection, values: dict[str, str]
+) -> None:
+    """Upsert keys; never deletes other keys sharing the table."""
+    for k, v in values.items():
+        await conn.execute(
+            """INSERT INTO setting_snapshot (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (k, v),
+        )
+    await conn.commit()
+
+
+async def save_population_snapshot(
+    conn: aiosqlite.Connection, day: str, users: int, channels: int, keywords: int
+) -> None:
+    await conn.execute(
+        "INSERT OR REPLACE INTO daily_snapshots (day, users, channels, keywords) VALUES (?, ?, ?, ?)",
+        (day, users, channels, keywords),
+    )
+    await conn.commit()
+
+
+async def get_last_population_snapshot(conn: aiosqlite.Connection) -> dict | None:
+    async with conn.execute(
+        "SELECT day, users, channels, keywords FROM daily_snapshots ORDER BY day DESC LIMIT 1"
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {"day": row[0], "users": row[1], "channels": row[2], "keywords": row[3]}
+
+
+_BUCKET_LEN = {"day": 10, "month": 7, "year": 4}
+
+
+async def get_cost_buckets(
+    conn: aiosqlite.Connection,
+    granularity: Literal["day", "month", "year"],
+    limit: int,
+) -> list[dict]:
+    """UTC-bucketed cost/usage, newest first. Unpriced batches are counted, not summed."""
+    n = _BUCKET_LEN[granularity]
+    buckets: dict[str, dict] = {}
+
+    def _get(b: str) -> dict:
+        return buckets.setdefault(b, {
+            "bucket": b, "scoring_usd": 0.0, "embedding_usd": 0.0,
+            "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+            "embedding_tokens": 0, "batches": 0, "succeeded": 0,
+            "unpriced_batches": 0,
+        })
+
+    async with conn.execute(
+        f"""SELECT substr(recorded_at, 1, {n}) AS b,
+                   COALESCE(SUM(cost_usd), 0),
+                   SUM(input_tokens), SUM(output_tokens),
+                   SUM(cache_read_input_tokens),
+                   COUNT(*), SUM(succeeded),
+                   SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END)
+            FROM batch_usage GROUP BY b"""
+    ) as cur:
+        for r in await cur.fetchall():
+            d = _get(r[0])
+            d.update(
+                scoring_usd=r[1] or 0.0, input_tokens=r[2] or 0,
+                output_tokens=r[3] or 0, cache_read_tokens=r[4] or 0,
+                batches=r[5] or 0, succeeded=r[6] or 0, unpriced_batches=r[7] or 0,
+            )
+
+    async with conn.execute(
+        f"""SELECT substr(day, 1, {n}) AS b, COALESCE(SUM(cost_usd), 0), SUM(tokens)
+            FROM embedding_usage GROUP BY b"""
+    ) as cur:
+        for r in await cur.fetchall():
+            d = _get(r[0])
+            d["embedding_usd"] = r[1] or 0.0
+            d["embedding_tokens"] = r[2] or 0
+
+    return sorted(buckets.values(), key=lambda x: x["bucket"], reverse=True)[:limit]
+
+
+async def save_reconciliation(
+    conn: aiosqlite.Connection, day: str, billed_usd: float, estimated_usd: float
+) -> None:
+    await conn.execute(
+        "INSERT OR REPLACE INTO cost_reconciliation (day, billed_usd, estimated_usd) VALUES (?, ?, ?)",
+        (day, billed_usd, estimated_usd),
+    )
+    await conn.commit()
+
+
+async def get_reconciliation(conn: aiosqlite.Connection, day: str) -> dict | None:
+    async with conn.execute(
+        "SELECT billed_usd, estimated_usd FROM cost_reconciliation WHERE day = ?", (day,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {"billed_usd": row[0], "estimated_usd": row[1]}
