@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # Pyrogram's sync.py calls asyncio.get_event_loop() at import time.
 # On Python 3.12+ there is no implicit event loop, so we create one first.
@@ -30,7 +30,7 @@ from ahsoka.pipeline.batch_submitter import BatchSubmitter
 from ahsoka.bot.commands import register_bot_commands, BOT_COMMANDS
 from ahsoka.bot.notifier import send_notification
 from ahsoka.pipeline import costs, embedder
-from ahsoka.pipeline.costs import embed_cost_for
+from ahsoka.pipeline.costs import build_digest, embed_cost_for
 from ahsoka.pipeline.embedder import embed, take_token_count
 from ahsoka.pipeline.repost_detector import check_and_store
 from ahsoka.pipeline.tg_resolver import is_tg_link, resolve_tg_link
@@ -328,6 +328,41 @@ async def population_worker(
         await asyncio.sleep(interval_s)
 
 
+async def digest_worker(
+    conn: aiosqlite.Connection,
+    log_bot: Bot | None,
+    chat_id: int,
+    *,
+    now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    iterations: int | None = None,
+) -> None:
+    """Send the daily cost digest once per UTC day, after 00:05Z. Fails open."""
+    done = 0
+    while iterations is None or done < iterations:
+        now = now_fn()
+        try:
+            today = now.strftime("%Y-%m-%d")
+            due = (now.hour, now.minute) >= (0, 5)
+            snap = await db.get_setting_snapshot(conn) or {}
+            if due and snap.get("digest_last_sent") != today:
+                text = await build_digest(conn, today)
+                if log_bot is not None:
+                    await log_bot.send_message(chat_id, text)
+                else:
+                    logger.info("Daily cost digest:\n%s", text)
+                await db.save_setting_snapshot(conn, {"digest_last_sent": today})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Daily cost digest failed: %s", exc)
+        done += 1
+        target = now.replace(hour=0, minute=5, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await sleep_fn((target - now).total_seconds())
+
+
 async def _recover_pending_batches(
     conn: aiosqlite.Connection,
     bot: Bot,
@@ -485,6 +520,9 @@ async def main() -> None:
     population = asyncio.create_task(
         population_worker(conn, keyword_index, watched_channels)
     )
+    digest = asyncio.create_task(
+        digest_worker(conn, log_bot, settings.owner_chat_id)
+    )
 
     async with pyro:
         # Warm the peer cache in the background; the poller waits for it.
@@ -505,7 +543,7 @@ async def main() -> None:
                 conn=conn,
             )
         )
-        all_tasks = [polling, poller, warm_task, cleanup, population, batch_task, recovery_task, *workers]
+        all_tasks = [polling, poller, warm_task, cleanup, population, digest, batch_task, recovery_task, *workers]
         try:
             await asyncio.gather(*all_tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):

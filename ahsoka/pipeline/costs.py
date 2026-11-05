@@ -184,3 +184,64 @@ def format_buckets(buckets: list[dict], events: list[dict], granularity: str) ->
             old = ev["old_value"] if ev["old_value"] is not None else "\u2013"
             lines.append(f"  {icon} {ev['key']}: {old} \u2192 {ev['new_value']}")
     return "\n".join(lines)
+
+
+# --- Daily digest ---
+
+
+async def build_digest(conn, today: str) -> str:
+    """Plain-text digest of yesterday's cost, month-to-date and recent changes.
+
+    `today` is a UTC date (YYYY-MM-DD); the digest covers the previous UTC day.
+    """
+    from datetime import date, timedelta
+
+    from ahsoka import database as db  # lazy: avoids database <-> costs import cycle
+
+    yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+    month = yesterday[:7]
+
+    days = await db.get_cost_buckets(conn, "day", 400)
+    months = await db.get_cost_buckets(conn, "month", 24)
+    day_b = next((b for b in days if b["bucket"] == yesterday), None)
+    month_b = next((b for b in months if b["bucket"] == month), None)
+
+    lines = [f"Daily cost digest · {yesterday}"]
+    if day_b is None:
+        lines.append("No API activity.")
+    else:
+        total = day_b["scoring_usd"] + day_b["embedding_usd"]
+        parts = [
+            f"Yesterday: {_fmt_usd(total)}",
+            f"scoring {_fmt_usd(day_b['scoring_usd'])} + embed {_fmt_usd(day_b['embedding_usd'])}",
+            f"{day_b['batches']} batches",
+            f"{fmt_tokens(day_b['input_tokens'])} in / {fmt_tokens(day_b['output_tokens'])} out",
+        ]
+        if day_b["unpriced_batches"]:
+            parts.append(f"{day_b['unpriced_batches']} unpriced")
+        lines.append(" · ".join(parts))
+
+    if month_b is not None:
+        mtotal = month_b["scoring_usd"] + month_b["embedding_usd"]
+        line = f"Month to date ({month}): {_fmt_usd(mtotal)}"
+        if month_b["unpriced_batches"]:
+            line += f" · {month_b['unpriced_batches']} unpriced"
+        lines.append(line)
+
+    rec = await db.get_reconciliation(conn, yesterday)
+    if rec is not None:
+        billed, est = rec["billed_usd"], rec["estimated_usd"]
+        drift = f"{(billed - est) / est * 100:+.1f}%" if est else "n/a"
+        lines.append(
+            f"Reconciliation: billed {_fmt_usd(billed)} vs est. {_fmt_usd(est)} (Δ {drift})"
+        )
+
+    events = await db.list_cost_events(conn, f"{yesterday}T00:00:00Z", f"{today}T23:59:59Z")
+    if events:
+        lines.append("")
+        lines.append("Changes since last digest:")
+        for ev in events:
+            icon = _EVENT_ICONS.get(ev["kind"], "•")
+            old = ev["old_value"] if ev["old_value"] is not None else "–"
+            lines.append(f"  {icon} {ev['key']}: {old} → {ev['new_value']}")
+    return "\n".join(lines)
