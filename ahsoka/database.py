@@ -914,6 +914,17 @@ async def get_total_usage(conn: aiosqlite.Connection) -> dict:
     }
 
 
+async def get_total_cost(conn: aiosqlite.Connection) -> dict:
+    """Sum of stored per-batch cost_usd plus the count of batches with no cost."""
+    async with conn.execute(
+        """SELECT COALESCE(SUM(cost_usd), 0),
+                  COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END), 0)
+           FROM batch_usage"""
+    ) as cur:
+        row = await cur.fetchone()
+    return {"cost_usd": row[0] or 0.0, "unpriced_batches": row[1] or 0}
+
+
 # --- Cost tracking: embeddings, events, snapshots, buckets, reconciliation ---
 
 

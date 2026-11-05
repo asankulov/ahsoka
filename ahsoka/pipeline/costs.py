@@ -134,3 +134,53 @@ async def collect_population(conn, keyword_index, watched_channels) -> tuple[int
 
     users = [u for u in await db.list_users(conn) if not u.is_banned]
     return len(users), len(watched_channels), keyword_index.keyword_count
+
+
+# --- Formatting for /stats ---
+
+
+def fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}K"
+    return str(n)
+
+
+def _fmt_usd(x: float) -> str:
+    if 0 < x < 0.01:
+        return f"${x:.4f}"
+    return f"${x:.2f}"
+
+
+_EVENT_ICONS = {"setting": "\u2699", "population": "\U0001F465"}
+
+
+def format_buckets(buckets: list[dict], events: list[dict], granularity: str) -> str:
+    """Render cost buckets (newest first) with change events under their bucket."""
+    if not buckets:
+        return "No cost data yet."
+    lines: list[str] = []
+    for b in buckets:
+        label = b["bucket"]
+        total = b["scoring_usd"] + b["embedding_usd"]
+        parts = [
+            f"{label} \u00b7 {_fmt_usd(total)}",
+            f"scoring {_fmt_usd(b['scoring_usd'])} + embed {_fmt_usd(b['embedding_usd'])}",
+            f"{b['batches']} batches",
+        ]
+        if b["succeeded"] > 0:
+            parts.append(f"{_fmt_usd(total / b['succeeded'])}/post")
+        parts.append(
+            f"{fmt_tokens(b['input_tokens'])} in / {fmt_tokens(b['output_tokens'])} out"
+        )
+        if b["unpriced_batches"]:
+            parts.append(f"{b['unpriced_batches']} unpriced")
+        lines.append(" \u00b7 ".join(parts))
+        for ev in events:
+            if ev["ts"][: len(label)] != label:
+                continue
+            icon = _EVENT_ICONS.get(ev["kind"], "\u2022")
+            old = ev["old_value"] if ev["old_value"] is not None else "\u2013"
+            lines.append(f"  {icon} {ev['key']}: {old} \u2192 {ev['new_value']}")
+    return "\n".join(lines)

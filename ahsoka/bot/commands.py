@@ -19,19 +19,12 @@ from ahsoka import database as db
 from ahsoka.bot.export import entities_to_markdown, parse_range, render_markdown
 from ahsoka.config import Settings
 from ahsoka.models import Post
-from ahsoka.pipeline.costs import price_for as _pricing_for
+from ahsoka.pipeline.costs import fmt_tokens as _fmt_tokens
+from ahsoka.pipeline.costs import format_buckets, price_for as _pricing_for
 from ahsoka.pipeline.keyword_index import KeywordIndex
 from ahsoka.text_utils import slice_utf16
 
 logger = logging.getLogger(__name__)
-
-def _fmt_tokens(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.0f}K"
-    return str(n)
-
 
 class WaitingForInput(StatesGroup):
     setstack      = State()
@@ -927,6 +920,29 @@ def register_bot_commands(
     @admin_router.message(Command("stats"))
     async def cmd_stats(message: Message, state: FSMContext) -> None:
         await state.clear()
+        parts = (message.text or "").split()
+        arg = parts[1].lower() if len(parts) > 1 else None
+        if arg is not None:
+            limits = {"day": 14, "month": 12, "year": 5}
+            if arg not in limits:
+                await message.reply("Usage: /stats [day|month|year]")
+                return
+            buckets = await db.get_cost_buckets(conn, arg, limits[arg])
+            events: list[dict] = []
+            if buckets:
+                oldest = buckets[-1]["bucket"]
+                since = {
+                    "day": f"{oldest}T00:00:00Z",
+                    "month": f"{oldest}-01T00:00:00Z",
+                    "year": f"{oldest}-01-01T00:00:00Z",
+                }[arg]
+                until = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                events = await db.list_cost_events(conn, since, until)
+            text = format_buckets(buckets, events, arg)
+            if len(text) > 4096:
+                text = text[:4094].rsplit("\n", 1)[0] + "\n\u2026"
+            await message.reply(text)
+            return
         users = await db.list_users(conn)
         active = [u for u in users if not u.is_banned]
         async with conn.execute("SELECT COUNT(*) FROM seen_posts") as cur:
@@ -940,34 +956,20 @@ def register_bot_commands(
         if not usage_by_model:
             api_line = "API: no data yet"
         else:
-            total_in = total_out = total_cw = total_cr = total_batches = 0
-            total_cost = 0.0
-            has_unknown_model = False
-            for model, u in usage_by_model.items():
-                in_tok = u["input_tokens"] + u["cache_creation_input_tokens"]
-                out_tok = u["output_tokens"]
-                cr_tok = u["cache_read_input_tokens"]
-                total_in     += in_tok
-                total_out    += out_tok
-                total_cr     += cr_tok
-                total_batches += u["batches"]
-                prices = _pricing_for(model)
-                if prices:
-                    p_in, p_out, p_cw, p_cr = prices
-                    total_cost += (
-                        u["input_tokens"] * p_in
-                        + u["output_tokens"] * p_out
-                        + u["cache_creation_input_tokens"] * p_cw
-                        + u["cache_read_input_tokens"] * p_cr
-                    )
-                else:
-                    has_unknown_model = True
-
+            total_in = sum(
+                u["input_tokens"] + u["cache_creation_input_tokens"] for u in usage_by_model.values()
+            )
+            total_out = sum(u["output_tokens"] for u in usage_by_model.values())
+            total_cr = sum(u["cache_read_input_tokens"] for u in usage_by_model.values())
+            total_batches = sum(u["batches"] for u in usage_by_model.values())
+            cost = await db.get_total_cost(conn)
             cached_part = f" ({_fmt_tokens(total_cr)} cached)" if total_cr > 0 else ""
-            cost_part = f" · est. ${total_cost:.2f}" if not has_unknown_model else " · est. unknown"
+            cost_part = f" \u00b7 est. ${cost['cost_usd']:.2f}"
+            if cost["unpriced_batches"]:
+                cost_part += f" \u00b7 {cost['unpriced_batches']} unpriced"
             api_line = (
                 f"API: {_fmt_tokens(total_in)} in{cached_part} / {_fmt_tokens(total_out)} out"
-                f" · {total_batches} batches{cost_part}"
+                f" \u00b7 {total_batches} batches{cost_part}"
             )
 
         lines = [
