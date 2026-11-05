@@ -193,3 +193,89 @@ async def test_collect_population_excludes_banned_users(conn):
     idx.keyword_count = 7
     users, channels, kws = await costs.collect_population(conn, idx, [101, 102, 103, 104])
     assert (users, channels, kws) == (2, 4, 7)
+
+
+# ---------------------------------------------------------------------------
+# format_buckets
+# ---------------------------------------------------------------------------
+
+
+def _bucket(label="2026-11-05", **kw):
+    b = {
+        "bucket": label, "scoring_usd": 1.0, "embedding_usd": 0.5,
+        "input_tokens": 2_000_000, "output_tokens": 50_000, "cache_read_tokens": 0,
+        "embedding_tokens": 10_000, "batches": 3, "succeeded": 30,
+        "unpriced_batches": 0,
+    }
+    b.update(kw)
+    return b
+
+
+def test_format_buckets_empty_says_no_cost_data():
+    assert "No cost data yet" in costs.format_buckets([], [], "day")
+
+
+def test_format_buckets_shows_label_total_split_and_batches():
+    out = costs.format_buckets([_bucket()], [], "day")
+    assert "2026-11-05" in out
+    assert "$1.50" in out
+    assert "$1.00" in out and "$0.50" in out
+    assert "3 batches" in out
+    assert "2.0M" in out
+
+
+def test_format_buckets_cost_per_post():
+    out = costs.format_buckets([_bucket(scoring_usd=3.0, embedding_usd=0.0, succeeded=30)], [], "day")
+    assert "$0.10" in out  # 3.00 / 30
+
+
+def test_format_buckets_no_per_post_when_none_succeeded():
+    out = costs.format_buckets([_bucket(succeeded=0)], [], "day")
+    assert "per post" not in out.lower()
+
+
+def test_format_buckets_tiny_cost_uses_four_decimals():
+    out = costs.format_buckets(
+        [_bucket(scoring_usd=0.0042, embedding_usd=0.0, succeeded=0)], [], "day"
+    )
+    assert "$0.0042" in out
+
+
+def test_format_buckets_unpriced_shown_not_added():
+    out = costs.format_buckets(
+        [_bucket(scoring_usd=0.0, embedding_usd=0.0, unpriced_batches=2, succeeded=0)], [], "day"
+    )
+    assert "2 unpriced" in out
+
+
+def test_format_buckets_no_unpriced_text_when_zero():
+    assert "unpriced" not in costs.format_buckets([_bucket()], [], "day")
+
+
+def test_format_buckets_setting_event_under_matching_bucket_only():
+    ev = [{"ts": "2026-11-05T10:00:00Z", "kind": "setting", "key": "claude_model",
+           "old_value": "claude-haiku-4-5", "new_value": "claude-haiku-5-5"}]
+    out = costs.format_buckets([_bucket("2026-11-05"), _bucket("2026-11-04")], ev, "day")
+    line = "  ⚙ claude_model: claude-haiku-4-5 → claude-haiku-5-5"
+    assert line in out
+    assert out.index("2026-11-05") < out.index(line) < out.index("2026-11-04")
+
+
+def test_format_buckets_population_event_rendered():
+    ev = [{"ts": "2026-11-05T10:00:00Z", "kind": "population", "key": "users",
+           "old_value": "10", "new_value": "13"}]
+    out = costs.format_buckets([_bucket()], ev, "day")
+    assert "  \U0001F465 users: 10 → 13" in out
+
+
+@pytest.mark.parametrize("gran,label", [("month", "2026-11"), ("year", "2026")])
+def test_format_buckets_event_prefix_match_for_coarser_granularity(gran, label):
+    ev = [{"ts": "2026-11-05T10:00:00Z", "kind": "setting", "key": "k",
+           "old_value": "a", "new_value": "b"}]
+    assert "k: a → b" in costs.format_buckets([_bucket(label)], ev, gran)
+
+
+def test_format_buckets_event_outside_buckets_not_shown():
+    ev = [{"ts": "2026-10-01T10:00:00Z", "kind": "setting", "key": "k",
+           "old_value": "a", "new_value": "b"}]
+    assert "k: a" not in costs.format_buckets([_bucket("2026-11-05")], ev, "day")
