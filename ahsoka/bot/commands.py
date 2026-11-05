@@ -946,8 +946,7 @@ def register_bot_commands(
         active = [u for u in users if not u.is_banned]
         async with conn.execute("SELECT COUNT(*) FROM seen_posts") as cur:
             (total_posts,) = await cur.fetchone()  # type: ignore[misc]
-        async with conn.execute("SELECT COUNT(*) FROM seen_posts WHERE score IS NOT NULL") as cur:
-            (scored_posts,) = await cur.fetchone()  # type: ignore[misc]
+        scored_posts = await db.count_scored_posts(conn)
         async with conn.execute("SELECT COUNT(*) FROM user_notified") as cur:
             (total_notified,) = await cur.fetchone()  # type: ignore[misc]
 

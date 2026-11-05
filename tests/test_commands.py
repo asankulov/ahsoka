@@ -22,7 +22,7 @@ from ahsoka.pipeline.costs import fmt_tokens, price_for
 from ahsoka.config import Settings
 from ahsoka.database import (
     get_user_config, init_db, load_watched_channels, get_or_create_user, get_user,
-    save_batch_usage, mark_notified, store_verdict,
+    save_batch_usage, mark_notified, store_verdict, mark_seen,
 )
 from ahsoka.models import PersonalizedVerdict
 
@@ -1203,6 +1203,48 @@ async def test_stats_summary_keeps_all_lines(conn, settings):
     reply_text = msg.reply.call_args[0][0]
     for prefix in ("Users:", "Channels:", "Posts:", "Notifications:", "API:", "Debug mode:"):
         assert prefix in reply_text
+
+
+async def test_stats_scored_counts_distinct_posts_from_verdicts(conn, settings):
+    """Scored = distinct posts with a verdict (seen_posts.score is never set in batch mode)."""
+    _, h, _ = setup_dp(conn, settings)
+    await mark_seen(conn, CHAN_A, 1)
+    await mark_seen(conn, CHAN_A, 2)
+    await mark_seen(conn, CHAN_A, 3)
+    for uid in (101, 102):  # two users score post 1 -> counts once
+        await store_verdict(
+            conn,
+            PersonalizedVerdict(user_id=uid, score=7, reason="r", matched=True),
+            channel_id=CHAN_A, message_id=1,
+        )
+    await store_verdict(
+        conn,
+        PersonalizedVerdict(user_id=101, score=2, reason="r", matched=False),
+        channel_id=CHAN_A, message_id=2,
+    )
+    msg = make_msg("/stats")
+    await h["cmd_stats"](msg, make_ctx())
+    assert "Posts: 3 seen, 2 scored" in msg.reply.call_args[0][0]
+
+
+async def test_stats_scored_excludes_orphan_verdicts(conn, settings):
+    """Verdicts whose seen_posts row was pruned must not push scored above seen."""
+    _, h, _ = setup_dp(conn, settings)
+    await mark_seen(conn, CHAN_A, 1)
+    await store_verdict(
+        conn,
+        PersonalizedVerdict(user_id=101, score=7, reason="r", matched=True),
+        channel_id=CHAN_A, message_id=1,
+    )
+    for mid in (50, 51):  # orphans: no seen_posts row
+        await store_verdict(
+            conn,
+            PersonalizedVerdict(user_id=101, score=7, reason="r", matched=True),
+            channel_id=CHAN_A, message_id=mid,
+        )
+    msg = make_msg("/stats")
+    await h["cmd_stats"](msg, make_ctx())
+    assert "Posts: 1 seen, 1 scored" in msg.reply.call_args[0][0]
 
 
 async def _seed_cost_data(conn):

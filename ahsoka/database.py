@@ -724,6 +724,24 @@ async def delete_old_posts(conn: aiosqlite.Connection, days: int = 30) -> int:
     return cursor.rowcount  # type: ignore[return-value]
 
 
+async def count_scored_posts(conn: aiosqlite.Connection) -> int:
+    """Count seen_posts rows that have at least one post_verdicts row.
+
+    Counts per seen_posts row (same unit as ``SELECT COUNT(*) FROM seen_posts``),
+    so the result is always <= the seen count. post_verdicts is never pruned
+    while seen_posts is, hence the join direction from seen_posts.
+    """
+    async with conn.execute(
+        """SELECT COUNT(*) FROM seen_posts s
+           WHERE EXISTS (
+               SELECT 1 FROM post_verdicts v
+               WHERE v.channel_id = s.channel_id AND v.message_id = s.message_id
+           )"""
+    ) as cur:
+        (n,) = await cur.fetchone()  # type: ignore[misc]
+    return n
+
+
 # --- Post embeddings (repost detection) ---
 
 
