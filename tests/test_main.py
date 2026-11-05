@@ -2341,3 +2341,66 @@ async def test_digest_worker_event_not_repeated_in_next_day_digest(digest_conn):
     await digest_worker(digest_conn, bot, 99, now_fn=_digest_now("2026-11-06"), sleep_fn=AsyncMock(), iterations=1)
     assert bot.send_message.await_count == 2
     assert "repeat_k" not in bot.send_message.await_args.args[1]
+
+
+def _ticking_now(start=(2026, 11, 5, 0, 10, 0), step_s=60):
+    """now_fn that returns a strictly later time on every call; records call count."""
+    from datetime import timedelta as _td
+
+    base = datetime(*start, tzinfo=_tz.utc)
+    calls = []
+
+    def fn():
+        t = base + _td(seconds=step_s * len(calls))
+        calls.append(t)
+        return t
+
+    fn.calls = calls
+    return fn
+
+
+async def test_digest_worker_saved_ts_is_iteration_start_time(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka import database as _db
+
+    now_fn = _ticking_now()
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    await digest_worker(digest_conn, bot, 99, now_fn=now_fn, sleep_fn=AsyncMock(), iterations=1)
+    snap = await _db.get_setting_snapshot(digest_conn)
+    assert snap["digest_last_sent_ts"] == "2026-11-05T00:10:00Z"
+    assert snap["digest_last_sent"] == "2026-11-05"
+    assert len(now_fn.calls) == 1
+
+
+async def test_digest_worker_calls_now_fn_once_per_iteration(digest_conn):
+    from ahsoka.main import digest_worker
+
+    now_fn = _ticking_now()
+    await digest_worker(digest_conn, None, 99, now_fn=now_fn, sleep_fn=AsyncMock(), iterations=3)
+    assert len(now_fn.calls) == 3
+
+
+async def test_digest_worker_event_written_during_build_shows_in_next_digest(digest_conn):
+    from ahsoka.main import digest_worker
+    from ahsoka.pipeline.costs import build_digest as real_build
+
+    async def build_then_event(conn, today):
+        text = await real_build(conn, today)
+        # lands after the captured iteration time (00:10:00) but before any later clock read
+        await conn.execute(
+            "INSERT INTO cost_events (ts, kind, key, old_value, new_value) VALUES (?, ?, ?, ?, ?)",
+            ("2026-11-05T00:10:30Z", "setting", "race_k", "a", "b"),
+        )
+        await conn.commit()
+        return text
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    with patch("ahsoka.main.build_digest", new=build_then_event):
+        await digest_worker(digest_conn, bot, 99, now_fn=_ticking_now(), sleep_fn=AsyncMock(), iterations=1)
+    assert "race_k" not in bot.send_message.await_args.args[1]
+
+    await digest_worker(digest_conn, bot, 99, now_fn=_digest_now("2026-11-06"), sleep_fn=AsyncMock(), iterations=1)
+    assert bot.send_message.await_count == 2
+    assert "race_k" in bot.send_message.await_args.args[1]

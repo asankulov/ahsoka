@@ -301,3 +301,27 @@ async def test_fetch_billed_page_cap_stops_endless_has_more():
     result = await _fetch(h)
     assert len(h.requests) <= 50
     assert result is None or isinstance(result, float)
+
+
+async def test_fetch_billed_overflowing_total_returns_none_and_warns(caplog):
+    h = _recorder(_body([_bucket(["1E999"])]))
+    with caplog.at_level(logging.WARNING):
+        assert await _fetch(h) is None
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+    assert KEY not in caplog.text
+    assert "1E999" not in caplog.text
+
+
+async def test_fetch_billed_large_finite_total_returned_exactly():
+    from decimal import Decimal
+    import math
+
+    h = _recorder(_body([_bucket(["1E300"])]))
+    result = await _fetch(h)
+    assert math.isfinite(result)
+    assert result == float(Decimal("1E300") / 100)
+
+
+async def test_fetch_billed_normal_value_unchanged_by_overflow_guard():
+    h = _recorder(_body([_bucket(["250"])]))
+    assert await _fetch(h) == pytest.approx(2.5)
