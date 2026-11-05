@@ -50,6 +50,9 @@ async def _fetch(client: httpx.AsyncClient, day: str) -> float | None:
         if body.get("has_more"):
             params["page"] = body["next_page"]
         else:
+            if not total.is_finite():
+                logger.warning("Admin API cost report returned a non-finite total")
+                return None
             return float(total / 100)
     logger.warning("Admin API cost report exceeded %d pages", _MAX_PAGES)
     return None

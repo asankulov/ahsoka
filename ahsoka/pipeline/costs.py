@@ -153,36 +153,60 @@ def _fmt_usd(x: float) -> str:
     return f"${x:.2f}"
 
 
+def _fmt_unit_usd(x: float) -> str:
+    """Per-request cost: four decimals below $0.10 so tiny values stay visible."""
+    if 0 < x < 0.1:
+        return f"${x:.4f}"
+    return f"${x:.2f}"
+
+
 _EVENT_ICONS = {"setting": "\u2699", "population": "\U0001F465"}
 
 
+def _event_line(ev: dict) -> str:
+    icon = _EVENT_ICONS.get(ev["kind"], "\u2022")
+    old = ev["old_value"] if ev["old_value"] is not None else "\u2013"
+    return f"  {icon} {ev['key']}: {old} \u2192 {ev['new_value']}"
+
+
 def format_buckets(buckets: list[dict], events: list[dict], granularity: str) -> str:
-    """Render cost buckets (newest first) with change events under their bucket."""
+    """Render cost buckets (newest first) with change events under their period.
+
+    Events whose period has no bucket but is not older than the oldest displayed
+    bucket get a placeholder line; older events are hidden.
+    """
     if not buckets:
         return "No cost data yet."
+    by_label = {b["bucket"]: b for b in buckets}
+    oldest = min(by_label)
+    width = len(oldest)
+    ev_by_label: dict[str, list[dict]] = {}
+    for ev in events:
+        lbl = ev["ts"][:width]
+        if lbl >= oldest:
+            ev_by_label.setdefault(lbl, []).append(ev)
     lines: list[str] = []
-    for b in buckets:
-        label = b["bucket"]
-        total = b["scoring_usd"] + b["embedding_usd"]
-        parts = [
-            f"{label} \u00b7 {_fmt_usd(total)}",
-            f"scoring {_fmt_usd(b['scoring_usd'])} + embed {_fmt_usd(b['embedding_usd'])}",
-            f"{b['batches']} batches",
-        ]
-        if b["succeeded"] > 0:
-            parts.append(f"{_fmt_usd(total / b['succeeded'])}/post")
-        parts.append(
-            f"{fmt_tokens(b['input_tokens'])} in / {fmt_tokens(b['output_tokens'])} out"
-        )
-        if b["unpriced_batches"]:
-            parts.append(f"{b['unpriced_batches']} unpriced")
-        lines.append(" \u00b7 ".join(parts))
-        for ev in events:
-            if ev["ts"][: len(label)] != label:
-                continue
-            icon = _EVENT_ICONS.get(ev["kind"], "\u2022")
-            old = ev["old_value"] if ev["old_value"] is not None else "\u2013"
-            lines.append(f"  {icon} {ev['key']}: {old} \u2192 {ev['new_value']}")
+    for label in sorted(set(by_label) | set(ev_by_label), reverse=True):
+        b = by_label.get(label)
+        if b is None:
+            lines.append(f"{label} \u2014 no API activity")
+        else:
+            total = b["scoring_usd"] + b["embedding_usd"]
+            parts = [
+                f"{label} \u00b7 {_fmt_usd(total)}",
+                f"scoring {_fmt_usd(b['scoring_usd'])} + embed {_fmt_usd(b['embedding_usd'])}",
+                f"{b['batches']} batches",
+            ]
+            if b["succeeded"] > 0:
+                parts.append(f"{_fmt_unit_usd(total / b['succeeded'])}/req")
+            parts.append(
+                f"{fmt_tokens(b['input_tokens'])} in / {fmt_tokens(b['output_tokens'])} out"
+            )
+            if b["unpriced_batches"]:
+                parts.append(f"{b['unpriced_batches']} unpriced")
+            lines.append(" \u00b7 ".join(parts))
+        for ev in ev_by_label.get(label, []):
+            lines.append(_event_line(ev))
     return "\n".join(lines)
 
 
@@ -236,7 +260,13 @@ async def build_digest(conn, today: str) -> str:
             f"Reconciliation: billed {_fmt_usd(billed)} vs est. {_fmt_usd(est)} (Δ {drift})"
         )
 
-    events = await db.list_cost_events(conn, f"{yesterday}T00:00:00Z", f"{today}T23:59:59Z")
+    snap = await db.get_setting_snapshot(conn) or {}
+    last_ts = snap.get("digest_last_sent_ts")
+    events = await db.list_cost_events(
+        conn, last_ts or f"{yesterday}T00:00:00Z", f"{today}T23:59:59Z"
+    )
+    if last_ts:
+        events = [e for e in events if e["ts"] > last_ts]
     if events:
         lines.append("")
         lines.append("Changes since last digest:")

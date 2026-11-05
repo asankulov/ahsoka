@@ -19,8 +19,7 @@ from ahsoka import database as db
 from ahsoka.bot.export import entities_to_markdown, parse_range, render_markdown
 from ahsoka.config import Settings
 from ahsoka.models import Post
-from ahsoka.pipeline.costs import fmt_tokens as _fmt_tokens
-from ahsoka.pipeline.costs import format_buckets, price_for as _pricing_for
+from ahsoka.pipeline.costs import fmt_tokens, format_buckets
 from ahsoka.pipeline.keyword_index import KeywordIndex
 from ahsoka.text_utils import slice_utf16
 
@@ -963,12 +962,12 @@ def register_bot_commands(
             total_cr = sum(u["cache_read_input_tokens"] for u in usage_by_model.values())
             total_batches = sum(u["batches"] for u in usage_by_model.values())
             cost = await db.get_total_cost(conn)
-            cached_part = f" ({_fmt_tokens(total_cr)} cached)" if total_cr > 0 else ""
+            cached_part = f" ({fmt_tokens(total_cr)} cached)" if total_cr > 0 else ""
             cost_part = f" \u00b7 est. ${cost['cost_usd']:.2f}"
             if cost["unpriced_batches"]:
                 cost_part += f" \u00b7 {cost['unpriced_batches']} unpriced"
             api_line = (
-                f"API: {_fmt_tokens(total_in)} in{cached_part} / {_fmt_tokens(total_out)} out"
+                f"API: {fmt_tokens(total_in)} in{cached_part} / {fmt_tokens(total_out)} out"
                 f" \u00b7 {total_batches} batches{cost_part}"
             )
 

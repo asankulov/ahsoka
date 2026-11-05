@@ -359,7 +359,13 @@ async def digest_worker(
                     await log_bot.send_message(chat_id, text)
                 else:
                     logger.info("Daily cost digest:\n%s", text)
-                await db.save_setting_snapshot(conn, {"digest_last_sent": today})
+                await db.save_setting_snapshot(
+                    conn,
+                    {
+                        "digest_last_sent": today,
+                        "digest_last_sent_ts": now_fn().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    },
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
