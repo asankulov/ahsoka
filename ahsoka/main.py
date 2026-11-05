@@ -1,5 +1,7 @@
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 
 # Pyrogram's sync.py calls asyncio.get_event_loop() at import time.
 # On Python 3.12+ there is no implicit event loop, so we create one first.
@@ -27,6 +29,8 @@ from ahsoka.pipeline.batch_queue import BatchQueue
 from ahsoka.pipeline.batch_submitter import BatchSubmitter
 from ahsoka.bot.commands import register_bot_commands, BOT_COMMANDS
 from ahsoka.bot.notifier import send_notification
+from ahsoka.pipeline import embedder
+from ahsoka.pipeline.costs import embed_cost_for
 from ahsoka.pipeline.embedder import embed, take_token_count
 from ahsoka.pipeline.repost_detector import check_and_store
 from ahsoka.pipeline.tg_resolver import is_tg_link, resolve_tg_link
@@ -349,9 +353,24 @@ def _bot_id_from_token(token: object) -> int | None:
         return None
 
 
+def make_embedding_usage_sink(
+    conn: aiosqlite.Connection,
+    model_getter: Callable[[], str] = lambda: settings.voyage_model,
+) -> Callable[[int], Awaitable[None]]:
+    async def sink(tokens: int) -> None:
+        model = model_getter()
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        await db.record_embedding_usage(
+            conn, day, model, tokens, embed_cost_for(model, tokens)
+        )
+
+    return sink
+
+
 async def main() -> None:
     conn = await aiosqlite.connect(settings.db_path)
     await db.init_db(conn, owner_chat_id=settings.owner_chat_id)
+    embedder.set_usage_sink(make_embedding_usage_sink(conn))
     await db.seed_channels(conn, settings.channel_ids)
 
     watched_channels = await db.load_watched_channels(conn)
