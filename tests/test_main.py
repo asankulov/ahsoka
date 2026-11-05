@@ -2034,3 +2034,33 @@ async def test_repost_not_run_when_no_active_users(conn):
     m["embed"].assert_not_awaited()
     m["check"].assert_not_awaited()
     m["enqueue"].assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# make_embedding_usage_sink
+# ---------------------------------------------------------------------------
+
+
+async def test_embedding_usage_sink_records_today_row_with_cost(conn):
+    from datetime import timezone
+    from ahsoka.main import make_embedding_usage_sink
+
+    sink = make_embedding_usage_sink(conn, model_getter=lambda: "voyage-4-lite")
+    await sink(100)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async with conn.execute("SELECT day, model, tokens, cost_usd FROM embedding_usage") as cur:
+        rows = await cur.fetchall()
+    assert len(rows) == 1
+    day, model, tokens, cost = rows[0]
+    assert (day, model, tokens) == (today, "voyage-4-lite", 100)
+    assert cost is not None
+
+
+async def test_embedding_usage_sink_unknown_model_stores_null_cost(conn):
+    from ahsoka.main import make_embedding_usage_sink
+
+    sink = make_embedding_usage_sink(conn, model_getter=lambda: "mystery-model")
+    await sink(100)
+    async with conn.execute("SELECT model, tokens, cost_usd FROM embedding_usage") as cur:
+        rows = await cur.fetchall()
+    assert rows == [("mystery-model", 100, None)]

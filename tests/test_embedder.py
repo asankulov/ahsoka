@@ -9,6 +9,13 @@ from ahsoka.pipeline import embedder
 from ahsoka.pipeline.embedder import embed, normalize, take_token_count
 
 
+@pytest.fixture(autouse=True)
+def _reset_usage_sink():
+    embedder.set_usage_sink(None)
+    yield
+    embedder.set_usage_sink(None)
+
+
 def _settings(key="k"):
     s = MagicMock()
     s.voyage_api_key = key
@@ -173,3 +180,71 @@ async def test_embed_invalid_embedding_returns_none_one_warning_no_tokens(bad, c
     warns = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warns) == 1
     assert take_token_count() == 0
+
+
+async def test_usage_sink_called_with_total_tokens():
+    calls = []
+
+    async def sink(tokens):
+        calls.append(tokens)
+
+    embedder.set_usage_sink(sink)
+    with patch("ahsoka.pipeline.embedder.settings", _settings()):
+        assert await embed("hello", client=_client(_ok(17))) == [0.1, 0.2]
+    assert calls == [17]
+
+
+async def test_usage_sink_exception_swallowed_and_warned(caplog):
+    take_token_count()
+
+    async def sink(tokens):
+        raise RuntimeError("db down")
+
+    embedder.set_usage_sink(sink)
+    with patch("ahsoka.pipeline.embedder.settings", _settings()), \
+         caplog.at_level(logging.WARNING, logger="ahsoka.pipeline.embedder"):
+        assert await embed("hello", client=_client(_ok(5))) == [0.1, 0.2]
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert take_token_count() == 5
+
+
+async def test_no_sink_set_still_accumulates_tokens():
+    take_token_count()
+    embedder.set_usage_sink(None)
+    with patch("ahsoka.pipeline.embedder.settings", _settings()):
+        assert await embed("hello", client=_client(_ok(4))) == [0.1, 0.2]
+    assert take_token_count() == 4
+
+
+async def test_usage_sink_not_called_on_http_error():
+    calls = []
+
+    async def sink(tokens):
+        calls.append(tokens)
+
+    embedder.set_usage_sink(sink)
+
+    def handler(request):
+        return httpx.Response(500, json={"detail": "nope"})
+
+    with patch("ahsoka.pipeline.embedder.settings", _settings()):
+        assert await embed("hello", client=_client(handler)) is None
+    assert calls == []
+
+
+async def test_usage_sink_not_called_on_malformed_embedding():
+    calls = []
+
+    async def sink(tokens):
+        calls.append(tokens)
+
+    embedder.set_usage_sink(sink)
+
+    def handler(request):
+        return httpx.Response(
+            200, json={"data": [{"embedding": [True, 0.2]}], "usage": {"total_tokens": 9}}
+        )
+
+    with patch("ahsoka.pipeline.embedder.settings", _settings()):
+        assert await embed("hello", client=_client(handler)) is None
+    assert calls == []
