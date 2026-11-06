@@ -10,6 +10,11 @@ on:
       - ".github/workflows/deploy.yml"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".claude/**"
+      - ".env.example"
   workflow_dispatch:
 
 env:

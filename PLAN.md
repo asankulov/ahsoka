@@ -334,7 +334,7 @@ If you see `batch exceeded max_wait_seconds` warnings, the Anthropic batch queue
 
 ## CI/CD (.github/workflows/deploy.yml)
 
-Triggers: push to `main` (only when `ahsoka/**`, `pyproject.toml`, `uv.lock` or `deploy.yml` change), PRs, and manual `workflow_dispatch`:
+Triggers: push to `main` (only when `ahsoka/**`, `pyproject.toml`, `uv.lock` or `deploy.yml` change), PRs (skipped when only `docs/**`, `**/*.md`, `.claude/**` or `.env.example` change), and manual `workflow_dispatch`:
 1. **Test job**: `uv sync --locked` → `pytest`
 2. **Deploy job** (after tests pass; on `main` push, or on `workflow_dispatch` from a branch whose own `deploy.yml` has the new condition):
    - rsync source to server (excludes `.env`, `*.session`, `ahsoka.db`, `.venv`)
