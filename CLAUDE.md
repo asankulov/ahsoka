@@ -27,9 +27,15 @@ ahsoka/
     dedup.py           # is_duplicate()
     keyword_filter.py  # Fast keyword pre-filter (no LLM cost)
     keyword_index.py   # Union of all users' keywords for shared pre-filter
+    resume_filter.py   # Drops #резюме/#resume/#cv posts before KeywordIndex
+    embedder.py        # Voyage REST client (httpx); persists tokens to embedding_usage
+    repost_detector.py # Cosine search over post_embeddings; check_and_store under a lock
+    costs.py           # Price tables, cost_for, tracked-settings diff, /stats buckets, digest
+    reconcile.py       # Optional Anthropic Admin API cost reconciliation (needs ANTHROPIC_ADMIN_KEY)
     user_filter.py     # Thin validator: not paused AND matched AND score >= threshold
   models.py         # Post, Score, PersonalizedVerdict, User, UserConfig dataclasses
   main.py           # Entry point; pipeline_worker, batch_worker, fan-out; log bot setup
+  text_utils.py     # Shared text helpers
   config.py         # Settings (pydantic); instantiated at module level
   database.py       # aiosqlite: schema, migration, multi-user CRUD
   watcher/
@@ -53,6 +59,16 @@ tests/
   test_dedup.py            # is_duplicate()
   test_keyword_index.py    # KeywordIndex rebuild + passes()
   test_watcher.py          # Watcher handler / poller
+  test_resume_filter.py    # Resume-post filter
+  test_embedder.py         # Voyage client (mocked httpx)
+  test_repost_detector.py  # Cosine, window, threshold, concurrency
+  test_costs.py            # Pricing, settings diff, buckets, digest
+  test_cost_database.py    # Cost tables CRUD + backfill
+  test_reconcile.py        # Admin API reconciliation (mocked)
+  test_config.py           # Settings parsing / validators
+  test_scraper_ssrf.py     # Scraper SSRF guards
+  test_export.py           # /export
+  test_text_utils.py       # Text helpers
 ```
 
 ## Key Design Decisions
@@ -65,7 +81,20 @@ tests/
 - **Thin post-verdict validator**: `user_filter.matches_user(verdict, config)` checks only `not paused AND verdict.matched AND score >= threshold`. All stack/seniority/remote/location/salary reasoning lives in the scoring prompt.
 - **Startup batch recovery**: `_recover_pending_batches` polls any in-flight batches from a crashed run (tracked in `pending_batches` table) and stores their verdicts. Notifications are **not** re-sent on recovery (original Post/UserConfig objects are gone from memory); verdicts are stored for auditability.
 
+### Repost Detection (embedder.py, repost_detector.py)
+- Stage in `pipeline_worker` runs **after** `KeywordIndex.passes` and the "no active users" drop, before `_enqueue_single`. Only keyword-passing posts are embedded, so the union pre-filter still gates all spend.
+- Voyage `voyage-4-lite` (512 dims) via httpx REST; vectors in `post_embeddings` (float32 BLOB, 30-day window pruned by `delete_old_posts`); pure-Python cosine.
+- A vector is stored **only if the post is not a repost**, so chains resolve to the original. `find_nearest` + insert run under one `asyncio.Lock`; the HTTP call stays outside it.
+- `REPOST_MODE=off|shadow|enforce` (default `shadow`: log only, still score). Threshold `>=` `REPOST_THRESHOLD` (0.95). Empty `VOYAGE_API_KEY` disables the stage. The whole check is fail-open.
+- Changing `voyage_model` or `repost_dimensions` makes old vectors incomparable (skipped; window refills in 30 days).
+
+### Cost Management (costs.py, reconcile.py)
+- `batch_usage.cost_usd` is **frozen at record time** (NULL + WARNING for an unknown model); backfilled rows carry `estimated=1`. Voyage tokens persist per day in `embedding_usage`.
+- `cost_events` records tracked-setting changes (startup diff against `setting_snapshot`; first run is baseline) and daily population shifts. **Any new cost-relevant `Settings` field must be added to `TRACKED_SETTINGS`.**
+- Daily digest (00:05 UTC) goes through the log bot, not a new logging path. Reconciliation is off unless `ANTHROPIC_ADMIN_KEY` is set. Cost recording, snapshotting and reconciliation all fail open.
+
 ### Bot Commands (commands.py)
+- `/stats` (admin) shows the stored-cost summary; `/stats day|month|year` shows 14/12/5 buckets with change events as markers.
 - Two routers: `user_router` (open to all, checks not banned) and `admin_router` (admin-only)
 - `BOT_COMMANDS` lists user-visible commands registered via `bot.set_my_commands()`. Admin commands are hidden.
 - **FSM**: `WaitingForInput(StatesGroup)` with states for all input-requiring commands
@@ -84,7 +113,7 @@ def get_handler_map(dp: Dispatcher) -> dict[str, object]:
 ```
 
 ### Database Schema
-Eight tables: `users` (registry), `user_config` (per-user settings), `seen_posts` (dedup; scoring columns now nullable), `watched_channels` (shared watchlist), `user_notified` (per-user notification tracking), `post_verdicts` (per-(post, user) `PersonalizedVerdict`), `pending_batches` (in-flight batch recovery state), `batch_usage` (token counts + cost per completed batch).
+Fourteen tables: `users` (registry), `user_config` (per-user settings), `seen_posts` (dedup; scoring columns now nullable), `watched_channels` (shared watchlist), `user_notified` (per-user notification tracking), `post_verdicts` (per-(post, user) `PersonalizedVerdict`), `pending_batches` (in-flight batch recovery state), `batch_usage` (token counts + frozen `cost_usd` + `estimated` flag per completed batch), `post_embeddings` (repost-detection vectors), `embedding_usage` (Voyage tokens/cost per day), `cost_events` (setting/population change markers), `setting_snapshot` (last tracked settings + digest timestamps), `daily_snapshots` (population counts), `cost_reconciliation` (Admin API figures).
 
 Migrations are additive and idempotent via `CREATE TABLE IF NOT EXISTS` in `init_db()`. The old single-user key-value `user_config` migration is still handled automatically.
 
@@ -122,7 +151,7 @@ The project's conventions are settled tribal law. They are not suggestions, they
 
 - Per-user scoring via Anthropic Message Batches API: one personalized request per (post, user), submitted in buffered batches for a 50% cost discount. Notifications are near-real-time (minutes, not instant). `location`, `salary_min`, and `salary_max` on `UserConfig` are load-bearing in the scoring prompt. *(This reverses the previous "score-once fan-out" rule — authorized by the user 2026-04-11 on branch `refactor/per-user-batch-scoring`.)*
 - Separate bots for separate concerns (never reuse `Bot(token=settings.bot_token)` for a secondary purpose).
-- Union keyword pre-filter via `KeywordIndex` runs **before** the batch queue — posts matching zero users never consume batch budget.
+- Union keyword pre-filter via `KeywordIndex` runs **before** repost detection and the batch queue — posts matching zero users never consume batch budget.
 - GitHub Secrets for sensitive values, GitHub Variables for non-sensitive tunables; defaults stay in `config.py`.
 - `bot/log_handler.py` is the canonical observability path — never add a second logging mechanism.
 - `t.me` URLs go through `tg_resolver.py`, never `scraper.py`.

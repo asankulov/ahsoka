@@ -121,7 +121,7 @@ Any user can `/start` the bot and configure their own filters:
 | `/users` | `/users` | List registered users |
 | `/ban` | `/ban 123456` | Ban a user |
 | `/unban` | `/unban 123456` | Unban a user |
-| `/stats` | `/stats` | Usage statistics + API cost estimate |
+| `/stats` | `/stats month` | Usage statistics + API cost; `day`, `month` or `year` shows cost buckets with change markers |
 | `/debug` | `/debug on` | Toggle debug scoring mode (forward a post to score it live) |
 | `/export` | `/export 123456 7d` | Export notified posts for a user (or `all`) as a Markdown file |
 | `/admin` | `/admin` | Show admin command help |
@@ -132,7 +132,7 @@ If a command is waiting for input (e.g. `/setstack`, `/addchannel`) and you send
 
 ## Storage
 
-SQLite (`ahsoka.db`). Eight tables:
+SQLite (`ahsoka.db`). Fourteen tables:
 
 - `users` — registered users with admin/ban status and notification target
 - `user_config` — per-user filter settings (stack, seniority, location, salary, keywords, threshold, etc.)
@@ -141,7 +141,13 @@ SQLite (`ahsoka.db`). Eight tables:
 - `user_notified` — tracks which posts were sent to which users (prevents duplicate notifications)
 - `post_verdicts` — per-(post, user) `PersonalizedVerdict` for auditability
 - `pending_batches` — in-flight Anthropic batch state for crash recovery
-- `batch_usage` — token counts and estimated cost per completed batch
+- `batch_usage` — token counts and cost (frozen at record time) per completed batch
+- `post_embeddings` — Voyage vectors for repost detection (30-day window)
+- `embedding_usage` — Voyage tokens and cost per day
+- `cost_events` — markers for cost-relevant setting and population changes
+- `setting_snapshot` — last tracked settings and digest timestamps
+- `daily_snapshots` — daily active-user, channel and keyword counts
+- `cost_reconciliation` — optional Anthropic Admin API cost figures
 
 ## Running tests
 
