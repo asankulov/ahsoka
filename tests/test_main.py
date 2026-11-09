@@ -1775,6 +1775,21 @@ async def test_pipeline_worker_short_post_resume_in_fetched_content_dropped(conn
     mock_single.assert_not_called()
 
 
+async def test_pipeline_worker_short_post_leading_resume_word_in_fetched_content_dropped(conn):
+    post = make_post(text="See details", urls=["https://jobs.example/1"])
+    keyword_index = _kw_index()
+
+    with patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main._fetch_content", new_callable=AsyncMock, return_value="Резюме Senior backend dev"), \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock) as mock_mark_seen, \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock) as mock_single:
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), keyword_index)
+
+    mock_mark_seen.assert_called_once()
+    keyword_index.passes.assert_not_called()
+    mock_single.assert_not_called()
+
+
 async def test_enqueue_single_with_content_skips_fetch(conn):
     from ahsoka.main import _enqueue_single
 
