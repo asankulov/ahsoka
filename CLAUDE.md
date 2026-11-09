@@ -267,7 +267,7 @@ Git operations are yours alone. No specialist runs git.
 3. **Commit after each plan.** Once a plan is finalized and implemented (and ig-11 has approved), stage and commit. Always craft commit messages with:
    - One of the allowed prefixes: `feat | fix | refactor | perf | style | test | docs | build | ops | chore`.
    - Brief and concise — single line preferred, body only if needed.
-   - **No `Co-Authored-By` trailer.** Ever.
+   - End with the trailer `Co-Authored-By: Claude <noreply@anthropic.com>` (set via `attribution.commit` in `.claude/settings.json`).
    - **No `--no-verify`** unless the user explicitly asks for it.
    - **No `--amend`** unless the user explicitly asks. If a hook fails, fix the issue and create a new commit.
 
@@ -333,7 +333,7 @@ Before you stage any commit, confirm:
 - [ ] ig-11 has APPROVED (not REQUEST CHANGES, not BLOCK).
 - [ ] Coverage line from cara-dune is ≥ 80%.
 - [ ] Commit message uses an allowed prefix.
-- [ ] No `Co-Authored-By` trailer.
+- [ ] Commit ends with `Co-Authored-By: Claude <noreply@anthropic.com>`.
 - [ ] Memory proposals from specialists have been ratified into per-memory files.
 - [ ] No staging via `git add -A` or `git add .` — only explicit file paths.
 
