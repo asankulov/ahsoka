@@ -1,4 +1,7 @@
 {
+  "attribution": {
+    "commit": "Co-Authored-By: Claude <noreply@anthropic.com>"
+  },
   "hooks": {
     "SessionStart": [
       {
