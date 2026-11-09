@@ -80,3 +80,67 @@ def test_has_resume_marker_no_match_false(text):
 def test_is_resume_delegates_to_post_text_marker():
     assert is_resume(make_post("#resume")) is True
     assert is_resume(make_post("vacancy")) is False
+
+
+REPORTED_CV_POST = (
+    "🔥 Резюме Senior / Lead Frontend / Full-Stack Engineer от @codevanger, от $3,500/мес, "
+    "г. Калининград, удаленно или релокация, фуллтайм\n\n"
+    "⭐ Оптимизация GIS-движка: 100 000+ объектов ускорились с 3.5с до 200мс\n"
+    "⭐ AI-пайплайн для 550 000 SKU с сокращением ручной работы на 70%\n"
+    "⭐ TypeScript-библиотека Active Inference и опубликованный NPM-пакет"
+)
+
+
+def test_reported_hashtagless_cv_post_detected():
+    assert has_resume_marker(REPORTED_CV_POST) is True
+    assert is_resume(make_post(REPORTED_CV_POST)) is True
+
+
+LEADING_WORD_TRUE = [
+    "Резюме Senior Python dev",
+    "резюме",
+    "РЕЗЮМЕ",
+    "Resume Senior dev",
+    "CV",
+    "cv:",
+    "CV — Senior",
+    "CV-",
+    "CV Senior dev",
+    "- Resume",
+    "# CV",
+    "🔥⭐ Резюме",
+    "\n\n  Резюме Python dev",
+    "Резюме\nbackend",
+]
+
+
+@pytest.mark.parametrize("text", LEADING_WORD_TRUE)
+def test_leading_resume_word_true(text):
+    assert has_resume_marker(text) is True
+    assert is_resume(make_post(text)) is True
+
+
+LEADING_WORD_FALSE = [
+    "Отправьте резюме на hr@co.com",
+    "Ищем разработчика. Присылайте резюме",
+    "Вакансия\nРезюме присылайте",
+    "We want your CV",
+    "resumes",
+    "resume2",
+    "cvs",
+    "резюмер",
+    "cvx",
+    "Resumed work",
+    "cv_dev",
+]
+
+
+@pytest.mark.parametrize("text", LEADING_WORD_FALSE)
+def test_leading_resume_word_false(text):
+    assert has_resume_marker(text) is False
+    assert is_resume(make_post(text)) is False
+
+
+@pytest.mark.parametrize("text", ["", "   ", "🔥🔥", "\n\n", "-"])
+def test_resume_marker_degenerate_text_false_no_raise(text):
+    assert has_resume_marker(text) is False
