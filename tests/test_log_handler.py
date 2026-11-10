@@ -5,7 +5,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ahsoka.bot.log_handler import TelegramLogHandler, TG_MESSAGE_LIMIT, _NOISY_PREFIXES
+from ahsoka.bot.log_handler import (
+    TelegramLogHandler, TG_MESSAGE_LIMIT, _NOISY_PREFIXES, _should_forward,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -215,3 +217,81 @@ async def test_critical_record_forwarded():
     handler.handle(record)
     await asyncio.sleep(0)
     bot.send_message.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# WARNING allowlist (ahsoka.repost) gating in emit()
+# ---------------------------------------------------------------------------
+
+def make_warning_handler() -> tuple[TelegramLogHandler, AsyncMock]:
+    """Handler configured as in main(): level WARNING, emit() does the gating."""
+    handler, bot = make_handler()
+    handler.setLevel(logging.WARNING)
+    return handler, bot
+
+
+async def test_emit_error_from_non_noisy_logger_forwarded_at_warning_level():
+    handler, bot = make_warning_handler()
+    handler.handle(make_record(name="ahsoka.main", level=logging.ERROR))
+    await asyncio.sleep(0)
+    bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.parametrize("name", ["ahsoka.main", "ahsoka.pipeline", "ahsoka.repost.sub", "ahsoka.reposted", "ahsoka"])
+async def test_emit_warning_from_non_allowlisted_logger_not_forwarded(name):
+    handler, bot = make_warning_handler()
+    handler.handle(make_record(name=name, level=logging.WARNING))
+    await asyncio.sleep(0)
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.parametrize("level", [logging.WARNING, logging.ERROR])
+async def test_emit_warning_or_higher_from_repost_logger_forwarded(level):
+    handler, bot = make_warning_handler()
+    handler.handle(make_record(name="ahsoka.repost", level=level, msg="Repost candidate"))
+    await asyncio.sleep(0)
+    bot.send_message.assert_awaited_once()
+    assert "Repost candidate" in bot.send_message.call_args[0][1]
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+async def test_emit_below_warning_from_repost_logger_not_forwarded(level):
+    # Bypass handle()'s level check: emit() itself must still gate.
+    handler, bot = make_warning_handler()
+    handler.emit(make_record(name="ahsoka.repost", level=level))
+    await asyncio.sleep(0)
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.parametrize("name", ["aiogram.x", "pyrogram.connection", "httpx"])
+async def test_emit_error_from_noisy_prefix_still_dropped(name):
+    handler, bot = make_warning_handler()
+    handler.handle(make_record(name=name, level=logging.ERROR))
+    await asyncio.sleep(0)
+    bot.send_message.assert_not_awaited()
+
+
+async def test_emit_warning_from_noisy_logger_not_forwarded():
+    """Noisy-prefix check runs first: a noisy WARNING is never forwarded."""
+    handler, bot = make_warning_handler()
+    handler.handle(make_record(name="aiogram.dispatcher", level=logging.WARNING))
+    await asyncio.sleep(0)
+    bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "name,level,expected",
+    [
+        ("ahsoka.repost", logging.WARNING, True),
+        ("ahsoka.repost", logging.ERROR, True),
+        ("ahsoka.repost", logging.INFO, False),
+        ("ahsoka.repost", logging.DEBUG, False),
+        ("ahsoka.repost.sub", logging.WARNING, False),
+        ("ahsoka.reposted", logging.WARNING, False),
+        ("ahsoka.main", logging.WARNING, False),
+        ("ahsoka.main", logging.ERROR, True),
+        ("ahsoka.main", logging.CRITICAL, True),
+    ],
+)
+def test_should_forward_matrix(name, level, expected):
+    assert _should_forward(make_record(name=name, level=level)) is expected

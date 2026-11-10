@@ -747,6 +747,107 @@ async def test_enqueue_single_mark_seen_false_skips_scrape_and_enqueue(conn):
     batch_queue.enqueue.assert_not_called()
 
 
+async def test_enqueue_single_lost_race_logs_debug_on_main_not_repost(conn, caplog):
+    """Lost mark_seen race: DEBUG on ahsoka.main (%s/%s format); nothing on ahsoka.repost."""
+    import logging
+    from ahsoka.main import _enqueue_single
+
+    post = make_post(channel_id=-1001234567890, message_id=55)
+    batch_queue = AsyncMock()
+
+    with caplog.at_level(logging.DEBUG), \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock, return_value=False), \
+         patch("ahsoka.main._fetch_content", new_callable=AsyncMock) as mock_fetch:
+        await _enqueue_single(conn, batch_queue, post, [make_config()], MagicMock())
+
+    recs = [r for r in caplog.records if "Lost race" in r.getMessage()]
+    assert len(recs) == 1
+    assert recs[0].name == "ahsoka.main"
+    assert recs[0].levelno == logging.DEBUG
+    assert recs[0].getMessage() == "Lost race, already claimed: -1001234567890/55"
+    assert not [r for r in caplog.records if r.name == "ahsoka.repost"]
+    mock_fetch.assert_not_called()
+    batch_queue.enqueue.assert_not_called()
+
+
+async def test_pipeline_worker_duplicate_drop_logs_debug_on_main_not_repost(conn, caplog):
+    """Routine Duplicate: drop stays DEBUG on ahsoka.main; ahsoka.repost stays silent."""
+    import logging
+    post = make_post()
+
+    with caplog.at_level(logging.DEBUG), \
+         patch("ahsoka.main.is_duplicate", new_callable=AsyncMock, return_value=True), \
+         patch("ahsoka.main.db.mark_seen", new_callable=AsyncMock), \
+         patch("ahsoka.main._enqueue_single", new_callable=AsyncMock):
+        await _run_pipeline_worker_with_one_post(post, conn, AsyncMock(), MagicMock())
+
+    dup = [r for r in caplog.records if "Duplicate:" in r.getMessage()]
+    assert len(dup) == 1
+    assert dup[0].name == "ahsoka.main"
+    assert dup[0].levelno == logging.DEBUG
+    assert not [r for r in caplog.records if r.name == "ahsoka.repost"]
+
+
+async def test_log_handler_at_warning_forwards_repost_but_not_main_warning(conn):
+    """Integration: real TelegramLogHandler(WARNING) on root forwards repost WARNINGs only."""
+    import logging
+    from ahsoka.bot.log_handler import TelegramLogHandler
+    from ahsoka.main import _repost_check
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    handler = TelegramLogHandler(bot, 999)
+    handler.setLevel(logging.WARNING)
+    root = logging.getLogger()
+    repost = logging.getLogger("ahsoka.repost")
+    old_level = repost.level
+    repost.setLevel(logging.DEBUG)
+    root.addHandler(handler)
+    try:
+        logging.getLogger("ahsoka.main").warning("ordinary main warning")
+        await asyncio.sleep(0)
+        bot.send_message.assert_not_awaited()
+
+        match = RepostMatch(channel_id=-1009876543210, message_id=7, similarity=0.97)
+        with patch("ahsoka.main.settings", _repost_settings("shadow")), \
+             patch("ahsoka.main.embed", new_callable=AsyncMock, return_value=[0.1]), \
+             patch("ahsoka.main.check_and_store", new_callable=AsyncMock, return_value=match):
+            await _repost_check(conn, make_post(channel_id=-1001111111111, message_id=1), None)
+        await asyncio.sleep(0)
+    finally:
+        root.removeHandler(handler)
+        repost.setLevel(old_level)
+
+    bot.send_message.assert_awaited_once()
+    sent = bot.send_message.call_args[0][1]
+    assert "Repost candidate (shadow)" in sent
+    assert "https://t.me/c/9876543210/7" in sent
+
+
+async def test_main_registers_log_handler_at_warning_level():
+    """main() attaches TelegramLogHandler to root at WARNING (emit() gates ERROR+/repost)."""
+    import logging
+    from ahsoka.bot.log_handler import TelegramLogHandler
+
+    fake_settings = _make_fake_settings()
+    fake_settings.log_bot_token = "logtok"
+    root = logging.getLogger()
+    before = list(root.handlers)
+    try:
+        async with _main_env(extra_patches=[patch("ahsoka.main.settings", fake_settings)]) as task:
+            try:
+                await task
+            except BaseException:
+                pass
+        added = [h for h in root.handlers if h not in before and isinstance(h, TelegramLogHandler)]
+        assert len(added) == 1
+        assert added[0].level == logging.WARNING
+    finally:
+        for h in list(root.handlers):
+            if h not in before:
+                root.removeHandler(h)
+
+
 async def test_enqueue_single_concurrent_calls_produce_exactly_one_request_in_real_queue(conn):
     """Regression test for the production bug: two pipeline_worker tasks
     racing on the same post must not both scrape and enqueue.
@@ -1932,7 +2033,10 @@ async def test_repost_shadow_logs_and_enqueues(conn, caplog):
             conn, make_post(channel_id=-1009999, message_id=9), mode="shadow",
             embed_ret=[0.1], match=match,
         )
-    assert "Repost candidate (shadow)" in caplog.text
+    recs = [r for r in caplog.records if "Repost candidate (shadow)" in r.getMessage()]
+    assert len(recs) == 1
+    assert recs[0].name == "ahsoka.repost"
+    assert recs[0].levelno == logging.WARNING
     assert "https://t.me/c/1458440404/7" in caplog.text
     assert "sim=0.970" in caplog.text
     m["enqueue"].assert_awaited_once()
@@ -1944,7 +2048,10 @@ async def test_repost_enforce_drops(conn, caplog):
     match = RepostMatch(channel_id=1, message_id=2, similarity=0.97)
     with caplog.at_level(logging.INFO, logger="ahsoka.main"):
         m = await _run_repost_pipeline(conn, post, mode="enforce", embed_ret=[0.1], match=match)
-    assert "Repost drop" in caplog.text
+    recs = [r for r in caplog.records if "Repost drop" in r.getMessage()]
+    assert len(recs) == 1
+    assert recs[0].name == "ahsoka.repost"
+    assert recs[0].levelno == logging.WARNING
     m["mark_seen"].assert_awaited_once_with(conn, post.channel_id, post.message_id)
     m["enqueue"].assert_not_awaited()
 
@@ -1954,15 +2061,22 @@ async def test_repost_near_miss_logged(conn, caplog, mode):
     match = RepostMatch(channel_id=1, message_id=2, similarity=0.90)
     with caplog.at_level(logging.INFO, logger="ahsoka.main"):
         m = await _run_repost_pipeline(conn, make_post(), mode=mode, embed_ret=[0.1], match=match)
-    assert "Repost near-miss" in caplog.text
+    recs = [r for r in caplog.records if "Repost near-miss" in r.getMessage()]
+    assert len(recs) == 1
+    assert recs[0].name == "ahsoka.repost"
+    assert recs[0].levelno == logging.WARNING
     m["enqueue"].assert_awaited_once()
 
 
-async def test_repost_below_floor_not_logged_at_info(conn, caplog):
+async def test_repost_below_floor_only_debug_on_main_nothing_on_repost(conn, caplog):
     match = RepostMatch(channel_id=1, message_id=2, similarity=0.50)
-    with caplog.at_level(logging.INFO, logger="ahsoka.main"):
+    with caplog.at_level(logging.DEBUG):
         m = await _run_repost_pipeline(conn, make_post(), mode="enforce", embed_ret=[0.1], match=match)
-    assert "Repost" not in caplog.text
+    assert not [r for r in caplog.records if r.name == "ahsoka.repost"]
+    best = [r for r in caplog.records if "Repost check: best sim" in r.getMessage()]
+    assert len(best) == 1
+    assert best[0].name == "ahsoka.main"
+    assert best[0].levelno == logging.DEBUG
     m["enqueue"].assert_awaited_once()
 
 
@@ -2031,6 +2145,8 @@ async def test_repost_check_store_error_fails_open_and_logs_warning(conn, caplog
     warns = [r for r in caplog.records
              if r.levelno == logging.WARNING and "Repost check failed, failing open" in r.getMessage()]
     assert len(warns) == 1
+    assert warns[0].name == "ahsoka.main"
+    assert not [r for r in caplog.records if r.name == "ahsoka.repost"]
 
 
 async def test_repost_embed_unexpected_exception_fails_open(conn, caplog):

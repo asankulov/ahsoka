@@ -1,4 +1,5 @@
-"""TelegramLogHandler — forwards ERROR+ log records to a dedicated Telegram bot."""
+"""TelegramLogHandler — forwards ERROR+ log records (and WARNINGs from allowlisted
+loggers, e.g. ``ahsoka.repost``) to a dedicated Telegram bot."""
 import asyncio
 import logging
 
@@ -12,7 +13,17 @@ _NOISY_PREFIXES: tuple[str, ...] = (
     "httpcore",
 )
 
+# Loggers whose WARNING records are forwarded too (everything else is ERROR+ only).
+_WARNING_FORWARD_LOGGERS: tuple[str, ...] = ("ahsoka.repost",)
+
 TG_MESSAGE_LIMIT = 4096
+
+
+def _should_forward(record: logging.LogRecord) -> bool:
+    """ERROR+ always; WARNING only from allowlisted loggers (exact name match)."""
+    if record.levelno >= logging.ERROR:
+        return True
+    return record.levelno >= logging.WARNING and record.name in _WARNING_FORWARD_LOGGERS
 
 
 class TelegramLogHandler(logging.Handler):
@@ -30,6 +41,8 @@ class TelegramLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         if record.name.startswith(_NOISY_PREFIXES):
+            return
+        if not _should_forward(record):
             return
         try:
             text = self._render(record)

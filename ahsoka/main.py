@@ -41,6 +41,8 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+# Allowlisted in TelegramLogHandler: WARNINGs on this logger reach the log bot.
+repost_logger = logging.getLogger("ahsoka.repost")
 
 
 def _post_ref(channel_id: int, message_id: int) -> str:
@@ -70,17 +72,17 @@ async def _repost_check(
         orig_ref = _post_ref(match.channel_id, match.message_id)
         if match.similarity >= settings.repost_threshold:
             if settings.repost_mode == "shadow":
-                logger.info(
+                repost_logger.warning(
                     "Repost candidate (shadow): %s ≈ %s, sim=%.3f",
                     new_ref, orig_ref, match.similarity,
                 )
                 return False
-            logger.info(
+            repost_logger.warning(
                 "Repost drop: %s ≈ %s, sim=%.3f", new_ref, orig_ref, match.similarity
             )
             return True
         if match.similarity >= settings.repost_near_miss_floor:
-            logger.info(
+            repost_logger.warning(
                 "Repost near-miss: %s ≈ %s, sim=%.3f", new_ref, orig_ref, match.similarity
             )
             return False
@@ -498,10 +500,10 @@ async def main() -> None:
         except Exception as exc:
             logger.error("Log bot health check failed: %s — verify LOG_BOT_TOKEN", exc)
         _tg_handler = TelegramLogHandler(log_bot, settings.owner_chat_id)
-        _tg_handler.setLevel(logging.ERROR)
+        _tg_handler.setLevel(logging.WARNING)  # emit() gates: ERROR+ and allowlisted WARNINGs
         _tg_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s\n%(message)s"))
         logging.getLogger().addHandler(_tg_handler)
-        logger.info("Telegram log handler registered (ERROR+) via dedicated log bot")
+        logger.info("Telegram log handler registered (ERROR+, plus repost WARNINGs) via dedicated log bot")
 
     # Sync command menu and bot description with Telegram
     try:
